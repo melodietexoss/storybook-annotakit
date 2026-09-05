@@ -1,0 +1,10 @@
+# annotakit store branch
+
+Managed by storybook-annotakit — do not merge into code branches,
+do not commit here manually. The tree is exactly README + threads.db
+(a sqlite snapshot, WAL-checkpointed). Divergence between machines is
+resolved by a logical union merge performed by the addon itself.
+
+If you are reading this out of curiosity: `git show annotakit:threads.db`
+would stream binary; run the Storybook dev server instead and use
+GET /annotakit/api/threads.
