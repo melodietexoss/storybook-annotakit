@@ -1,0 +1,9 @@
+.env
+node_modules/
+dist-storybook/
+sb.log
+sb-debug.log
+# threads.db stays tracked (review feedback); sidecars are volatile
+*.db-wal
+*.db-shm
+*.tsbuildinfo

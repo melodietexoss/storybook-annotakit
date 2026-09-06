@@ -1,0 +1,27 @@
+{
+  "dependencies": {
+    "lucide-react": "^1.39.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "description": "Demo: fresh Storybook 10 + storybook-annotakit \u2014 zero-config pin comments with React component awareness.",
+  "devDependencies": {
+    "@storybook/react-vite": "10.6.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "storybook": "10.6.0",
+    "storybook-annotakit": "file:../..",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.0",
+    "vite": "^7.3.6"
+  },
+  "name": "nimbus-storybook-demo",
+  "private": true,
+  "scripts": {
+    "storybook": "storybook dev -p 6006",
+    "preview": "storybook dev -p 3000 --ci",
+    "build": "storybook build -o dist-storybook",
+    "build:static": "storybook build -o dist-storybook && node ../../scripts/bake-static-threads.mjs dist-storybook"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}

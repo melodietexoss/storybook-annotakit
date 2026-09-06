@@ -1,0 +1,19 @@
+node_modules/
+examples/nimbus/node_modules/
+examples/nimbus/dist-storybook/
+examples/nimbus/sb.log
+examples/nimbus/sb-debug.log
+# dist/ IS tracked (dogfood #6): file:-installs from a fresh clone work without
+# building the kit first; release commits carry the rebuilt dist.
+# annotakit store: threads.db IS tracked (durable feedback — survives disk loss);
+# only the sqlite sidecars are volatile
+*.db-wal
+*.db-shm
+*.tsbuildinfo
+.DS_Store
+*.tgz
+examples/nimbus/debug-storybook.log
+examples/nimbus/sb-*.log
+examples/nimbus/dist-storybook/
+examples/nimbus/static-*.log
+api-test-boot.log

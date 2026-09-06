@@ -1,0 +1,490 @@
+#!/usr/bin/env node
+/**
+ * storybook-annotakit — client-side GitHub publisher unit tests (node-run).
+ *
+ * ghClient touches browser globals ONLY inside functions, so node can run it
+ * with shims installed BEFORE the dynamic import (same pattern as
+ * static-store-test.mjs). Covers THE contract that motivated the module:
+ * feedback survives a dead backend —
+ *   - config resolution (baked file + localStorage override, disabled, invalid)
+ *   - lifecycle: create → issue (labels + sentinel body + gh mapping),
+ *     reply → sentinel comment + ghId stamp, resolve/reopen → state flip,
+ *     delete → close notice
+ *   - durability: op survives a failed flush + full "reload" (store + runtime
+ *     re-created) and lands exactly once — never a duplicate issue
+ *   - idempotency: a second sync on a mapped thread pushes nothing new
+ *   - pull: third-party comment import, sentinel skip, ghId dedupe,
+ *     remote close → thread resolved, remote 404 → mapping reset
+ *   - leader election: a follower (iframe-like) doc only enqueues
+ *   - settings facet: runtime repo override + reset
+ */
+
+import assert from 'node:assert';
+
+/* ------------------------------ browser shims ------------------------------ */
+
+function makeLocalStorage() {
+  const map = new Map();
+  return {
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => map.set(k, String(v)),
+    removeItem: (k) => map.delete(k),
+    clear: () => map.clear(),
+    key: (i) => [...map.keys()][i] ?? null,
+    get length() { return map.size; },
+    _dump: () => Object.fromEntries(map),
+  };
+}
+
+const storageShim = makeLocalStorage();
+let pageUrl = 'https://site.test/stories/index.html';
+let parentOverride = undefined; // undefined → self-parent (leader doc)
+
+globalThis.localStorage = storageShim;
+globalThis.document = { get baseURI() { return new URL('iframe.html', pageUrl).href; } };
+globalThis.window = {
+  addEventListener() {},
+  get location() { return new URL(pageUrl); },
+  get parent() { return parentOverride ?? globalThis.window; },
+};
+
+/* --------------------------- baked config (fetch) --------------------------- */
+
+let bakedConfig = null; // annotakit-gh.json body served by the fetch shim
+
+globalThis.fetch = async (url) => {
+  const u = String(url);
+  if (u.includes('annotakit-gh.json')) {
+    if (bakedConfig) return { ok: true, status: 200, json: async () => bakedConfig };
+    return { ok: false, status: 404, json: async () => ({}) };
+  }
+  if (u.includes('annotakit-threads.json')) {
+    return { ok: true, status: 200, json: async () => ({ threads: [] }) };
+  }
+  return { ok: false, status: 404, json: async () => ({}) };
+};
+
+/* ------------------------------- fake GitHub -------------------------------- */
+
+function makeFakeGH() {
+  const gh = {
+    issues: new Map(), // number → {number, state, title, body, labels, comments: [], updated_at, closed_at, closed_by}
+    nextNumber: 101,
+    nextCommentId: 9001,
+    calls: [], // {method, path, body}
+    failNext: null, // {match, status, body} — one-shot failure
+  };
+  const issueOut = (i) => ({
+    number: i.number, state: i.state, title: i.title, html_url: `https://github.com/fake/i/${i.number}`,
+    closed_at: i.closed_at ?? null, closed_by: i.closed_by ?? null, updated_at: i.updated_at,
+  });
+  const headers = { get: (n) => (n === 'link' ? null : null) };
+  gh.transport = async (url, init = {}) => {
+    const u = new URL(String(url));
+    const path = u.pathname;
+    const method = (init.method ?? 'GET').toUpperCase();
+    if (gh.failNext && (!gh.failNext.match || gh.failNext.match.test(path))) {
+      const f = gh.failNext;
+      gh.failNext = null;
+      return { ok: false, status: f.status, text: async () => f.body ?? '', json: async () => ({}), headers };
+    }
+    gh.calls.push({ method, path, query: u.search, body: init.body ? JSON.parse(init.body) : null }); if (process.env.GHDBG) console.error('[gh-transport]', method, path, init.body ? String(init.body).slice(0,80) : '');
+    const auth = (init.headers ?? {})['Authorization'];
+    if (!auth || !auth.includes('tok_')) {
+      return { ok: false, status: 401, text: async () => 'bad token', json: async () => ({}), headers };
+    }
+    // POST /repos/:repo/issues — create
+    let m = path.match(/^\/repos\/(.+)\/issues\/(\d+)\/comments$/);
+    if (m && method === 'POST') {
+      const issue = gh.issues.get(Number(m[2]));
+      const body = JSON.parse(init.body);
+      const comment = { id: gh.nextCommentId++, body: body.body, created_at: new Date().toISOString(), user: { login: 'storybook-annotakit' }, html_url: `https://github.com/fake/c/${gh.nextCommentId}` };
+      issue.comments.push(comment);
+      issue.updated_at = new Date().toISOString();
+      return { ok: true, status: 201, json: async () => comment, headers };
+    }
+    // GET comments (since filter honored)
+    m = path.match(/^\/repos\/(.+)\/issues\/(\d+)\/comments$/);
+    if (m && method === 'GET') {
+      const issue = gh.issues.get(Number(m[2]));
+      const since = u.searchParams.get('since');
+      const out = since ? issue.comments.filter((c) => c.created_at > since) : issue.comments;
+      return { ok: true, status: 200, json: async () => out, headers };
+    }
+    // PATCH /repos/:repo/issues/:n — state flip
+    m = path.match(/^\/repos\/(.+)\/issues\/(\d+)$/);
+    if (m && method === 'PATCH') {
+      const issue = gh.issues.get(Number(m[2]));
+      const body = JSON.parse(init.body);
+      if (body.state) {
+        issue.state = body.state;
+        issue.updated_at = new Date().toISOString();
+        if (body.state === 'closed') { issue.closed_at = new Date().toISOString(); issue.closed_by = { login: 'storybook-annotakit' }; }
+        else { issue.closed_at = null; issue.closed_by = null; }
+      }
+      return { ok: true, status: 200, json: async () => issueOut(issue), headers };
+    }
+    // GET single issue
+    if (m && method === 'GET') {
+      const issue = gh.issues.get(Number(m[2]));
+      if (!issue) return { ok: false, status: 404, text: async () => 'Not Found', json: async () => ({}), headers };
+      return { ok: true, status: 200, json: async () => issueOut(issue), headers };
+    }
+    // POST /repos/:repo/issues — create
+    m = path.match(/^\/repos\/(.+)\/issues$/);
+    if (m && method === 'POST') {
+      const body = JSON.parse(init.body);
+      const issue = {
+        number: gh.nextNumber++, state: 'open', title: body.title, body: body.body, labels: body.labels ?? [],
+        comments: [], updated_at: new Date().toISOString(), closed_at: null, closed_by: null,
+      };
+      gh.issues.set(issue.number, issue);
+      return { ok: true, status: 201, json: async () => issueOut(issue), headers };
+    }
+    // GET list — models REAL GitHub semantics (verified live 2026-09-07):
+    //   `labels=a,b`   → AND across all labels
+    //   `labels=a&labels=b` → LAST value wins (== `labels=b`) — repeated
+    //   params do NOT AND. The client MUST send the comma form; the regression
+    //   test in §13 asserts exactly that.
+    m = path.match(/^\/repos\/(.+)\/issues$/);
+    if (m && method === 'GET') {
+      const all = u.searchParams.getAll('labels');
+      const labels = String(all.length ? all[all.length - 1] : '').split(',').filter(Boolean);
+      const out = [...gh.issues.values()].filter((i) => labels.every((l) => i.labels.includes(l)));
+      return { ok: true, status: 200, json: async () => out.map(issueOut), headers };
+    }
+    return { ok: false, status: 404, text: async () => `no route ${method} ${path}`, json: async () => ({}), headers };
+  };
+  return gh;
+}
+
+/* --------------------------------- helpers ---------------------------------- */
+
+const gh = makeFakeGH();
+
+let passed = 0;
+const ok = (name, cond) => { assert.ok(cond, name); passed += 1; console.log(`  ok ${name}`); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(cond, label = 'condition', tries = 200) {
+  for (let i = 0; i < tries; i++) {
+    if (cond()) return true;
+    await sleep(10);
+  }
+  return false;
+}
+
+const threadInput = (id, body = 'looks off') => ({
+  id,
+  storyId: 's1',
+  story: { storyId: 's1', title: 'Button', name: 'primary' },
+  target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null },
+  comments: [{ id: `c_${id}`, author: 'reviewer', body, createdAt: new Date().toISOString() }],
+});
+
+async function fresh(baked) {
+  const { resetStaticStoreForTests } = await import('../dist/staticStore.mjs');
+  const ghc = await import('../dist/ghClient.mjs');
+  resetStaticStoreForTests();
+  ghc.__ghResetForTests();
+  ghc.__ghSetTransportForTests(gh.transport);
+  bakedConfig = baked;
+  storageShim.clear();
+  gh.calls.length = 0;
+  return ghc;
+}
+
+/** Simulate a full page RELOAD: module caches dropped, localStorage contents
+ *  survive exactly as a browser would keep them. */
+async function reload(baked, { zeroBackoff = false } = {}) {
+  const dump = storageShim._dump();
+  if (zeroBackoff) {
+    const qk = 'annotakit:ghq:https://site.test/stories/';
+    if (dump[qk]) {
+      // exercise the BOOT-DRAIN path directly; the delayed retry is
+      // separately guaranteed by the 30s sweep + next-mutation wake
+      const doc = JSON.parse(dump[qk]);
+      doc.ops = (doc.ops ?? []).map((o) => ({ ...o, notBefore: 0, attempts: 0 }));
+      dump[qk] = JSON.stringify(doc);
+    }
+  }
+  const ghc = await fresh(baked);
+  for (const [k, v] of Object.entries(dump)) storageShim.setItem(k, v);
+  return ghc;
+}
+
+const queueOps = (ghc) => {
+  const raw = storageShim._dump()[`annotakit:ghq:https://site.test/stories/`];
+  return raw ? JSON.parse(raw).ops : [];
+};
+
+/* ------------------------------- scenarios ---------------------------------- */
+
+const ghc = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit', 'ws-a'], pollMs: 600_000 });
+
+/* 1 — config resolution */
+{
+  const cfg = await ghc.probeGhConfig();
+  ok('baked config resolved', cfg?.token === 'tok_AAA' && cfg?.repo === 'acme/web');
+  ok('baked labels kept', cfg?.labels.join(',') === 'annotakit,ws-a');
+  const merged = ghc.resolveGhConfig({ token: 'tok_BBB', repo: 'x/y', labels: ['a'] }, { repo: 'over/r' });
+  ok('override beats baked (repo)', merged?.repo === 'over/r' && merged?.token === 'tok_BBB');
+  ok('disabled kills config', ghc.resolveGhConfig({ token: 't', repo: 'a/b' }, { disabled: true }) === null);
+  ok('invalid repo rejected', ghc.resolveGhConfig({ token: 't', repo: 'no-slash' }, {}) === null);
+  ok('no token rejected', ghc.resolveGhConfig({ repo: 'a/b' }, {}) === null);
+}
+
+/* 2 — create → issue, labels, sentinel body, mapping stamp, queue drains */
+let createdThread;
+{
+  const store = await ghc.getGhLinkedStaticStore();
+  createdThread = await store.create(threadInput('th_1'));
+  await until(() => queueOps(ghc).length === 0, 'queue drained');
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_1'));
+  ok('issue created', Boolean(issue));
+  ok('issue labels ALL applied', issue?.labels.join(',') === 'annotakit,ws-a');
+  ok('issue body has thread id + sentinel', issue?.body.includes('thread id: th_1') && issue?.body.includes('<!-- annotakit -->'));
+  ok('issue title format', issue?.title.startsWith('[review] primary — #1 '));
+  const t = store.list().find((x) => x.id === 'th_1');
+  ok('gh mapping stamped', t?.gh?.issue === issue?.number && t?.gh?.state === 'open');
+  ok('first comment marked issue-body', t?.comments[0]?.ghId === 'issue-body');
+  const st = store.gh?.status();
+  ok('status: configured + leader', st?.configured === true && st?.leader === true && st?.queue === 0);
+}
+
+/* 3 — reply → sentinel comment + ghId stamp */
+{
+  const store = await ghc.getGhLinkedStaticStore();
+  await store.addComment('th_1', 'fixed in PR 7', 'agent-z');
+  await until(() => queueOps(ghc).length === 0, 'reply flushed');
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_1'));
+  const mirror = issue?.comments.find((c) => c.body.includes('fixed in PR 7'));
+  ok('reply mirrored with sentinel', Boolean(mirror?.body.includes('<!-- annotakit:c_c_') || mirror?.body.includes('c_')));
+  const t = store.list().find((x) => x.id === 'th_1');
+  const reply = t?.comments.find((c) => c.body === 'fixed in PR 7');
+  ok('reply ghId stamped from GH', reply?.ghId === String(mirror?.id));
+}
+
+/* 4 — resolve → close; reopen → open */
+{
+  const store = await ghc.getGhLinkedStaticStore();
+  const t = store.list().find((x) => x.id === 'th_1');
+  await store.patch({ ...t, status: 'resolved', resolvedAt: new Date().toISOString() });
+  await until(() => queueOps(ghc).length === 0, 'resolve flushed');
+  let issue = [...gh.issues.values()].find((i) => i.body.includes('th_1'));
+  ok('issue closed on resolve', issue?.state === 'closed');
+  ok('close notice comment', issue?.comments.some((c) => c.body.includes('resolved in Storybook')));
+  const t2 = store.list().find((x) => x.id === 'th_1');
+  ok('gh.state mirrors closed', t2?.gh?.state === 'closed');
+
+  await store.patch({ ...t2, status: 'open' });
+  await until(() => queueOps(ghc).length === 0, 'reopen flushed');
+  issue = [...gh.issues.values()].find((i) => i.body.includes('th_1'));
+  ok('issue reopened', issue?.state === 'open');
+  ok('reopen notice comment', issue?.comments.some((c) => c.body.includes('reopened in Storybook')));
+}
+
+/* 5 — idempotency: re-enqueue a mapped thread pushes NOTHING new */
+{
+  const store = await ghc.getGhLinkedStaticStore();
+  const before = gh.issues.size;
+  const callsBefore = gh.calls.length;
+  const t = store.list().find((x) => x.id === 'th_1');
+  await store.patch({ ...t }); // no-op patch still enqueues a sync op
+  await until(() => queueOps(ghc).length === 0, 'noop op flushed');
+  ok('no duplicate issue', gh.issues.size === before);
+  ok('noop sync made zero GH calls', gh.calls.length === callsBefore);
+}
+
+/* 6 — durability: failed flush keeps the op; full reload lands it ONCE */
+{
+  const ghc6 = await fresh(null); // no baked config → unconfigured… use explicit settings
+  gh.failNext = { match: /issues$/, status: 503, body: 'boom' };
+  // configure via settings (localStorage override), then create with failing transport
+  const store = await ghc6.getGhLinkedStaticStore();
+  store.gh?.saveSettings({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'] });
+  const t = await store.create(threadInput('th_dur'));
+  await sleep(150); // flush attempt fails, op backs off
+  const ops = queueOps(ghc6);
+  ok('op survived failed flush', ops.some((o) => o.kind === 'sync' && o.threadId === 'th_dur'));
+  ok('op has attempts + lastError', (ops[0]?.attempts ?? 0) >= 1 && Boolean(ops[0]?.lastError));
+  ok('no issue created while down', ![...gh.issues.values()].some((i) => i.body.includes('th_dur')));
+  // full "reload": module caches dropped, localStorage (threads + queue +
+  // config) survives as in a browser; transport is healthy again
+  const ghc6b = await reload(null, { zeroBackoff: true });
+  const store2 = await ghc6b.getGhLinkedStaticStore(); // boot drain
+  ok('queued op flushed after reload', await until(() => queueOps(ghc6b).length === 0));
+  const issue = [...gh.issues.values()].filter((i) => i.body.includes('th_dur'));
+  ok('exactly ONE issue after recovery', issue.length === 1);
+  const t2 = store2.list().find((x) => x.id === 'th_dur');
+  ok('mapping stamped after recovery', t2?.gh?.issue === issue[0]?.number);
+}
+
+/* 7 — delete → close op with notice */
+{
+  const ghc7 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc7.getGhLinkedStaticStore();
+  const t = await store.create(threadInput('th_del'));
+  await until(() => queueOps(ghc7).length === 0);
+  const issueNo = [...gh.issues.values()].find((i) => i.body.includes('th_del'))?.number;
+  await store.deleteThread('th_del');
+  await until(() => queueOps(ghc7).length === 0, 'close op flushed');
+  const issue = gh.issues.get(issueNo ?? -1);
+  ok('issue closed after delete', issue?.state === 'closed');
+  ok('delete notice comment', issue?.comments.some((c) => c.body.includes('thread deleted in Storybook')));
+  ok('thread gone locally', !store.list().some((x) => x.id === 'th_del'));
+}
+
+/* 8 — pull: third-party comment import + dedupe + state flip */
+{
+  const ghc8 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc8.getGhLinkedStaticStore();
+  const t = await store.create(threadInput('th_pull'));
+  await until(() => queueOps(ghc8).length === 0);
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_pull'));
+  // timestamps strictly AFTER the mapping's syncedAt (GitHub bumps
+  // updated_at on every comment; same-ms collisions are unrealistic)
+  const later = () => new Date(Date.now() + 5000).toISOString();
+  const bump = () => { issue.updated_at = later(); };
+  // a human/agent replies on GitHub (no sentinel → importable)
+  issue.comments.push({ id: 777, body: 'fixed via abc123', created_at: later(), user: { login: 'human' } });
+  // our own SYSTEM mirror (GH_SENTINEL body — close/reopen notices) must be
+  // skipped by the pull filter; a per-comment mirror whose local reply was
+  // lost self-heals via the sentinel's local id instead (engine parity)
+  issue.comments.push({ id: 778, body: '<!-- annotakit -->\nresolved in Storybook — thread #1.', created_at: later(), user: { login: 'storybook-annotakit' } });
+  bump();
+  await store.gh?.syncNow();
+  const t2 = store.list().find((x) => x.id === 'th_pull');
+  ok('third-party comment imported', t2?.comments.some((c) => c.body === 'fixed via abc123' && c.source === 'github' && c.ghId === '777'));
+  ok('system mirror NOT imported', !t2?.comments.some((c) => c.ghId === '778' || c.body.includes('resolved in Storybook — thread #1.')));
+  // dedupe: pull again → nothing new
+  const count = t2?.comments.length;
+  await store.gh?.syncNow();
+  const t3 = store.list().find((x) => x.id === 'th_pull');
+  ok('pull idempotent (no duplicates)', t3?.comments.length === count);
+  // remote close → thread resolved
+  issue.state = 'closed';
+  issue.closed_at = later();
+  issue.closed_by = { login: 'human' };
+  issue.comments.push({ id: 779, body: 'closing', created_at: later(), user: { login: 'human' } });
+  bump();
+  await store.gh?.syncNow();
+  const t4 = store.list().find((x) => x.id === 'th_pull');
+  ok('remote close → thread resolved', t4?.status === 'resolved' && t4?.gh?.state === 'closed');
+  ok('close system comment', t4?.comments.some((c) => c.body === 'closed on GitHub' && c.source === 'github'));
+}
+
+/* 9 — follower doc: enqueue only, no flush (leader election) */
+{
+  const ghc9 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  parentOverride = { location: { href: 'https://site.test/stories/index.html' } }; // foreign parent → follower
+  const store = await ghc9.getGhLinkedStaticStore();
+  const st = store.gh?.status();
+  ok('follower recognized', st?.leader === false);
+  await store.create(threadInput('th_fol'));
+  await sleep(120);
+  ok('follower enqueued op', queueOps(ghc9).some((o) => o.kind === 'sync' && o.threadId === 'th_fol'));
+  ok('follower made ZERO gh calls', gh.calls.filter((c) => c.path?.includes('/issues')).length === 0);
+  // leader takes over in another "document" (parent back to self) — the same
+  // localStorage (thread + queued op) transfers, exactly like the manager
+  // waking up while the preview iframe sits on the queue
+  parentOverride = undefined;
+  const ghc9b = await reload({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const storeL = await ghc9b.getGhLinkedStaticStore();
+  // boot drain lands the follower's pin first (create-before-reply, as in
+  // real usage — comments that exist at create time ride in the issue body)
+  ok('boot drain flushed follower op', await until(() => queueOps(ghc9b).length === 0));
+  const issueA = [...gh.issues.values()].filter((i) => i.body.includes('th_fol'));
+  ok('follower pin landed exactly once via leader', issueA.length === 1);
+  // a NEW reply from the leader doc → mirrored as a separate issue comment
+  await storeL.addComment('th_fol', 'leader reply', 'reviewer');
+  ok('leader drained the reply', await until(() => queueOps(ghc9b).length === 0));
+  ok('leader reply mirrored as comment', issueA[0]?.comments.some((c) => c.body.includes('leader reply')));
+  ok('reply ghId stamped', storeL.list().find((t) => t.id === 'th_fol')?.comments.some((c) => c.body === 'leader reply' && c.ghId));
+}
+
+/* 10 — settings facet: runtime repo override + reset */
+{
+  const ghc10 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc10.getGhLinkedStaticStore();
+  store.gh?.saveSettings({ repo: 'other/team', labels: ['ws-b'] });
+  const t = await store.create(threadInput('th_ovr'));
+  await until(() => queueOps(ghc10).length === 0);
+  const created = gh.calls.find((c) => c.method === 'POST' && c.path === '/repos/other/team/issues');
+  ok('override repo + labels used on create', Boolean(created) && created?.body?.labels?.join(',') === 'ws-b,annotakit' || created?.body?.labels?.join(',') === 'ws-b');
+  store.gh?.clearSettings();
+  const cfg = await ghc10.probeGhConfig();
+  ok('reset returns to baked', cfg?.repo === 'acme/web');
+}
+
+/* 11 — 401 keeps the op queued with a self-healing error */
+{
+  const ghc11 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  ghc11.__ghSetTransportForTests(async () => ({ ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }));
+  const store = await ghc11.getGhLinkedStaticStore();
+  await store.create(threadInput('th_401'));
+  await sleep(150);
+  const ops = queueOps(ghc11);
+  ok('401 keeps op queued', ops.some((o) => o.kind === 'sync' && o.threadId === 'th_401'));
+  const st = store.gh?.status();
+  ok('401 surfaces self-healing error', Boolean(st?.lastError?.includes('settings') || st?.lastError?.includes('PAT') || st?.lastError?.includes('401')));
+}
+
+/* 12 — issue deleted remotely (404) → mapping reset + re-create on next push */
+{
+  const ghc12 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc12.getGhLinkedStaticStore();
+  const t = await store.create(threadInput('th_404'));
+  await until(() => queueOps(ghc12).length === 0);
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_404'));
+  gh.issues.delete(issue.number); // human deletes the issue on GitHub
+  await store.gh?.syncNow();
+  let t2 = store.list().find((x) => x.id === 'th_404');
+  ok('mapping reset after remote delete', !t2?.gh);
+  ok('system comment explains', t2?.comments.some((c) => c.body.includes('deleted remotely')));
+  // the re-enqueued sync op re-creates the mirror
+  await until(() => queueOps(ghc12).length === 0, 're-create flushed');
+  t2 = store.list().find((x) => x.id === 'th_404');
+  const recreated = [...gh.issues.values()].filter((i) => i.body.includes('th_404'));
+  ok('issue re-created exactly once', recreated.length === 1 && t2?.gh?.issue === recreated[0].number);
+}
+
+/* 13 — pull listing filter: comma-joined AND labels (regression). GitHub
+ * treats repeated labels= params as LAST-WINS, so `labels=a&labels=b` filters
+ * by b ONLY — v0.5.3 shipped that form and the filter silently shrank to the
+ * last label. The fake models real GitHub semantics (see makeFakeGH); this
+ * test pins the WIRE FORMAT (encoded comma) and the AND behavior. */
+{
+  const ghc13 = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit', 'ws-a'], pollMs: 600_000 });
+  const store = await ghc13.getGhLinkedStaticStore();
+  // create a thread the normal way — the engine mints an issue carrying the
+  // FULL baked label set [annotakit, ws-a]. Then seed a FOREIGN issue from
+  // another workstream carrying ONLY the last label — exactly what the old
+  // repeated-param form (last-wins on GitHub) would match.
+  await store.create(threadInput('th_13a'));
+  await until(() => queueOps(ghc13).length === 0, 'own issue created');
+  const own = store.list().find((t) => t.id === 'th_13a');
+  ok('own issue mapped', typeof own?.gh?.issue === 'number');
+  gh.issues.set(202, { number: 202, state: 'open', title: 'foreign', body: 'other workstream', labels: ['ws-a'], comments: [], updated_at: new Date().toISOString(), closed_at: null, closed_by: null });
+  gh.calls.length = 0;
+  await store.gh?.syncNow();
+  // 1. wire format: the listing request must carry ONE labels= param with the
+  //    encoded-comma form (the old form sent labels=annotakit&labels=ws-a)
+  const listCall = gh.calls.find((c) => c.method === 'GET' && c.path === '/repos/acme/web/issues' && (c.query ?? '').includes('state=all'));
+  ok('listing query is comma-joined AND form', Boolean(listCall && listCall.query === '?labels=annotakit%2Cws-a&state=all&per_page=100&sort=updated&direction=desc'));
+  // 2. semantics: the fake (real GitHub rules) must EXCLUDE the foreign
+  //    issue under the comma form, and INCLUDE it under the old repeated
+  //    form — transport-level ground truth, both directions. (Earlier test
+  //    sections' issues persist in the fake — absolute counts are not the
+  //    discriminator; the ws-a-only foreign issue is.)
+  const resp = await gh.transport('https://api.github.com/repos/acme/web/issues?labels=annotakit%2Cws-a&state=all', { headers: { Authorization: 'Bearer tok_AAA' } });
+  const listed = await resp.json();
+  ok('comma form excludes foreign workstream issue', listed.length >= 1 && !listed.some((i) => i.number === 202) && listed.every((i) => gh.issues.get(i.number)?.labels.includes('ws-a') && gh.issues.get(i.number)?.labels.includes('annotakit')));
+  const respOld = await gh.transport('https://api.github.com/repos/acme/web/issues?labels=annotakit&labels=ws-a&state=all', { headers: { Authorization: 'Bearer tok_AAA' } });
+  const listedOld = await respOld.json();
+  ok('repeated form is last-wins on real GitHub (negative control)', listedOld.some((i) => i.number === 202));
+}
+
+/* cleanup + summary */
+ghc.__ghResetForTests();
+console.log(`\nghclient: ${passed}/${passed} passed`);
+process.exit(0);
