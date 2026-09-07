@@ -38,6 +38,7 @@ import {
 import { elementSummary } from '../shared/describe';
 import { probeMode } from '../shared/mode';
 import { getGhLinkedStaticStore, type GhClientStatus } from '../shared/ghClient';
+import { MAX_BODY_CHARS } from '../shared/types';
 import type { DomSnapshot, ThreadInput } from '../shared/types';
 import type { Comment, ComponentRef, TargetContext, Thread, ThreadTarget } from '../shared/types';
 
@@ -217,6 +218,19 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
   const [helpOpen, setHelpOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** v0.6.1: transient, non-error friction hints (Track C) — dead clicks and
+   *  blocked commands must SPEAK instead of failing silently. */
+  const [hint, setHint] = useState<string | null>(null);
+  const hintTimer = useRef<number | undefined>(undefined);
+  const showHint = useCallback((text: string) => {
+    setHint(text);
+    if (hintTimer.current) window.clearTimeout(hintTimer.current);
+    hintTimer.current = window.setTimeout(() => setHint(null), 2600);
+  }, []);
+  useEffect(() => () => { if (hintTimer.current) window.clearTimeout(hintTimer.current); }, []);
+  /** v0.6.1: localStorage write failures (quota/privacy) must surface in the
+   *  canvas — a pin that will not survive reload is a lie without this. */
+  const [storageError, setStorageError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const [hoverBox, setHoverBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [dragRect, setDragRect] = useState<{ x: number; y: number; h: number; w: number } | null>(null);
@@ -378,6 +392,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
       const readStatus = (): void => {
         if (!alive) return;
         setGhStatus(store.gh?.status() ?? null);
+        setStorageError(store.info().lastStorageError ?? null);
       };
       readStatus();
       statusPoll = window.setInterval(readStatus, 2000);
@@ -461,9 +476,16 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
     const onCommand = (cmd: UiCommand | undefined) => {
       if (!cmd?.command) return;
       if (cmd.command === 'pin' || cmd.command === 'region') {
-        if (!composer && !activeThread) {
+        // v0.6.1 (Track C P1-4): a thread popup used to BLOCK the pin command
+        // silently — the reviewer clicked Pin, the button/hint looked armed,
+        // then every canvas click did NOTHING. enterMode already closes the
+        // popup (setActiveThread(null)) — no reason to refuse the intent.
+        // A COMPOSER with a draft still guards (never silently eat text).
+        if (!composer) {
           const m = cmd.command;
           enterMode(mode === m ? 'idle' : m);
+        } else {
+          showHint('Submit or cancel the open comment first (Esc)');
         }
       } else if (cmd.command === 'drawer') {
         setDrawerOpen((d) => !d);
@@ -663,9 +685,11 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
         return;
       }
       if (altOf(hkPin)) {
-        if (!composer && !activeThread) enterMode(mode === 'pin' ? 'idle' : 'pin');
+        if (!composer) enterMode(mode === 'pin' ? 'idle' : 'pin');
+        else showHint('Submit or cancel the open comment first (Esc)');
       } else if (altOf(hkRegion)) {
-        if (!composer && !activeThread) enterMode(mode === 'region' ? 'idle' : 'region');
+        if (!composer) enterMode(mode === 'region' ? 'idle' : 'region');
+        else showHint('Submit or cancel the open comment first (Esc)');
       } else if (altOf(hkLayer)) {
         setVisible((v) => !v);
       } else if (altOf(hkDrawer)) {
@@ -844,7 +868,16 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
                 top: clamp(fixed.y - 26, 2, Math.max(window.innerHeight - 26, 2)),
               }}
               onClick={() => setActiveThread(thread.id)}
-              title={`#${thread.number}${status === 'orphan' ? ' (orphaned — element not found)' : ''}`}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setActiveThread(thread.id);
+                }
+              }}
+              tabIndex={0}
+              role="button"
+              aria-label={`Open thread #${thread.number} (${thread.status})`}
+              title={`#${thread.number} — Enter/Space opens${status === 'orphan' ? ' (orphaned — element not found)' : ''}`}
             >
               {thread.number}
             </div>
@@ -855,12 +888,27 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
           browser itself lands feedback on GitHub (PAT baked/embedded or set
           in the manager's static settings); queue counts + errors surface
           here. Otherwise: local-only, export to hand-carry. */}
-      {staticMode && !ghStatus?.configured && (
+      {staticMode && !ghStatus?.configured && !ghStatus?.suppressed && (
         <div className="annota-static-chip" title="Static `storybook build` — no dev server. Threads live in this browser's localStorage for this deployment; export to hand-carry them back. Nothing syncs.">
           📌 static · local-only
         </div>
       )}
-      {staticMode && ghStatus?.configured && (
+      {staticMode && ghStatus?.suppressed && (
+        <div
+          className="annota-static-chip"
+          style={{ background: '#92400e22', color: '#b45309', borderColor: '#92400e66' }}
+          title={[
+            'Static build + client-side GitHub publishing — DISABLED by local settings.',
+            ghStatus && ghStatus.queue > 0 ? `queued feedback holds until re-enabled: ${ghStatus.queue}` : null,
+            'Open the annotakit panel → GitHub (static) settings to re-enable.',
+          ]
+            .filter(Boolean)
+            .join('\n')}
+        >
+          📌 static · client GH off{ghStatus && ghStatus.queue > 0 ? ` · ${ghStatus.queue} queued` : ''}
+        </div>
+      )}
+      {staticMode && ghStatus?.configured && !ghStatus.suppressed && (
         <div
           className="annota-static-chip"
           style={
@@ -869,9 +917,9 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
               : { background: '#16a34a22', color: '#15803d', borderColor: '#16a34a66' }
           }
           title={[
-            `Static build + client-side GitHub publishing → ${ghStatus.repo}`,
-            `labels: ${ghStatus.labels.join(', ')}`,
-            `queue: ${ghStatus.queue}${ghStatus.flushing ? ' (flushing)' : ''}`,
+            `Static build + client-side GitHub publishing → ${ghStatus.repo ?? '(not set)'}`,
+            `labels: ${ghStatus.labels.length ? ghStatus.labels.join(', ') : '(default)'}`,
+            `queue: ${ghStatus.queue}${ghStatus.flushing ? ' (flushing)' : ''}${ghStatus.parked ? ` · parked: ${ghStatus.parked} (rejected by GitHub — not retrying)` : ''}`,
             ghStatus.lastPushAt ? `last push: ${ghStatus.lastPushAt.replace('T', ' ').slice(5, 16)}` : null,
             ghStatus.lastPullAt ? `last pull: ${ghStatus.lastPullAt.replace('T', ' ').slice(5, 16)}` : null,
             ghStatus.lastError ? `error: ${ghStatus.lastError}` : null,
@@ -880,10 +928,28 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
             .join('\n')}
         >
           {ghStatus.lastError
-            ? '📌 static → github · error'
+            ? `📌 static → github · error${ghStatus.queue > 0 ? ` · queued ${ghStatus.queue}` : ''}`
             : ghStatus.queue > 0
               ? `📌 static → github · queued ${ghStatus.queue}`
               : '📌 static → github'}
+        </div>
+      )}
+
+      {/* transient, non-error friction hints (v0.6.1) — dead clicks SPEAK */}
+      {hint && mode === 'idle' && (
+        <div className="annota-capture-hint" role="status">
+          {hint}
+        </div>
+      )}
+
+      {/* localStorage write failure (quota/privacy) — feedback is NOT
+          persisting; say so in the canvas, not in a console (v0.6.1) */}
+      {staticMode && storageError && (
+        <div className="annota-toast is-error" role="alert">
+          ⚠ {storageError}
+          <button className="annota-btn is-small" onClick={() => setStorageError(null)}>
+            ✕
+          </button>
         </div>
       )}
 
@@ -994,6 +1060,14 @@ function useClampedPosition(x: number, y: number): { ref: React.RefObject<HTMLDi
 
 /* ------------------------------- sub components ------------------------------- */
 
+/** v0.6.1 (Track C P2-6): minified production names ("E", "KJ") read as bugs
+ *  to humans — suppress them in the UI at RENDER time (capture keeps the raw
+ *  value; digests stay truthful). */
+function prettyName(name: string | undefined): string | null {
+  if (!name) return null;
+  return /^[A-Za-z$_][A-Za-z0-9$_]{0,1}$/.test(name) ? null : name;
+}
+
 function ComposerCard(props: {
   x: number;
   y: number;
@@ -1005,6 +1079,10 @@ function ComposerCard(props: {
   onCancel: () => void;
 }): React.ReactElement {
   const [body, setBody] = React.useState('');
+  // v0.6.1 (Track C P2-8): Esc on a NON-EMPTY draft used to discard it
+  // instantly and irrecoverably. Two-stage now: first Esc arms a visible
+  // "again to discard" hint, the second one discards. Typing resets the arm.
+  const [discardArmed, setDiscardArmed] = React.useState(false);
   const { ref, style } = useClampedPosition(props.x, props.y);
   // v0.5.0: the EXACT same one-line identity the digest will render later —
   // what the reviewer pins is byte-for-byte what the agent reads back.
@@ -1019,9 +1097,9 @@ function ComposerCard(props: {
         <div className="annota-element-summary" title={props.context.outerHTML}>
           <b>element:</b> {summary}
         </div>
-        {props.component?.name && (
+        {props.component && prettyName(props.component.name) && (
           <div>
-            <b>component:</b> {props.component.name}
+            <b>component:</b> {prettyName(props.component.name) as string}
             {props.component.key != null && <span className="annota-chip is-meta">key=&quot;{props.component.key}&quot;</span>}
           </div>
         )}
@@ -1033,27 +1111,51 @@ function ComposerCard(props: {
         )}
       </div>
       {props.error && <div className="annota-status-banner is-error">{props.error}</div>}
+      {discardArmed && body.trim() && (
+        <div className="annota-status-banner is-info" role="status">
+          Press Esc again to discard this comment.
+        </div>
+      )}
       <div style={{ padding: '10px 12px' }}>
         <textarea
           className="annota-textarea"
           autoFocus
           placeholder="What's wrong here? (⌘/Ctrl+Enter to pin)"
           value={body}
-          onChange={(e) => setBody(e.target.value)}
+          maxLength={MAX_BODY_CHARS}
+          onChange={(e) => {
+            setDiscardArmed(false);
+            setBody(e.target.value);
+          }}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && body.trim()) {
               e.preventDefault();
               props.onSubmit(body);
             }
+            if (e.key === 'Escape') {
+              // stop the document handler from also firing (it would discard
+              // the draft in one shot)
+              e.stopPropagation();
+              if (body.trim() && !discardArmed) {
+                setDiscardArmed(true);
+                return;
+              }
+              props.onCancel();
+            }
           }}
         />
+        {body.length > MAX_BODY_CHARS - 2000 && (
+          <div className="annota-status-banner is-info" style={{ marginTop: 4 }}>
+            {MAX_BODY_CHARS - body.length} characters left (bodies are capped to keep mirrors safe)
+          </div>
+        )}
       </div>
       <div className="annota-reply-row">
         <span style={{ flex: 1 }} />
         <button className="annota-btn" onClick={props.onCancel}>
           Cancel
         </button>
-        <button className="annota-btn is-primary" disabled={!body.trim() || props.busy} onClick={() => props.onSubmit(body)}>
+        <button className="annota-btn is-primary" disabled={!body.trim() || body.length > MAX_BODY_CHARS || props.busy} onClick={() => props.onSubmit(body)}>
           Pin it
         </button>
       </div>
@@ -1092,7 +1194,7 @@ function ThreadCard(props: {
             ⤴ #{t.gh.issue}
           </a>
         )}
-        {comp?.name && <span className="annota-chip is-component">{comp.name}</span>}
+        {comp?.name && prettyName(comp.name) && <span className="annota-chip is-component">{prettyName(comp.name)}</span>}
         <button className="annota-btn is-small" onClick={props.onClose}>
           ✕
         </button>
@@ -1111,7 +1213,7 @@ function ThreadCard(props: {
         )}
         {comp && comp.chain?.length > 1 && (
           <div>
-            <b>chain:</b> {comp.chain.slice(0, 5).join(' > ')}
+            <b>chain:</b> {comp.chain.slice(0, 5).filter((n): n is string => Boolean(prettyName(n))).join(' > ')}
           </div>
         )}
         {t.target.selector.cssSelector && (
@@ -1138,6 +1240,7 @@ function ThreadCard(props: {
           className="annota-input"
           placeholder="Reply…"
           value={replyBody}
+          maxLength={MAX_BODY_CHARS}
           onChange={(e) => setReplyBody(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && replyBody.trim() && !props.busy) {
@@ -1175,13 +1278,13 @@ function DrawerCard(props: {
   return (
     <div className="annota-card annota-drawer">
       <div className="annota-card-header">
-        <span className="annota-grow">
+        <span className="annota-grow" title="Press ? for all keyboard shortcuts">
           Threads — this story ({props.threads.filter((t) => t.status === 'open').length} open)
         </span>
         <button
           className={`annota-btn is-small${filter === 'open' ? ' is-primary' : ''}`}
           onClick={() => setFilter((f) => (f === 'open' ? 'all' : 'open'))}
-          title="Show only open threads"
+          title={`Filter: ${filter === 'open' ? 'open only' : 'all'} — click to ${filter === 'open' ? 'show all threads' : 'show only open threads'}`}
         >
           {filter === 'open' ? 'open only' : 'all'}
         </button>

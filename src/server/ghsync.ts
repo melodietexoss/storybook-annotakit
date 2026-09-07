@@ -402,9 +402,23 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       if (issueActive) {
         const ghComments = await listIssueComments(tk, rp, mir.issue, since);
         const known = new Set(t.comments.map((c) => c.ghId).filter((x): x is string => Boolean(x)));
-        fresh = ghComments
-          .filter((c) => !known.has(String(c.id)) && !c.body.includes(GH_SENTINEL))
-          .sort((a, b) => a.created_at.localeCompare(b.created_at));
+        // v0.6.1 hostile-input hardening (Track A): GitHub issue comments are
+        // ATTACKER-CONTROLLABLE data — one malformed comment (body not a
+        // string, created_at missing/non-string) used to TypeError mid-sort
+        // and abort the ENTIRE pull for every thread. Skip malformed entries
+        // with a counter instead; never let remote garbage block the mirror.
+        let malformed = 0;
+        for (const c of ghComments) {
+          if (typeof c?.body !== 'string' || (c.created_at !== undefined && typeof c.created_at !== 'string')) {
+            malformed++;
+            continue;
+          }
+          if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
+        }
+        if (malformed > 0) {
+          console.warn(`[storybook-annotakit] pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at) — treated as untrusted input, not imported`);
+        }
+        fresh.sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')));
       }
 
       if (statusChange || fresh.length > 0 || mir.state !== issue.state || issueActive) {
@@ -438,7 +452,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
               id: newId().replace(/^th_/, 'c_'),
               author: c.user?.login ?? 'github',
               body: c.body.replace(SENTINEL_RE, '').trimEnd(),
-              createdAt: c.created_at,
+              createdAt: typeof c.created_at === 'string' && c.created_at ? c.created_at : nowIso(),
               ghId: String(c.id),
               source: 'github',
             });

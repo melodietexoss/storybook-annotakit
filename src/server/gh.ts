@@ -111,6 +111,17 @@ async function ghError(res: Response, method: string, pathname: string): Promise
   if (res.status === 404) {
     throw Object.assign(new Error(`GitHub 404 on ${method} ${pathname} (${text.slice(0, 160)})`), { status: 404 });
   }
+  if (res.status === 422) {
+    // The BODY itself was rejected (too long / validation) — retrying can
+    // never fix it. Non-transient: the engine stops hammering within this
+    // cycle and surfaces the error (the periodic sweep may retry later,
+    // documented). Capture-side caps (MAX_BODY_CHARS) make this unreachable
+    // in practice — belt and braces.
+    throw Object.assign(
+      new Error(`GitHub rejected the request body (422: ${text.slice(0, 200)}) — not retried automatically; the offending thread's body needs editing`),
+      { status: 422 },
+    );
+  }
   // 5xx and anything else unexpected → 502, transient (retry with backoff)
   throw Object.assign(
     new Error(`GitHub API ${res.status} on ${method} ${pathname}: ${text.slice(0, 300)}`),

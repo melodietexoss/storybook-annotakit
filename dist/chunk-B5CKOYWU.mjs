@@ -2,7 +2,7 @@ import {
   getStaticStore,
   renderThreadBlock,
   staticScope
-} from "./chunk-MI4XC5WF.mjs";
+} from "./chunk-EVH4K5TX.mjs";
 
 // src/shared/ghClient.ts
 var GH_FILE = "annotakit-gh.json";
@@ -42,6 +42,12 @@ async function ghError(res, method, pathname) {
   }
   if (res.status === 404) {
     throw Object.assign(new Error(`GitHub 404 on ${method} ${pathname} (${text.slice(0, 160)})`), { status: 404 });
+  }
+  if (res.status === 422) {
+    throw Object.assign(
+      new Error(`GitHub rejected the request body (422: ${text.slice(0, 200)}) \u2014 this op will not be retried automatically; edit or delete the offending thread feedback.`),
+      { status: 422, park: true }
+    );
   }
   throw Object.assign(new Error(`GitHub API ${res.status} on ${method} ${pathname}: ${text.slice(0, 300)}`), {
     status: 502,
@@ -289,6 +295,7 @@ function writeQueue(ops) {
   try {
     store.setItem(queueKey(), JSON.stringify({ v: 1, ops }));
   } catch {
+    if (state) state.lastError = "outbox write failed (storage full) \u2014 publishing paused for new feedback; free space or export + re-add later";
   }
 }
 function opKeyOf(op) {
@@ -311,12 +318,24 @@ function enqueue(kind, ref) {
 function removeOp(id) {
   writeQueue(readQueue().filter((o) => o.id !== id));
 }
+function clearOpBackoff() {
+  const ops = readQueue();
+  if (!ops.some((o) => !o.parked && ((o.notBefore ?? 0) > 0 || o.lastError))) return;
+  writeQueue(ops.map((o) => o.parked ? o : { ...o, notBefore: 0, lastError: void 0 }));
+}
 function bumpOp(id, err) {
   const ops = readQueue();
   const idx = ops.findIndex((o) => o.id === id);
   const transient = Boolean(err?.transient) || [429, 502, 503, 504].includes(Number(err?.status));
+  const park = Boolean(err?.park);
   if (idx >= 0) {
     const op = ops[idx];
+    if (park) {
+      const ref = op.kind === "sync" ? `thread ${op.threadId}` : `issue #${op.issue}`;
+      ops[idx] = { ...op, parked: true, lastError: `parked (422 \u2014 GitHub rejected the body, ${ref}): ${err instanceof Error ? err.message.slice(0, 200) : String(err)}` };
+      writeQueue(ops);
+      return { transient: false };
+    }
     const attempts = (op.attempts ?? 0) + 1;
     const retryMs = Number(err?.retryMs) || Math.min(15e3 * 2 ** Math.min(attempts, 5), MAX_BACKOFF_MS);
     ops[idx] = { ...op, attempts, notBefore: Date.now() + retryMs, lastError: err instanceof Error ? err.message.slice(0, 300) : String(err) };
@@ -408,12 +427,14 @@ thread deleted in Storybook (static) \u2014 closing.`);
 async function flushOnce(base) {
   if (!state || state.flushing) return;
   state.flushing = true;
+  let ranWork = false;
   try {
     for (; ; ) {
       const cfg = await probeGhConfig();
       if (!cfg) return;
-      const ops = readQueue().filter((o) => (o.notBefore ?? 0) <= Date.now());
+      const ops = readQueue().filter((o) => !o.parked && (o.notBefore ?? 0) <= Date.now());
       if (!ops.length) return;
+      ranWork = true;
       const op = ops[0];
       try {
         if (op.kind === "sync") await processSyncOp(base, cfg, op);
@@ -430,7 +451,7 @@ async function flushOnce(base) {
   } finally {
     if (state) {
       state.flushing = false;
-      if (readQueue().some((o) => (o.notBefore ?? 0) <= Date.now())) void flushOnce(base);
+      if (ranWork && readQueue().some((o) => !o.parked && (o.notBefore ?? 0) <= Date.now())) void flushOnce(base);
     }
   }
 }
@@ -485,7 +506,18 @@ async function pullOnce(base) {
     if (issueActive) {
       const ghComments = await listIssueCommentsRemote(cfg, mir.issue, since);
       const known = new Set(t.comments.map((c) => c.ghId).filter((x) => Boolean(x)));
-      fresh = ghComments.filter((c) => !known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)).sort((a, b) => a.created_at.localeCompare(b.created_at));
+      let malformed = 0;
+      for (const c of ghComments) {
+        if (typeof c?.body !== "string" || c.created_at !== void 0 && typeof c.created_at !== "string") {
+          malformed++;
+          continue;
+        }
+        if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
+      }
+      if (malformed > 0 && state) {
+        state.lastError = `pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at)`;
+      }
+      fresh.sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
     }
     if (statusChange || fresh.length > 0 || mir.state !== issue.state || issueActive) {
       const cur = freshThread(base, t.id);
@@ -514,7 +546,7 @@ async function pullOnce(base) {
           id: `c_gh_${Math.random().toString(36).slice(2, 10)}`,
           author: c.user?.login ?? "github",
           body: c.body.replace(SENTINEL_RE, "").trimEnd(),
-          createdAt: c.created_at,
+          createdAt: typeof c.created_at === "string" && c.created_at ? c.created_at : (/* @__PURE__ */ new Date()).toISOString(),
           ghId: String(c.id),
           source: "github"
         });
@@ -589,9 +621,12 @@ function buildStatus() {
     repo: resolved?.repo ?? override?.repo ?? null,
     labels: resolved?.labels ?? override?.labels ?? [],
     leader: state?.leader ?? false,
-    queue: ops.length,
+    queue: ops.filter((o) => !o.parked).length,
+    parked: ops.filter((o) => Boolean(o.parked)).length,
     flushing: state?.flushing ?? false,
-    lastError: (state?.lastError ?? void 0) || ops.find((o) => o.lastError)?.lastError,
+    // parked errors FIRST: they are terminal + name the thread (actionable);
+    // the raw state error would otherwise shadow them with a generic message
+    lastError: ops.find((o) => o.parked && o.lastError)?.lastError || (state?.lastError ?? void 0) || ops.find((o) => o.lastError)?.lastError,
     lastPushAt: state?.lastPushAt,
     lastPullAt: state?.lastPullAt,
     lastPullCount: state?.lastPullCount,
@@ -638,11 +673,13 @@ async function getGhLinkedStaticStore() {
     status: buildStatus,
     saveSettings(patch) {
       writeOverride(patch);
+      clearOpBackoff();
       if (state?.leader) void flushOnce(base);
     },
     clearSettings() {
       const store = ls();
       if (store) store.removeItem(cfgKey());
+      clearOpBackoff();
       if (state?.leader) void flushOnce(base);
     },
     async syncNow() {

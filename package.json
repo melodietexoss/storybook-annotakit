@@ -1,17 +1,21 @@
 {
   "name": "storybook-annotakit",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "AnnotaKit, reborn inside Storybook: zero-setup pin comments on live stories with React component awareness. Dev-server-embedded store, lean agent digests, GitHub issue publishing.",
   "license": "MIT",
+  "author": "melodietexoss",
   "repository": "https://github.com/melodietexoss/storybook-annotakit",
   "main": "./preset.js",
+  "engines": {
+    "node": ">=20"
+  },
   "files": [
     "dist",
     "preset.js",
     "README.md",
     "LICENSE",
-    ".agents/SKILL.md",
-    "scripts"
+    "scripts/bake-static-threads.mjs",
+    "scripts/serve-static.py"
   ],
   "keywords": [
     "storybook",
@@ -25,7 +29,7 @@
     "design-review"
   ],
   "peerDependencies": {
-    "storybook": "^10.0.0",
+    "storybook": ">=9.1.16",
     "react": "^18.0.0 || ^19.0.0"
   },
   "devDependencies": {
@@ -42,6 +46,6 @@
   "scripts": {
     "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsup",
     "typecheck": "tsc --noEmit",
-    "prepare": "tsup || true"
+    "release-check": "node scripts/release-check.mjs"
   }
 }

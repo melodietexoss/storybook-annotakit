@@ -31,9 +31,10 @@ import {
   storeLocation,
 } from './env';
 import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared/events';
+import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -220,7 +221,7 @@ function afterMutation(rt: Runtime, payload: ThreadsChangedPayload): void {
 /** dogfood #4: mirror trouble must be visible AT THE MUTATION RESPONSE, not
  *  only in /health. Non-breaking: an HTTP header, the JSON body stays the
  *  thread (envelope changes would break clients). */
-async function sendMutationJson(rt: Runtime, res: ServerResponse, status: number, body: unknown): Promise<void> {
+async function sendMutationJson(rt: Runtime, res: ServerResponse, status: number, body: unknown, opts?: { replayed?: boolean }): Promise<void> {
   try {
     const s = await rt.ghsync.status();
     if (s.mode === 'auto' && (s.stalled > 0 || s.lastError)) {
@@ -231,6 +232,16 @@ async function sendMutationJson(rt: Runtime, res: ServerResponse, status: number
     }
   } catch {
     /* header is best-effort */
+  }
+  // idempotent-replay signal (Track B: a 200 replay of a DIFFERENT body
+  // silently swallowed corrections — agents couldn't tell “landed” from
+  // “already existed”). Both channels: body flag (every client) + header
+  // (curl/Node; exposed to cross-origin browser JS via Access-Control-
+  // Expose-Headers).
+  if (opts?.replayed) {
+    res.setHeader('X-Annotakit-Replayed', '1');
+    sendJson(res, status, body && typeof body === 'object' ? { ...(body as Record<string, unknown>), replayed: true } : body);
+    return;
   }
   sendJson(res, status, body);
 }
@@ -298,6 +309,9 @@ function applyCors(req: IncomingMessage, res: ServerResponse, methods = 'GET,POS
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', methods);
     res.setHeader('Access-Control-Allow-Headers', 'content-type');
+    // custom response headers are invisible to cross-origin JS unless listed
+    // here (loopback cross-PORT browser agents read X-Annotakit-Replayed)
+    res.setHeader('Access-Control-Expose-Headers', 'X-Annotakit-Replayed, X-Annotakit-Mirror');
     res.setHeader('Vary', 'Origin');
   } else {
     res.setHeader('Vary', 'Origin'); // deliberate: no ACAO for foreign origins
@@ -317,16 +331,26 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let oversize = false;
     req.on('data', (c: Buffer) => {
+      if (oversize) return; // past the cap: drain silently, never buffer
       size += c.length;
       if (size > 2_000_000) {
-        reject(Object.assign(new Error('body too large'), { status: 413 }));
-        req.destroy();
+        // v0.6.1: NEVER destroy the socket here — the old code did, and the
+        // 413 written by the rejection handler landed on a DEAD socket:
+        // clients saw ECONNRESET with no HTTP error and the server log said
+        // nothing (Track B's most-painful agent symptom). Respond first;
+        // the response completes, node closes the connection afterwards.
+        oversize = true;
+        chunks.length = 0;
+        console.warn('[storybook-annotakit] 413: request body exceeds 2MB — comment bodies are capped at 64000 chars; PUT snapshots at 96KB');
+        reject(Object.assign(new Error('request body too large (max 2MB — comment bodies are capped at 64000 chars, snapshots at 96KB)'), { status: 413 }));
         return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (oversize) return; // already rejected
       if (!chunks.length) return resolve({});
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
@@ -338,8 +362,24 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
-function notFound(res: ServerResponse): void {
-  sendJson(res, 404, { error: 'not found' });
+function notFound(res: ServerResponse, hint?: string): void {
+  sendJson(res, 404, { error: hint ? `not found — ${hint}` : 'not found' });
+}
+
+const THREAD_404_HINT = 'GET /annotakit/api/threads lists thread ids';
+const ROUTE_404_HINT = 'unknown route — GET /annotakit/api/schema documents every endpoint';
+
+/** Ghost-thread visibility (Track B): the server cannot validate storyId
+ *  against the story index, so typo'd ids still mint threads — but a thread
+ *  with no story metadata renders as a bare `## <storyId>` digest section
+ *  with no story file. Warn once per storyId per process (no rate risk). */
+const warnedStories = new Set<string>();
+function warnUnknownStory(storyId: string, hasImportPath: boolean): void {
+  if (hasImportPath || warnedStories.has(storyId)) return;
+  warnedStories.add(storyId);
+  console.warn(
+    `[storybook-annotakit] note: thread created for storyId ${JSON.stringify(storyId)} WITHOUT story metadata (importPath) — digests will show a bare story-id section with no story file. Pass story: {title, name, importPath} when you have it; a typo'd storyId is invisible to the server.`,
+  );
 }
 
 function fail(res: ServerResponse, err: unknown): void {
@@ -435,6 +475,9 @@ function validateThreadInput(body: Record<string, unknown>): ThreadInput {
   }
   for (const c of comments) {
     if (!c.body?.trim()) throw Object.assign(new Error('comment body is required'), { status: 400 });
+    if (c.body.length > MAX_BODY_CHARS) {
+      throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars — the full body stays in the store/json export; keep evidence links instead of pasting whole logs)`), { status: 413 });
+    }
     normalizeComment(c); // A8: never trust client comment ids under union-merge
   }
   return body as unknown as ThreadInput;
@@ -513,23 +556,44 @@ async function handleApi(
     sendJson(res, 200, {
       ok: true,
       version: VERSION,
+      // route index (Track B: 404s gave no pointers; agents had to read the
+      // README to discover endpoints — now the API self-documents them)
+      endpoints: [
+        ['GET', `${API_BASE}/health`, 'agentSurfaces, store, gh + git state — detect your path here first'],
+        ['GET', `${API_BASE}/schema`, 'this document'],
+        ['GET', `${API_BASE}/threads`, 'ALL threads — envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array)'],
+        ['GET', `${API_BASE}/threads?storyId=<id>&status=<open|resolved>`, 'filtered (an EMPTY storyId param is treated as absent, not a filter)'],
+        ['POST', `${API_BASE}/threads`, 'create → 201; idempotent replay (same id) → 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only — amend via PATCH'],
+        ['GET', `${API_BASE}/threads/<id>`, 'one thread doc'],
+        ['PATCH', `${API_BASE}/threads/<id>`, 'partial {status} (JSON-merge) or full doc — see PATCH below'],
+        ['POST', `${API_BASE}/threads/<id>/comments`, 'reply → 201 with the FULL updated thread doc (not the new comment); key comments by thread id, never by your own comment id (ids are re-hashed)'],
+        ['DELETE', `${API_BASE}/threads/<id>`, 'delete (path form; legacy DELETE /threads?id=<id> equivalent)'],
+        ['GET|PUT', `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence — GET → JSON, GET ?format=html → human view; PUT replaces (idempotent, 96KB cap)'],
+        ['GET', `${API_BASE}/export?format=md|json`, 'digest — md clips comment bodies at 200 chars for display; json keeps FULL bodies. NOTE the json envelope is {generatedAt, stories:[...]} (story-grouped), NOT the {threads:[...]} shape of GET /threads'],
+        ['GET|POST', `${API_BASE}/sync`, 'mirror status / force reconcile — POST also forces one git store cycle first (v0.6.1)'],
+      ],
       POST: {
         url: `${API_BASE}/threads`,
         body: THREAD_INPUT_EXAMPLE,
-        note: 'body.id is the IDEMPOTENCY KEY: a replayed POST with the same id returns 200 (existing thread), a fresh id (or none) returns 201 — send a stable id (e.g. "fix-header-overflow") whenever a retry might replay the POST, or you mint duplicate threads. Server assigns per-story numbers; comment ids are deterministically re-hashed server-side (your comment id may come back different — key by thread id).',
+        note: 'body.id is the IDEMPOTENCY KEY: a replayed POST with the same id returns 200 (existing thread, flagged replayed:true — your new body does NOT land; amend via PATCH), a fresh id (or none) returns 201 — send a stable id (e.g. "fix-header-overflow") whenever a retry might replay the POST, or you mint duplicate threads. Server assigns per-story numbers; comment ids are deterministically re-hashed server-side (your comment id may come back different — key by thread id). Threads without story.importPath render as bare digest sections (pass story metadata when you have it).',
       },
       PATCH: {
         url: `${API_BASE}/threads/<id>`,
         partialBody: { status: 'resolved' },
-        note: 'partial (JSON-merge) or full-document both accepted; comments always union-merge by id',
+        note: 'partial (JSON-merge) or full-document both accepted; status must be exactly "open" or "resolved" (case-insensitive, normalized — anything else is a 400, the server stamps resolvedAt on open→resolved); comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt)',
       },
-      COMMENT: { url: `${API_BASE}/threads/<id>/comments`, body: { author: 'agent', body: 'fixed in abc123' } },
+      COMMENT: {
+        url: `${API_BASE}/threads/<id>/comments`,
+        body: { author: 'agent', body: 'fixed in abc123' },
+        note: 'returns the FULL updated thread doc (201), not the comment; comment bodies capped at 64000 chars',
+      },
       DELETE: { url: `${API_BASE}/threads/<id>` },
       SNAPSHOT: {
         url: `${API_BASE}/threads/<id>/snapshot`,
         methods: ['GET', 'PUT'],
-        note: 'GET → JSON { html, clipped, capturedAt, width, height } (plan-b evidence: story DOM at pin time, pinned element carries data-annota-snap="1"); GET ?format=svg → human-viewable foreignObject wrapper; PUT replaces (idempotent)',
+        note: 'GET → JSON { html, clipped, capturedAt, width, height } (plan-b evidence: story DOM at pin time, pinned element carries data-annota-snap="1"); GET ?format=html → human-viewable inert render (CSP script-src none; unknown format values → 400); PUT replaces (idempotent, 96KB cap)',
       },
+      limits: { maxCommentBodyChars: MAX_BODY_CHARS, maxRequestBodyBytes: 2_000_000, maxSnapshotBytes: 96 * 1024 },
     });
     return true;
   }
@@ -566,6 +630,7 @@ async function handleApi(
         ghSync,
         labels: rt.ghLabels,
       },
+      git: rt.sync.gitHealth(),
       ...(rt.bootWarnings.length ? { warnings: rt.bootWarnings } : {}),
     };
     if (method === 'HEAD') {
@@ -593,11 +658,18 @@ async function handleApi(
     if (method === 'POST') {
       const input = validateThreadInput(await readBody(req));
       // idempotent upsert: replaying a client POST with the same id is NOT a
-      // new thread — respond 200 (not 201) so callers can tell the difference
+      // new thread — respond 200 (not 201) so callers can tell the difference;
+      // the replay is FLAGGED (body `replayed:true` + X-Annotakit-Replayed
+      // header) because a 200 replay of a DIFFERENT body silently swallowed
+      // corrections (Track B P1) — POST is create-only, amend via PATCH.
       const preexisting = input.id ? await store.getThread(input.id) : null;
       const thread = await store.createThread(input);
+      // ghost-thread visibility (Track B P2): the server cannot validate
+      // storyId against the story index, but a thread with no story metadata
+      // renders as a bare digest section — warn once per storyId per process
+      warnUnknownStory(input.storyId, Boolean(input.story?.importPath));
       afterMutation(rt, { storyId: thread.storyId, threadId: thread.id, reason: 'created' });
-      await sendMutationJson(rt, res, preexisting ? 200 : 201, thread);
+      await sendMutationJson(rt, res, preexisting ? 200 : 201, thread, { replayed: Boolean(preexisting) });
       return true;
     }
     if (method === 'DELETE') {
@@ -624,7 +696,7 @@ async function handleApi(
       // resource addressing; both shapes are equivalent and idempotent)
       const prev = await store.getThread(id);
       const ok = await store.deleteThread(id);
-      if (!ok) return notFound(res), true;
+      if (!ok) return notFound(res, THREAD_404_HINT), true;
       if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
       afterMutation(rt, { storyId: prev?.storyId, threadId: undefined, reason: 'updated' });
       sendJson(res, 200, { ok: true });
@@ -633,7 +705,7 @@ async function handleApi(
 
     if (method === 'GET' && !isComments) {
       const thread = await store.getThread(id);
-      if (!thread) return notFound(res), true;
+      if (!thread) return notFound(res, THREAD_404_HINT), true;
       sendJson(res, 200, thread);
       return true;
     }
@@ -643,8 +715,23 @@ async function handleApi(
         throw Object.assign(new Error('id mismatch between URL and body'), { status: 400 });
       }
       const prev = await store.getThread(id);
-      if (!prev) return notFound(res), true;
+      if (!prev) return notFound(res, THREAD_404_HINT), true;
       const full = buildPatchCandidate(prev, body);
+      // status enum (Track B P1): "closed"/"RESOLVED" used to be stored
+      // verbatim — resolvedAt never stamped, digest counted the thread OPEN,
+      // nothing told the agent. Case-normalize; only validate when the client
+      // actually sent a status (legacy garbage in stored docs is not repaired
+      // here, and must not make a status-less PATCH un-fixable).
+      if ('status' in body && full.status !== undefined) {
+        const norm = String(full.status).toLowerCase();
+        if (norm !== 'open' && norm !== 'resolved') {
+          throw Object.assign(
+            new Error(`status must be "open" or "resolved" (got ${JSON.stringify(full.status)}) — {"status":"resolved"} resolves (server stamps resolvedAt), {"status":"open"} reopens`),
+            { status: 400 },
+          );
+        }
+        full.status = norm as Thread['status'];
+      }
       // server-side resolve bookkeeping: agents forget resolvedAt — the server
       // stamps/clears it on transitions so digests stay consistent
       if (prev.status === 'open' && full.status === 'resolved' && !full.resolvedAt) {
@@ -670,9 +757,22 @@ async function handleApi(
           if (pc.ghId && !c.ghId) c.ghId = pc.ghId;
           if (pc.source && !c.source) c.source = pc.source;
         }
+        // shape guard (verification round 12-a): a comment INTRODUCED or
+        // CHANGED by this PATCH must have a string body — `body: null` used
+        // to reach the cap check below as a TypeError-500
+        if ((!pc || pc.body !== c.body) && typeof c.body !== 'string') {
+          throw Object.assign(new Error('comment body must be a string'), { status: 400 });
+        }
+        // comment-body cap (Track A/B): applies to comments this PATCH is
+        // INTRODUCING or CHANGING only — stored/imported bodies (GitHub's own
+        // 65,536-char imports, legacy threads) must never make a thread
+        // un-PATCH-able (the full-doc flow re-sends everything it GETs).
+        if ((!pc || pc.body !== c.body) && c.body.length > MAX_BODY_CHARS) {
+          throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars — new/changed comments only; stored bodies are exempt)`), { status: 413 });
+        }
       }
       const updated = await store.updateThread(full);
-      if (!updated) return notFound(res), true; // deleted concurrently — never resurrect
+      if (!updated) return notFound(res, THREAD_404_HINT), true; // deleted concurrently — never resurrect
       afterMutation(rt, {
         storyId: updated.storyId,
         threadId: updated.id,
@@ -689,12 +789,15 @@ async function handleApi(
     if (method === 'POST' && isComments) {
       const body = await readBody(req);
       const thread = await store.getThread(id);
-      if (!thread) return notFound(res), true;
+      if (!thread) return notFound(res, THREAD_404_HINT), true;
       // client-supplied createdAt keeps retries idempotent (same body → same
       // deterministic id); absent → server stamp (first write wins)
       const author = typeof body.author === 'string' && body.author.trim() ? body.author.trim() : 'anonymous';
       const commentBody = typeof body.body === 'string' ? body.body : '';
       if (!commentBody.trim()) throw Object.assign(new Error('comment body is required'), { status: 400 });
+      if (commentBody.length > MAX_BODY_CHARS) {
+        throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars — keep evidence links instead of pasting whole logs)`), { status: 413 });
+      }
       const comment = normalizeComment({
         id: '',
         author,
@@ -741,8 +844,12 @@ async function handleApi(
 
     if (method === 'GET' || method === 'HEAD') {
       const snap = await store.getSnapshot(id);
-      if (!snap) return notFound(res), true;
-      if (url.searchParams.get('format') === 'html') {
+      if (!snap) return notFound(res, THREAD_404_HINT), true;
+      const fmt = url.searchParams.get('format');
+      if (fmt !== null && fmt !== 'html' && fmt !== 'json') {
+        throw Object.assign(new Error(`unknown format ${JSON.stringify(fmt)} — use ?format=html (human view) or omit for JSON`), { status: 400 });
+      }
+      if (fmt === 'html') {
         // human-viewable "screenshot": native HTML parser (foreignObject would
         // demand XHTML-valid serialization — browser outerHTML is not). CSP
         // kills scripts: the snapshot is inert evidence, never live code.
@@ -769,6 +876,9 @@ async function handleApi(
     const stories = groupByStory(threads, origin);
     const snapshotIds = await store.listSnapshotIds();
     const format = (url.searchParams.get('format') ?? 'md').toLowerCase();
+    if (format !== 'md' && format !== 'json' && format !== 'jsonl') {
+      throw Object.assign(new Error(`unknown format ${JSON.stringify(format)} — use ?format=md (lean markdown digest) or ?format=json (full-fidelity bundle; jsonl is a json alias)`), { status: 400 });
+    }
 
     if (format === 'json' || format === 'jsonl') {
       const bundle: ExportBundle = { generatedAt: new Date().toISOString(), exportUrl: `${origin}${API_BASE}/export`, stories };
@@ -797,12 +907,16 @@ async function handleApi(
       // agent POSTing /sync during boot otherwise backfills a half-restored
       // store (duplicate issues for restored mappings).
       await rt.sync.restore().catch(() => undefined);
+      // v0.6.1 (issue #16): force ONE git store cycle first — previously the
+      // orphan branch only moved on mutation+debounce or shutdown flush; an
+      // agent had NO API path to flush the store (6s+ wait or kill -TERM).
+      const gitOk = await rt.sync.syncNow('api').catch(() => false);
       // Force reconcile BOTH directions. Idempotent: unmapped threads get an
       // issue (once, ever); mapped ones only receive actual deltas; remote
       // changes land locally. Unconfigured → 200 {ok, noop, reason} (local mode
       // is a state, not an error — reason carries the a/b/c setup steps).
       const summary: GhSyncSummary = await rt.ghsync.syncAll();
-      sendJson(res, 200, summary);
+      sendJson(res, 200, { ...summary, gitSync: rt.sync.gitHealth(), gitSyncForced: gitOk });
       return true;
     }
   }
@@ -841,7 +955,7 @@ function resolveNotHandled(res: ServerResponse, pathname: string): void {
       return;
     }
   }
-  notFound(res);
+  notFound(res, ROUTE_404_HINT);
 }
 
 /* -------------------------------- middleware --------------------------------- */
@@ -879,6 +993,19 @@ export function createMiddleware(configDir: string): (req: IncomingMessage, res:
       return;
     }
     if (url.pathname.startsWith(API_BASE)) {
+      // trailing-slash tolerance (Track B): ONE internal strip of a single
+      // trailing '/', BEFORE route matching AND the 405 table — /threads/,
+      // /threads/<id>/, /threads/<id>/comments/ all match. Implemented as a
+      // pathname rewrite, NOT a 301/308 redirect (redirects rewrite POST→GET
+      // for browser clients). The /annotakit/ landing check above runs first,
+      // so it keeps handling its own shapes.
+      if (url.pathname.length > API_BASE.length + 1 && url.pathname.endsWith('/')) {
+        try {
+          url.pathname = url.pathname.replace(/\/+$/, '');
+        } catch {
+          /* frozen URL in exotic runtimes — the un-stripped path just 404s as before */
+        }
+      }
       // CORS first (loopback-only; set via headers so every response carries it)
       applyCors(req, res);
       if (req.method === 'OPTIONS') {

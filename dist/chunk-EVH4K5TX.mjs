@@ -60,6 +60,10 @@ function logicalMerge(local, remote) {
   return { threads, deletedIds: deleted };
 }
 
+// src/shared/types.ts
+var MAX_BODY_CHARS = 64e3;
+var DIGEST_CLIP_CHARS = 200;
+
 // src/shared/describe.ts
 function clip(s, n) {
   const t = s.trim();
@@ -185,12 +189,16 @@ function getStaticStore() {
     const deletedIds = new Set(persisted?.deletedIds ?? []);
     for (const t of threads) deletedIds.delete(t.id);
     const listeners = /* @__PURE__ */ new Set();
+    let lastStorageError = null;
     const persist = () => {
       try {
         const doc = { v: 1, savedAt: nowIso(), threads, deletedIds: [...deletedIds] };
         localStorage.setItem(key, JSON.stringify(doc));
         localEdits = true;
-      } catch {
+        lastStorageError = null;
+      } catch (err) {
+        lastStorageError = `storage write failed (${err instanceof Error ? err.message : String(err)}) \u2014 feedback is NOT persisting across reloads; export the digest now and free space (localStorage ~5MB) or use a browser profile with storage enabled`;
+        for (const cb of listeners) cb();
       }
     };
     if (seed && !persisted) persist();
@@ -273,7 +281,7 @@ function getStaticStore() {
         return () => listeners.delete(cb);
       },
       info() {
-        return { scope: staticScope(), threads: threads.length, seeded: !!seed, localEdits };
+        return { scope: staticScope(), threads: threads.length, seeded: !!seed, localEdits, lastStorageError: lastStorageError ?? void 0 };
       }
     };
   })();
@@ -284,6 +292,7 @@ function resetStaticStoreForTests() {
   seedPromise = null;
 }
 function fmtDate(iso) {
+  if (!iso) return "";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toISOString().replace("T", " ").slice(5, 16);
@@ -291,9 +300,13 @@ function fmtDate(iso) {
 function oneLine(body) {
   return body.replace(/\s+/g, " ").trim();
 }
+function clip2(body) {
+  const line = oneLine(body);
+  return line.length > DIGEST_CLIP_CHARS ? line.slice(0, DIGEST_CLIP_CHARS) + "\u2026" : line;
+}
 function threadBlock(t, storageNote) {
   const first = t.comments[0];
-  const headline = first ? oneLine(first.body) : "(no text)";
+  const headline = first ? clip2(first.body) : "(no text)";
   const status = t.status === "open" ? "OPEN" : "resolved";
   const out = [];
   out.push(`### #${t.number} ${status} \u2014 ${headline}`);
@@ -302,7 +315,7 @@ function threadBlock(t, storageNote) {
     if (t.story.importPath) out.push(`- story: ${t.story.title ?? ""}/${t.story.name ?? ""} (${t.story.importPath})`);
   }
   out.push(`- thread id: ${t.id}`);
-  out.push(`- storage: ${storageNote ?? "local (static build \u2014 not synced; hand-carry via export)"}`);
+  out.push(`- storage: ${storageNote ?? "browser localStorage (this deployment) \u2014 hand-carry via export"}`);
   const comp = t.component;
   if (comp) {
     if (comp.name) out.push(`- component: ${comp.name}${comp.key ? ` (key="${comp.key}")` : ""}`);
@@ -315,7 +328,8 @@ function threadBlock(t, storageNote) {
   out.push(`- element: ${ctx ? elementSummary(ctx) : "?"}`);
   if (t.target?.selector?.cssSelector) out.push(`- selector: ${t.target.selector.cssSelector}`);
   for (const r of t.comments.slice(1)) {
-    out.push(`  - ${r.author} ${fmtDate(r.createdAt)}: ${oneLine(r.body).slice(0, 200)}`);
+    const via = r.source === "github" ? " (via github)" : "";
+    out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip2(r.body)}`);
   }
   if (t.status === "resolved" && t.resolvedAt) out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
   out.push("");
@@ -351,7 +365,7 @@ function renderStaticDigest(threads, opts) {
   out.push("");
   for (const s of stories) {
     const st = s.story;
-    out.push(`## ${st.title ?? st.storyId} / ${st.name ?? ""}`);
+    out.push(`## ${[st.title ?? st.storyId, st.name].filter(Boolean).join(" / ")}`);
     out.push("");
     out.push(`story id: \`${st.storyId}\``);
     if (st.importPath) out.push(`story file: ${st.importPath}`);
@@ -368,6 +382,7 @@ function renderStaticDigest(threads, opts) {
 }
 
 export {
+  MAX_BODY_CHARS,
   elementSummary,
   newThreadId,
   staticScope,

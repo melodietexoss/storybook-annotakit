@@ -11,6 +11,16 @@
 export type ThreadStatus = 'open' | 'resolved';
 export type ThreadKind = 'pin' | 'region';
 
+/** Hard cap on ONE comment body, enforced at every capture door (server
+ *  routes 413, client composer submit-guard, static store) — sized under
+ *  GitHub's own 65,536-char comment limit so a mirrored body is always
+ *  acceptable. The FULL body still lives in the store and the json export;
+ *  only md digests clip for display. */
+export const MAX_BODY_CHARS = 64_000;
+
+/** Display clip for digest headline + reply lines (md only). */
+export const DIGEST_CLIP_CHARS = 200;
+
 /** Story metadata captured at pin time (from /index.json + CSF render context). */
 export interface StoryRef {
   storyId: string;
@@ -220,6 +230,23 @@ export interface HealthInfo {
     /** v0.5.3: labels applied to created issues (multi-workstream routing). */
     labels?: string[];
     ghSync?: GhSyncStatus;
+  };
+  /** v0.6.1 (issue #16): machine-readable git store health — counters and
+   *  errors the debounced gh.autoSync string could not carry. `healthy`
+   *  false + consecutivePushFailures > 0 means data is currently only as
+   *  durable as the local orphan branch (agentSurfaces.durability degrades
+   *  to git-commit accordingly). */
+  git?: {
+    autoSync: boolean;
+    mode: 'git-push' | 'git-commit' | 'disk-only';
+    branch: string;
+    remote: string | null;
+    consecutivePushFailures: number;
+    lastPushError: string | null;
+    lastSyncAt: string | null;
+    lastSyncAttemptAt: string | null;
+    healthy: boolean;
+    describe: string;
   };
 }
 

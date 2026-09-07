@@ -484,6 +484,136 @@ let createdThread;
   ok('repeated form is last-wins on real GitHub (negative control)', listedOld.some((i) => i.number === 202));
 }
 
+/* 14 — P0 regression (v0.6.1): client GH DISABLED (local-only mode) with a
+ * queued op must NEVER spin the event loop. The v0.5.3-v0.6.0 bug: flushOnce
+ * exited at `if (!cfg) return` WITHOUT processing the op (no notBefore
+ * backoff), and the `finally` re-arm fired forever against cached-resolved
+ * promises — a pure microtask chain that starved timers/rendering: the whole
+ * tab froze at 100-110% CPU on ANY pin/reply while disabled, and re-froze on
+ * every reload (boot drain). A full regression hangs this suite (total
+ * starvation — no in-process watchdog can fire); the timer assertions below
+ * fail loudly on any partial regression. */
+{
+  const ghc14 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc14.getGhLinkedStaticStore();
+  store.gh?.saveSettings({ disabled: true });
+  let timerFired = false;
+  setTimeout(() => { timerFired = true; }, 30);
+  await store.create(threadInput('th_off'));
+  await sleep(250); // needs a LIVE event loop to resolve — frozen = hang = caught by suite timeout
+  const t = store.list().find((x) => x.id === 'th_off');
+  ok('disabled create persists the thread (data safe)', Boolean(t));
+  const st = store.gh?.status();
+  ok('status truth while disabled: suppressed + 1 queued', st?.suppressed === true && st?.queue === 1 && st?.parked === 0);
+  ok('timers still fire (no event-loop starvation)', timerFired);
+  ok('no transport call while disabled', gh.calls.every((c) => c.path !== '/repos/acme/web/issues' || c.method === 'GET'));
+  // boot-drain path: reload with the disabled override + queued op must NOT
+  // freeze either (the v0.6.0 boot scenario — hard freeze at page load)
+  const ghc14b = await reload({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  let bootTimerFired = false;
+  setTimeout(() => { bootTimerFired = true; }, 30);
+  await sleep(200);
+  const store2 = await ghc14b.getGhLinkedStaticStore();
+  ok('reload with disabled+queued stays alive (boot drain no freeze)', bootTimerFired && store2.list().some((x) => x.id === 'th_off'));
+  // re-enable drains the backlog exactly once
+  const before = gh.issues.size;
+  store2.gh?.saveSettings({ disabled: false });
+  await until(() => queueOps(ghc14b).length === 0, 'backlog drained after re-enable');
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_off'));
+  ok('re-enable drains backlog to exactly one issue', Boolean(issue) && gh.issues.size === before + 1);
+}
+
+/* 15 — Save/Reset (any config write) clears op backoff: recovery re-attempts
+ * NOW (one transport call per user action) instead of ~2min of silent
+ * backoff. 401-keeps-op semantics unchanged (op stays queued on failure). */
+{
+  const ghc15 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  let calls401 = 0;
+  ghc15.__ghSetTransportForTests(async () => { calls401++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+  const store = await ghc15.getGhLinkedStaticStore();
+  await store.create(threadInput('th_rec'));
+  await sleep(120);
+  ok('401 attempt #1 made', calls401 === 1);
+  const opBefore = queueOps(ghc15)[0];
+  ok('op is backed off after 401', (opBefore?.notBefore ?? 0) > Date.now() && (opBefore?.attempts ?? 0) >= 1);
+  store.gh?.saveSettings({ token: 'tok_AAA' }); // the user's recovery action: Save
+  await sleep(150);
+  ok('save re-attempts exactly once (backoff cleared)', calls401 === 2);
+  const opsAfter = queueOps(ghc15);
+  ok('op still queued on continued 401 (keep semantics)', opsAfter.some((o) => o.threadId === 'th_rec' && !o.parked));
+}
+
+/* 16 — 422 (GitHub rejected the BODY) parks the op: never retried, kept
+ * inspectable, surfaced in status().parked with a thread-naming error. A
+ * config write must NOT resurrect a parked op (the body is the problem). */
+{
+  const ghc16 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  let calls422 = 0;
+  ghc16.__ghSetTransportForTests(async () => { calls422++; return { ok: false, status: 422, text: async () => 'body is too long', json: async () => ({}), headers: { get: () => null } }; });
+  const store = await ghc16.getGhLinkedStaticStore();
+  await store.create(threadInput('th_422'));
+  await sleep(120);
+  const st = store.gh?.status();
+  ok('422 parks the op (not retried, not dropped)', st?.parked === 1 && st?.queue === 0);
+  ok('parked error names the thread', Boolean(st?.lastError?.includes('parked') && st?.lastError?.includes('th_422')));
+  const ops = queueOps(ghc16);
+  ok('parked op kept in the outbox doc', ops.length === 1 && ops[0].parked === true);
+  await sleep(200);
+  ok('no retry after parking (no spin)', calls422 === 1);
+  store.gh?.saveSettings({ token: 'tok_AAA' });
+  await sleep(150);
+  ok('config write does not resurrect parked op', calls422 === 1 && store.gh?.status()?.parked === 1);
+}
+
+/* 17 — outbox quota: a queue that CANNOT persist is a silent mirror gap —
+ * v0.6.1 surfaces it via status().lastError instead of swallowing. */
+{
+  const ghc17 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc17.getGhLinkedStaticStore();
+  const orig = storageShim.setItem.bind(storageShim);
+  storageShim.setItem = (k, v) => { if (String(k).includes('annotakit:ghq:')) throw new Error('QuotaExceeded'); return orig(k, v); };
+  await store.create(threadInput('th_quota'));
+  storageShim.setItem = orig;
+  const st = store.gh?.status();
+  ok('outbox quota surfaces an error', Boolean(st?.lastError?.includes('outbox write failed')));
+  ok('thread itself still persisted (data safe)', store.list().some((x) => x.id === 'th_quota'));
+}
+
+/* 18 — v0.6.1 hostile-remote hardening: a MALFORMED remote comment (body
+ * missing / created_at non-string — GitHub data is attacker-controllable)
+ * must be SKIPPED with a surfaced note, never abort the whole pull with a
+ * TypeError (verification round 12-a flagged this as unpinned). */
+{
+  const ghc18 = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'], pollMs: 600_000 });
+  const store = await ghc18.getGhLinkedStaticStore();
+  const t = await store.create(threadInput('th_mal'));
+  await until(() => queueOps(ghc18).length === 0, 'mirror created');
+  const own = store.list().find((x) => x.id === 'th_mal');
+  const issue = gh.issues.get(own?.gh?.issue ?? 0);
+  ok('setup: issue mapped for the pull test', Boolean(issue));
+  if (issue) {
+    // hostile payloads straight into the fake remote
+    issue.comments.push(
+      { id: 91001, body: undefined, created_at: new Date().toISOString(), user: { login: 'attacker' } },
+      { id: 91002, body: 'valid hostile comment', created_at: 12345, user: { login: 'attacker' } },
+      { id: 91003, body: 'a well-formed remote reply', created_at: new Date().toISOString(), user: { login: 'someone-else' } },
+    );
+    issue.updated_at = new Date().toISOString();
+    // the pull must SURVIVE the hostile entries (v0.6.0: TypeError abort)
+    try {
+      await store.gh?.syncNow();
+      ok('pull did NOT throw on malformed remote comments', true);
+    } catch (err) {
+      ok('pull did NOT throw on malformed remote comments', false, String(err).slice(0, 120));
+    }
+    const t2 = store.list().find((x) => x.id === 'th_mal');
+    ok('valid remote comment imported', Boolean(t2?.comments.some((c) => c.body === 'a well-formed remote reply' && c.source === 'github')));
+    ok('malformed remote comments skipped (not imported)', !t2?.comments.some((c) => c.ghId === '91001' || c.ghId === '91002'));
+    const st = store.gh?.status();
+    ok('skip surfaced in status.lastError', Boolean(st?.lastError?.includes('malformed') || st?.lastError?.includes('skipped')));
+  }
+}
+
 /* cleanup + summary */
 ghc.__ghResetForTests();
 console.log(`\nghclient: ${passed}/${passed} passed`);

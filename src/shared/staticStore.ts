@@ -32,6 +32,7 @@
  */
 
 import { logicalMerge } from '../server/merge';
+import { DIGEST_CLIP_CHARS } from './types';
 import type { ExportedStory, StoryRef, Thread, ThreadInput } from './types';
 import { elementSummary } from './describe';
 
@@ -159,7 +160,10 @@ export interface StaticStore {
    *  stale in-memory copy (the v0.3 clobber lesson, client edition). */
   reloadFromPersisted(): void;
   subscribe(cb: () => void): () => void;
-  info(): { scope: string; threads: number; seeded: boolean; localEdits: boolean };
+  /** v0.6.1: lastStorageError is set when localStorage writes FAIL (quota /
+   *  privacy mode) — the thread is in-memory only and vanishes on reload;
+   *  UIs must say so instead of silently losing feedback. */
+  info(): { scope: string; threads: number; seeded: boolean; localEdits: boolean; lastStorageError?: string };
 }
 
 let storePromise: Promise<StaticStore> | null = null;
@@ -194,13 +198,20 @@ export function getStaticStore(): Promise<StaticStore> {
     for (const t of threads) deletedIds.delete(t.id); // normalize: live row beats tombstone
 
     const listeners = new Set<() => void>();
+    // v0.6.1: a persist that CANNOT write (5MB quota / privacy mode) used to
+    // swallow silently — the thread vanished on reload with zero UI signal
+    // and the old catch-comment's "the badge says local-only anyway" was
+    // FALSE (info() exposed no error). Surfaced now; layer/manager render it.
+    let lastStorageError: string | null = null;
     const persist = (): void => {
       try {
         const doc: PersistDoc = { v: 1, savedAt: nowIso(), threads, deletedIds: [...deletedIds] };
         localStorage.setItem(key, JSON.stringify(doc));
         localEdits = true;
-      } catch {
-        /* quota / privacy mode — in-memory only; the badge says local-only anyway */
+        lastStorageError = null;
+      } catch (err) {
+        lastStorageError = `storage write failed (${err instanceof Error ? err.message : String(err)}) — feedback is NOT persisting across reloads; export the digest now and free space (localStorage ~5MB) or use a browser profile with storage enabled`;
+        for (const cb of listeners) cb(); // the badge must appear at the moment of failure
       }
     };
     if (seed && !persisted) persist(); // first visit to a baked build: materialize the seed
@@ -289,7 +300,7 @@ export function getStaticStore(): Promise<StaticStore> {
         return () => listeners.delete(cb);
       },
       info() {
-        return { scope: staticScope(), threads: threads.length, seeded: !!seed, localEdits };
+        return { scope: staticScope(), threads: threads.length, seeded: !!seed, localEdits, lastStorageError: lastStorageError ?? undefined };
       },
     };
   })();
@@ -304,7 +315,8 @@ export function resetStaticStoreForTests(): void {
 
 /* ---------------------------- client-side digest -------------------------- */
 
-function fmtDate(iso: string): string {
+function fmtDate(iso: string | undefined): string {
+  if (!iso) return '';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toISOString().replace('T', ' ').slice(5, 16); // MM-DD HH:mm — server parity
@@ -314,9 +326,16 @@ function oneLine(body: string): string {
   return body.replace(/\s+/g, ' ').trim();
 }
 
+/** Display clip, server-digest parity (the v0.6.0 static digest left the
+ *  FIRST comment un-clipped — a huge first comment produced a huge digest). */
+function clip(body: string): string {
+  const line = oneLine(body);
+  return line.length > DIGEST_CLIP_CHARS ? line.slice(0, DIGEST_CLIP_CHARS) + '…' : line;
+}
+
 function threadBlock(t: Thread, storageNote?: string): string[] {
   const first = t.comments[0];
-  const headline = first ? oneLine(first.body) : '(no text)';
+  const headline = first ? clip(first.body) : '(no text)';
   const status = t.status === 'open' ? 'OPEN' : 'resolved';
   const out: string[] = [];
   out.push(`### #${t.number} ${status} — ${headline}`);
@@ -325,7 +344,7 @@ function threadBlock(t: Thread, storageNote?: string): string[] {
     if (t.story.importPath) out.push(`- story: ${t.story.title ?? ''}/${t.story.name ?? ''} (${t.story.importPath})`);
   }
   out.push(`- thread id: ${t.id}`);
-  out.push(`- storage: ${storageNote ?? 'local (static build — not synced; hand-carry via export)'}`);
+  out.push(`- storage: ${storageNote ?? 'browser localStorage (this deployment) — hand-carry via export'}`);
   const comp = t.component;
   if (comp) {
     if (comp.name) out.push(`- component: ${comp.name}${comp.key ? ` (key="${comp.key}")` : ''}`);
@@ -338,7 +357,8 @@ function threadBlock(t: Thread, storageNote?: string): string[] {
   out.push(`- element: ${ctx ? elementSummary(ctx) : '?'}`);
   if (t.target?.selector?.cssSelector) out.push(`- selector: ${t.target.selector.cssSelector}`);
   for (const r of t.comments.slice(1)) {
-    out.push(`  - ${r.author} ${fmtDate(r.createdAt)}: ${oneLine(r.body).slice(0, 200)}`);
+    const via = r.source === 'github' ? ' (via github)' : '';
+    out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip(r.body)}`);
   }
   if (t.status === 'resolved' && t.resolvedAt) out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
   out.push('');
@@ -384,7 +404,7 @@ export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: str
   out.push('');
   for (const s of stories) {
     const st = s.story;
-    out.push(`## ${st.title ?? st.storyId} / ${st.name ?? ''}`);
+    out.push(`## ${[st.title ?? st.storyId, st.name].filter(Boolean).join(' / ')}`);
     out.push('');
     out.push(`story id: \`${st.storyId}\``);
     if (st.importPath) out.push(`story file: ${st.importPath}`);

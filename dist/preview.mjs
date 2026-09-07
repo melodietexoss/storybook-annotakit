@@ -8,13 +8,14 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-TD6OQ2GZ.mjs";
+} from "./chunk-TU6B6TIH.mjs";
 import {
   getGhLinkedStaticStore
-} from "./chunk-2UMKT53H.mjs";
+} from "./chunk-B5CKOYWU.mjs";
 import {
+  MAX_BODY_CHARS,
   elementSummary
-} from "./chunk-MI4XC5WF.mjs";
+} from "./chunk-EVH4K5TX.mjs";
 
 // src/preview/index.ts
 import React2 from "react";
@@ -1457,6 +1458,17 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
   const [helpOpen, setHelpOpen] = useState(false);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [hint, setHint] = useState(null);
+  const hintTimer = useRef(void 0);
+  const showHint = useCallback((text) => {
+    setHint(text);
+    if (hintTimer.current) window.clearTimeout(hintTimer.current);
+    hintTimer.current = window.setTimeout(() => setHint(null), 2600);
+  }, []);
+  useEffect(() => () => {
+    if (hintTimer.current) window.clearTimeout(hintTimer.current);
+  }, []);
+  const [storageError, setStorageError] = useState(null);
   const [tick, setTick] = useState(0);
   const [hoverBox, setHoverBox] = useState(null);
   const [dragRect, setDragRect] = useState(null);
@@ -1585,6 +1597,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       const readStatus = () => {
         if (!alive) return;
         setGhStatus(store.gh?.status() ?? null);
+        setStorageError(store.info().lastStorageError ?? null);
       };
       readStatus();
       statusPoll = window.setInterval(readStatus, 2e3);
@@ -1658,9 +1671,11 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     const onCommand = (cmd) => {
       if (!cmd?.command) return;
       if (cmd.command === "pin" || cmd.command === "region") {
-        if (!composer && !activeThread) {
+        if (!composer) {
           const m = cmd.command;
           enterMode(mode === m ? "idle" : m);
+        } else {
+          showHint("Submit or cancel the open comment first (Esc)");
         }
       } else if (cmd.command === "drawer") {
         setDrawerOpen((d) => !d);
@@ -1836,9 +1851,11 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
         return;
       }
       if (altOf(hkPin)) {
-        if (!composer && !activeThread) enterMode(mode === "pin" ? "idle" : "pin");
+        if (!composer) enterMode(mode === "pin" ? "idle" : "pin");
+        else showHint("Submit or cancel the open comment first (Esc)");
       } else if (altOf(hkRegion)) {
-        if (!composer && !activeThread) enterMode(mode === "region" ? "idle" : "region");
+        if (!composer) enterMode(mode === "region" ? "idle" : "region");
+        else showHint("Submit or cancel the open comment first (Esc)");
       } else if (altOf(hkLayer)) {
         setVisible((v) => !v);
       } else if (altOf(hkDrawer)) {
@@ -1978,26 +1995,48 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
           top: clamp(fixed.y - 26, 2, Math.max(window.innerHeight - 26, 2))
         },
         onClick: () => setActiveThread(thread.id),
-        title: `#${thread.number}${status === "orphan" ? " (orphaned \u2014 element not found)" : ""}`
+        onKeyDown: (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setActiveThread(thread.id);
+          }
+        },
+        tabIndex: 0,
+        role: "button",
+        "aria-label": `Open thread #${thread.number} (${thread.status})`,
+        title: `#${thread.number} \u2014 Enter/Space opens${status === "orphan" ? " (orphaned \u2014 element not found)" : ""}`
       },
       thread.number
     )
-  ), staticMode && !ghStatus?.configured && /* @__PURE__ */ React.createElement("div", { className: "annota-static-chip", title: "Static `storybook build` \u2014 no dev server. Threads live in this browser's localStorage for this deployment; export to hand-carry them back. Nothing syncs." }, "\u{1F4CC} static \xB7 local-only"), staticMode && ghStatus?.configured && /* @__PURE__ */ React.createElement(
+  ), staticMode && !ghStatus?.configured && !ghStatus?.suppressed && /* @__PURE__ */ React.createElement("div", { className: "annota-static-chip", title: "Static `storybook build` \u2014 no dev server. Threads live in this browser's localStorage for this deployment; export to hand-carry them back. Nothing syncs." }, "\u{1F4CC} static \xB7 local-only"), staticMode && ghStatus?.suppressed && /* @__PURE__ */ React.createElement(
+    "div",
+    {
+      className: "annota-static-chip",
+      style: { background: "#92400e22", color: "#b45309", borderColor: "#92400e66" },
+      title: [
+        "Static build + client-side GitHub publishing \u2014 DISABLED by local settings.",
+        ghStatus && ghStatus.queue > 0 ? `queued feedback holds until re-enabled: ${ghStatus.queue}` : null,
+        "Open the annotakit panel \u2192 GitHub (static) settings to re-enable."
+      ].filter(Boolean).join("\n")
+    },
+    "\u{1F4CC} static \xB7 client GH off",
+    ghStatus && ghStatus.queue > 0 ? ` \xB7 ${ghStatus.queue} queued` : ""
+  ), staticMode && ghStatus?.configured && !ghStatus.suppressed && /* @__PURE__ */ React.createElement(
     "div",
     {
       className: "annota-static-chip",
       style: ghStatus.lastError ? { background: "#dc262622", color: "#b91c1c", borderColor: "#dc262666" } : { background: "#16a34a22", color: "#15803d", borderColor: "#16a34a66" },
       title: [
-        `Static build + client-side GitHub publishing \u2192 ${ghStatus.repo}`,
-        `labels: ${ghStatus.labels.join(", ")}`,
-        `queue: ${ghStatus.queue}${ghStatus.flushing ? " (flushing)" : ""}`,
+        `Static build + client-side GitHub publishing \u2192 ${ghStatus.repo ?? "(not set)"}`,
+        `labels: ${ghStatus.labels.length ? ghStatus.labels.join(", ") : "(default)"}`,
+        `queue: ${ghStatus.queue}${ghStatus.flushing ? " (flushing)" : ""}${ghStatus.parked ? ` \xB7 parked: ${ghStatus.parked} (rejected by GitHub \u2014 not retrying)` : ""}`,
         ghStatus.lastPushAt ? `last push: ${ghStatus.lastPushAt.replace("T", " ").slice(5, 16)}` : null,
         ghStatus.lastPullAt ? `last pull: ${ghStatus.lastPullAt.replace("T", " ").slice(5, 16)}` : null,
         ghStatus.lastError ? `error: ${ghStatus.lastError}` : null
       ].filter(Boolean).join("\n")
     },
-    ghStatus.lastError ? "\u{1F4CC} static \u2192 github \xB7 error" : ghStatus.queue > 0 ? `\u{1F4CC} static \u2192 github \xB7 queued ${ghStatus.queue}` : "\u{1F4CC} static \u2192 github"
-  ), mode !== "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint" }, mode === "pin" ? "Click the element to pin \xB7 Esc cancels" : "Drag to mark a region \xB7 Esc cancels"), hoverBox && /* @__PURE__ */ React.createElement("div", { className: "annota-hover-box", style: { left: hoverBox.x, top: hoverBox.y, width: hoverBox.w, height: hoverBox.h } }), dragRect && /* @__PURE__ */ React.createElement("div", { className: "annota-drag-rect", style: { left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h } }), error && !composer && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, error, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setError(null) }, "\u2715")), composer && /* @__PURE__ */ React.createElement(
+    ghStatus.lastError ? `\u{1F4CC} static \u2192 github \xB7 error${ghStatus.queue > 0 ? ` \xB7 queued ${ghStatus.queue}` : ""}` : ghStatus.queue > 0 ? `\u{1F4CC} static \u2192 github \xB7 queued ${ghStatus.queue}` : "\u{1F4CC} static \u2192 github"
+  ), hint && mode === "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint", role: "status" }, hint), staticMode && storageError && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, "\u26A0 ", storageError, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setStorageError(null) }, "\u2715")), mode !== "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint" }, mode === "pin" ? "Click the element to pin \xB7 Esc cancels" : "Drag to mark a region \xB7 Esc cancels"), hoverBox && /* @__PURE__ */ React.createElement("div", { className: "annota-hover-box", style: { left: hoverBox.x, top: hoverBox.y, width: hoverBox.w, height: hoverBox.h } }), dragRect && /* @__PURE__ */ React.createElement("div", { className: "annota-drag-rect", style: { left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h } }), error && !composer && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, error, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setError(null) }, "\u2715")), composer && /* @__PURE__ */ React.createElement(
     ComposerCard,
     {
       x: composer.x,
@@ -2058,26 +2097,43 @@ function useClampedPosition(x, y) {
   }, [apply]);
   return { ref, style: pos };
 }
+function prettyName(name) {
+  if (!name) return null;
+  return /^[A-Za-z$_][A-Za-z0-9$_]{0,1}$/.test(name) ? null : name;
+}
 function ComposerCard(props) {
   const [body, setBody] = React.useState("");
+  const [discardArmed, setDiscardArmed] = React.useState(false);
   const { ref, style } = useClampedPosition(props.x, props.y);
   const summary = elementSummary(props.context);
-  return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card annota-composer", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "New comment"), /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-meta" }, "<", props.context.tag, ">")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, /* @__PURE__ */ React.createElement("div", { className: "annota-element-summary", title: props.context.outerHTML }, /* @__PURE__ */ React.createElement("b", null, "element:"), " ", summary), props.component?.name && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "component:"), " ", props.component.name, props.component.key != null && /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-meta" }, 'key="', props.component.key, '"')), props.component?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", props.component.source.file, props.component.source.line ? `:${props.component.source.line}` : "")), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), /* @__PURE__ */ React.createElement("div", { style: { padding: "10px 12px" } }, /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card annota-composer", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "New comment"), /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-meta" }, "<", props.context.tag, ">")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, /* @__PURE__ */ React.createElement("div", { className: "annota-element-summary", title: props.context.outerHTML }, /* @__PURE__ */ React.createElement("b", null, "element:"), " ", summary), props.component && prettyName(props.component.name) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "component:"), " ", prettyName(props.component.name), props.component.key != null && /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-meta" }, 'key="', props.component.key, '"')), props.component?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", props.component.source.file, props.component.source.line ? `:${props.component.source.line}` : "")), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), discardArmed && body.trim() && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info", role: "status" }, "Press Esc again to discard this comment."), /* @__PURE__ */ React.createElement("div", { style: { padding: "10px 12px" } }, /* @__PURE__ */ React.createElement(
     "textarea",
     {
       className: "annota-textarea",
       autoFocus: true,
       placeholder: "What's wrong here? (\u2318/Ctrl+Enter to pin)",
       value: body,
-      onChange: (e) => setBody(e.target.value),
+      maxLength: MAX_BODY_CHARS,
+      onChange: (e) => {
+        setDiscardArmed(false);
+        setBody(e.target.value);
+      },
       onKeyDown: (e) => {
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && body.trim()) {
           e.preventDefault();
           props.onSubmit(body);
         }
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          if (body.trim() && !discardArmed) {
+            setDiscardArmed(true);
+            return;
+          }
+          props.onCancel();
+        }
       }
     }
-  )), /* @__PURE__ */ React.createElement("div", { className: "annota-reply-row" }, /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement("button", { className: "annota-btn", onClick: props.onCancel }, "Cancel"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-primary", disabled: !body.trim() || props.busy, onClick: () => props.onSubmit(body) }, "Pin it")));
+  ), body.length > MAX_BODY_CHARS - 2e3 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info", style: { marginTop: 4 } }, MAX_BODY_CHARS - body.length, " characters left (bodies are capped to keep mirrors safe)")), /* @__PURE__ */ React.createElement("div", { className: "annota-reply-row" }, /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement("button", { className: "annota-btn", onClick: props.onCancel }, "Cancel"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-primary", disabled: !body.trim() || body.length > MAX_BODY_CHARS || props.busy, onClick: () => props.onSubmit(body) }, "Pin it")));
 }
 function ThreadCard(props) {
   const [replyBody, setReplyBody] = React.useState("");
@@ -2096,12 +2152,13 @@ function ThreadCard(props) {
     },
     "\u2934 #",
     t.gh.issue
-  ), comp?.name && /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-component" }, comp.name), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, t.story.importPath && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "story:"), " ", t.story.title, "/", t.story.name, " \u2014 ", t.story.importPath), comp?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", comp.source.file, comp.source.line ? `:${comp.source.line}` : ""), comp && comp.chain?.length > 1 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "chain:"), " ", comp.chain.slice(0, 5).join(" > ")), t.target.selector.cssSelector && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "selector:"), " ", t.target.selector.cssSelector)), t.comments.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.id, className: "annota-comment" }, /* @__PURE__ */ React.createElement("div", { className: "annota-comment-head" }, /* @__PURE__ */ React.createElement("b", null, c.author, c.source === "github" ? " \xB7 from GitHub" : ""), /* @__PURE__ */ React.createElement("span", null, c.createdAt.slice(0, 16).replace("T", " "))), /* @__PURE__ */ React.createElement("p", null, c.body))), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), /* @__PURE__ */ React.createElement("div", { className: "annota-reply-row" }, /* @__PURE__ */ React.createElement(
+  ), comp?.name && prettyName(comp.name) && /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-component" }, prettyName(comp.name)), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, t.story.importPath && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "story:"), " ", t.story.title, "/", t.story.name, " \u2014 ", t.story.importPath), comp?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", comp.source.file, comp.source.line ? `:${comp.source.line}` : ""), comp && comp.chain?.length > 1 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "chain:"), " ", comp.chain.slice(0, 5).filter((n) => Boolean(prettyName(n))).join(" > ")), t.target.selector.cssSelector && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "selector:"), " ", t.target.selector.cssSelector)), t.comments.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.id, className: "annota-comment" }, /* @__PURE__ */ React.createElement("div", { className: "annota-comment-head" }, /* @__PURE__ */ React.createElement("b", null, c.author, c.source === "github" ? " \xB7 from GitHub" : ""), /* @__PURE__ */ React.createElement("span", null, c.createdAt.slice(0, 16).replace("T", " "))), /* @__PURE__ */ React.createElement("p", null, c.body))), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), /* @__PURE__ */ React.createElement("div", { className: "annota-reply-row" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       className: "annota-input",
       placeholder: "Reply\u2026",
       value: replyBody,
+      maxLength: MAX_BODY_CHARS,
       onChange: (e) => setReplyBody(e.target.value),
       onKeyDown: (e) => {
         if (e.key === "Enter" && replyBody.trim() && !props.busy) {
@@ -2124,12 +2181,12 @@ function ThreadCard(props) {
 function DrawerCard(props) {
   const [filter, setFilter] = useState("all");
   const shown = props.threads.filter((t) => filter === "all" ? true : t.status === "open");
-  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-drawer" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "Threads \u2014 this story (", props.threads.filter((t) => t.status === "open").length, " open)"), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-drawer" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow", title: "Press ? for all keyboard shortcuts" }, "Threads \u2014 this story (", props.threads.filter((t) => t.status === "open").length, " open)"), /* @__PURE__ */ React.createElement(
     "button",
     {
       className: `annota-btn is-small${filter === "open" ? " is-primary" : ""}`,
       onClick: () => setFilter((f) => f === "open" ? "all" : "open"),
-      title: "Show only open threads"
+      title: `Filter: ${filter === "open" ? "open only" : "all"} \u2014 click to ${filter === "open" ? "show all threads" : "show only open threads"}`
     },
     filter === "open" ? "open only" : "all"
   ), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), props.threads.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info" }, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, props.hotkeys.pin.toUpperCase()), " and click an element (or", " ", /* @__PURE__ */ React.createElement("b", null, props.hotkeys.region.toUpperCase()), " to drag a region)."), props.threads.length > 0 && shown.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info" }, "All threads resolved \u{1F389} (showing \u201Copen only\u201D)."), shown.map((t) => {

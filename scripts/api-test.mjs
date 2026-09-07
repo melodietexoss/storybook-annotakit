@@ -35,7 +35,7 @@ async function j(method, url, body) {
   } catch {
     /* text response */
   }
-  return { status: res.status, json, text };
+  return { status: res.status, json, text, headers: res.headers };
 }
 
 async function main() {
@@ -193,7 +193,12 @@ async function main() {
   check('md contains jsx source line', md.includes('StatusBadge.tsx:12'));
   check('md contains comment text', md.includes('pulse when overdue'));
   check('md contains selector', md.includes('span.inline-flex'));
-  check('md contains story importPath', md.includes('.stories.tsx'));
+  // v0.6.1 portability (Track B): derive the extension from the ACTUAL story
+  // importPath (from index.json) — the hardcoded '.stories.tsx' false-failed
+  // 1/67 on JSX-only consumer projects
+  const ownImportPath = String(entries[storyId]?.importPath ?? '');
+  // repoRelPath strips a leading './' when rendering — accept either form
+  check('md contains story importPath', !ownImportPath || md.includes(ownImportPath) || md.includes(ownImportPath.replace(/^\.\//, '')), `importPath=${ownImportPath}`);
 
   /* 13. export json (lean) */
   const jsonRes = await fetch(`${API}/export?storyId=${encodeURIComponent(storyId)}&format=json`);
@@ -205,8 +210,11 @@ async function main() {
   // carry clipped outerHTML from real browser captures)
   const ownThreadsJson = JSON.stringify((bundle.stories[0]?.threads ?? []).filter((t) => ownIds.includes(t.id)));
   check('json lean: no outerHTML on API threads', !ownThreadsJson.includes('outerHTML'));
-  const len = JSON.stringify(bundle).length;
-  check(`json lean: < 4KB for 3 threads (${len}B)`, len < 6144);
+  // v0.6.1 (Track B): the lean budget applies to TEST-OWNED threads only —
+  // live sessions may carry legitimately large stored bodies (imports); the
+  // whole-bundle form false-failed on probe-polluted stores
+  const ownBundleLen = JSON.stringify({ stories: (bundle.stories ?? []).map((s) => ({ ...s, threads: (s.threads ?? []).filter((t) => ownIds.includes(t.id)) })) }).length;
+  check(`json lean: < 4KB for test-owned threads (${ownBundleLen}B)`, ownBundleLen < 6144);
 
   /* 14. sync endpoint — env-aware:
      - always: GET /sync returns engine status (mode/mapped/threads/pending).
@@ -287,6 +295,104 @@ async function main() {
   const exportMd = await exportAfterSnap.text();
   check('digest points at dom-snapshot evidence', exportMd.includes(`${API}/threads/${snapId}/snapshot`), 'pointer line missing');
   check('digest renders shared element summary', exportMd.includes('<button#go.primary.btn:nth(1) [testid=go-btn] "Go">'), 'elementSummary string missing');
+
+  /* 18. v0.6.1 hardening round — agent-facing contract additions ----------- */
+  // (a) PATCH status enum: garbage statuses are a 400 naming the two values
+  const enumT = await j('POST', `${API}/threads`, {
+    storyId,
+    story: { storyId, title: 'Contract', name: 'EnumTarget', importPath: './src/x.stories.tsx' },
+    target: { kind: 'pin', selector: { cssSelector: 'div', fragment: { x: 1, y: 1, w: 2, h: 2 } }, fingerprint: { tag: 'div' }, context: { tag: 'div', text: 'enum target' }, bbox: { x: 1, y: 1, w: 2, h: 2 } },
+    comments: [{ id: 'c-enum-1', author: 'api-test', body: 'enum guard carrier', createdAt: new Date().toISOString() }],
+  });
+  const enumId = enumT.json?.id;
+  if (enumId) ownIds.push(enumId);
+  const badStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'closed' });
+  check('PATCH bogus status → 400 naming open|resolved', badStatus.status === 400 && /"open" or "resolved"/.test(String(badStatus.json?.error)), `status=${badStatus.status}`);
+  const upperStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'RESOLVED' });
+  check('PATCH status case-normalized + resolvedAt stamped', upperStatus.status === 200 && upperStatus.json?.status === 'resolved' && typeof upperStatus.json?.resolvedAt === 'string', `status=${upperStatus.status}`);
+  const lowerStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'OPEN' });
+  check('PATCH reopen via OPEN clears resolvedAt', lowerStatus.status === 200 && lowerStatus.json?.status === 'open' && !lowerStatus.json?.resolvedAt, `status=${lowerStatus.status}`);
+
+  // (b) POST idempotent replay is FLAGGED (body + header) — a replay of a
+  // DIFFERENT body must not masquerade as "landed"
+  const replayBase = {
+    storyId,
+    story: { storyId, title: 'Contract', name: 'ReplayTarget', importPath: './src/x.stories.tsx' },
+    target: { kind: 'pin', selector: { cssSelector: 'div', fragment: { x: 1, y: 1, w: 2, h: 2 } }, fingerprint: { tag: 'div' }, context: { tag: 'div', text: 'replay target' }, bbox: { x: 1, y: 1, w: 2, h: 2 } },
+  };
+  const rep1 = await j('POST', `${API}/threads`, { ...replayBase, id: 'th_replay_v061', comments: [{ id: 'c-rep-1', author: 'api-test', body: 'first body', createdAt: new Date().toISOString() }] });
+  check('replay POST #1 → 201 (no replayed flag)', rep1.status === 201 && rep1.json?.replayed !== true, `status=${rep1.status}`);
+  if (rep1.json?.id) ownIds.push(rep1.json.id);
+  const rep2 = await j('POST', `${API}/threads`, { ...replayBase, id: 'th_replay_v061', comments: [{ id: 'c-rep-2', author: 'api-test', body: 'amended body — must NOT land', createdAt: new Date().toISOString() }] });
+  check('replay POST #2 → 200 + replayed:true + header', rep2.status === 200 && rep2.json?.replayed === true && rep2.headers?.get?.('x-annotakit-replayed') === '1', `status=${rep2.status} flag=${rep2.json?.replayed}`);
+  check('replay returns the OLD body (create-only contract)', rep2.json?.comments?.[0]?.body === 'first body', JSON.stringify(rep2.json?.comments?.[0] ?? null));
+
+  // (c) comment body cap: 64k chars is the door (413 with the limit stated)
+  const capT = await j('POST', `${API}/threads`, {
+    storyId,
+    story: { storyId, title: 'Contract', name: 'CapTarget', importPath: './src/x.stories.tsx' },
+    target: { kind: 'pin', selector: { cssSelector: 'div', fragment: { x: 1, y: 1, w: 2, h: 2 } }, fingerprint: { tag: 'div' }, context: { tag: 'div', text: 'cap target' }, bbox: { x: 1, y: 1, w: 2, h: 2 } },
+    comments: [{ id: 'c-cap-1', author: 'api-test', body: 'cap carrier', createdAt: new Date().toISOString() }],
+  });
+  const capId = capT.json?.id;
+  if (capId) ownIds.push(capId);
+  const capped = await j('POST', `${API}/threads/${capId}/comments`, { author: 'api-test', body: 'x'.repeat(64_001) });
+  check('comment > 64k chars → 413 with limit stated', capped.status === 413 && /64000/.test(String(capped.json?.error)), `status=${capped.status}`);
+  const atCap = await j('POST', `${API}/threads/${capId}/comments`, { author: 'api-test', body: 'y'.repeat(64_000) });
+  check('comment at exactly 64k chars accepted', atCap.status === 201, `status=${atCap.status}`);
+  // PATCH full-doc with an oversized NEW comment → 413; with the STORED
+  // oversized comment re-sent unchanged → still PATCHable (exempt)
+  const capThread = await j('GET', `${API}/threads/${capId}`);
+  const bigComments = [...(capThread.json?.comments ?? []), { id: 'c-new-big', author: 'api-test', body: 'z'.repeat(64_001), createdAt: new Date().toISOString() }];
+  const patchBig = await j('PATCH', `${API}/threads/${capId}`, { ...capThread.json, comments: bigComments });
+  check('PATCH with oversized NEW comment → 413', patchBig.status === 413, `status=${patchBig.status}`);
+  const patchStored = await j('PATCH', `${API}/threads/${capId}`, { ...capThread.json, status: 'resolved' });
+  check('PATCH re-sending stored oversized comment still works (exempt)', patchStored.status === 200 && patchStored.json?.status === 'resolved', `status=${patchStored.status}`);
+  await j('PATCH', `${API}/threads/${capId}`, { status: 'open' });
+
+  // (d) trailing-slash tolerance (internal rewrite, no 301)
+  const slash = await j('GET', `${API}/threads/`);
+  check('GET /threads/ tolerated (slash stripped)', slash.status === 200 && Array.isArray(slash.json?.threads), `status=${slash.status}`);
+  const slash2 = await j('GET', `${API}/threads/${rep1.json?.id ?? 'x'}/`);
+  check('GET /threads/<id>/ tolerated', slash2.status === 200, `status=${slash2.status}`);
+
+  // (e) 404s carry a pointer to the listing (self-correctable errors)
+  const nf = await j('GET', `${API}/threads/th_missing_v061`);
+  check('thread 404 hints at GET /threads', nf.status === 404 && /GET \/annotakit\/api\/threads/.test(String(nf.json?.error)), JSON.stringify(nf.json).slice(0, 120));
+  const nfRoot = await j('GET', `${API}/nope`);
+  check('route 404 hints at GET /schema', nfRoot.status === 404 && /schema/.test(String(nfRoot.json?.error)), JSON.stringify(nfRoot.json).slice(0, 120));
+
+  // (f) unknown export/snapshot formats → 400 (was: silent markdown fallback)
+  const badFmt = await fetch(`${API}/export?format=xml`);
+  check('export ?format=xml → 400', badFmt.status === 400, `status=${badFmt.status}`);
+  const badSnapFmt = await fetch(`${API}/threads/${snapId}/snapshot?format=svg`);
+  check('snapshot ?format=svg → 400 (svg never existed)', badSnapFmt.status === 400, `status=${badSnapFmt.status}`);
+
+  // (g) /schema self-doc: endpoints index + the corrected snapshot note
+  const schema2 = await j('GET', `${API}/schema`);
+  check('schema has endpoints index', Array.isArray(schema2.json?.endpoints) && schema2.json.endpoints.length >= 10);
+  check('schema snapshot note says html (svg lie fixed)', !/format=svg/.test(JSON.stringify(schema2.json ?? {})) && /format=html/.test(JSON.stringify(schema2.json?.SNAPSHOT ?? {})));
+  check('schema documents both list envelopes', String(schema2.json?.endpoints?.find((e) => String(e?.[1] ?? '').endsWith('/threads'))?.[2] ?? '').includes('threads:') && String(schema2.json?.endpoints?.find((e) => String(e?.[1] ?? '').includes('export'))?.[2] ?? '').includes('stories:'));
+  check('schema documents limits', schema2.json?.limits?.maxCommentBodyChars === 64000);
+
+  // (h) ≥2MB request → a REAL HTTP 413, not a silent TCP reset (v0.6.1 root
+  // cause: the old readBody destroyed the socket BEFORE the 413 was written —
+  // clients saw ECONNRESET and the server log said nothing; verification
+  // round 12-a flagged this as unpinned)
+  {
+    let bigRes = null;
+    let transportError = null;
+    try {
+      bigRes = await fetch(`${API}/threads/${capId}/comments`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ author: 'api-test', body: 'z'.repeat(2_600_000) }),
+      });
+    } catch (e) {
+      transportError = e;
+    }
+    check('2.6MB request → HTTP 413 (never a connection reset)', bigRes !== null && bigRes.status === 413, transportError ? `transport error: ${String(transportError).slice(0, 80)}` : `status=${bigRes?.status}`);
+  }
 
   /* cleanup: remove ONLY threads this test created (live sessions may own others) */
   for (const tid of ownIds.filter(Boolean)) {

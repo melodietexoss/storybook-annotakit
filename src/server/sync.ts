@@ -40,8 +40,28 @@ export interface AutoSync {
   notify(): void;
   /** Human-readable state for /health. */
   describe(): string;
-  /** Durability classification for the health agentSurfaces block. */
+  /** Durability classification for the health agentSurfaces block.
+   *  v0.6.1: degrades to 'git-commit' while pushes are CURRENTLY failing
+   *  (issue #16: 'git-push' used to be reported via everPushed even while
+   *  every push failed — the `git` health block carries the detail). */
   durability(): 'git-push' | 'git-commit' | 'disk-only';
+  /** v0.6.1 (issue #16): machine-readable git store health — counters and
+   *  errors the old debounced `describe()` string could not carry. */
+  gitHealth(): {
+    autoSync: boolean;
+    mode: 'git-push' | 'git-commit' | 'disk-only';
+    branch: string;
+    remote: string | null;
+    consecutivePushFailures: number;
+    lastPushError: string | null;
+    lastSyncAt: string | null;
+    lastSyncAttemptAt: string | null;
+    healthy: boolean;
+    describe: string;
+  };
+  /** v0.6.1 (issue #16): force ONE git store cycle NOW (POST /sync chains
+   *  this) — previously only mutation+debounce or shutdown flush pushed. */
+  syncNow(reason?: string): Promise<boolean>;
   /** A6: boot restore — await before ghsync.start() / POST /sync. Resolves
    *  immediately when not in git mode. */
   restore(): Promise<void>;
@@ -55,7 +75,14 @@ export interface AutoSync {
 
 const DEBOUNCE_MS = 6000;
 const BOOT_MS = Date.now();
-const README_CONTENT = [
+/** v0.6.1 (issue #16): stable VERSIONED marker — the first line of every
+ *  store-branch README. Adoption matches THIS line, not the whole blob: any
+ *  prose rewording used to retroactively de-orphan every deployed store
+ *  branch (byte-fragile). Legacy branches without the marker are accepted
+ *  once (frozen prose set below) and self-heal to the marker on their next
+ *  push, since buildTree always writes the CURRENT README. */
+const README_MARKER = 'annotakit-store: v1';
+const README_PROSE = [
   '# annotakit store branch',
   '',
   'Managed by storybook-annotakit — do not merge into code branches,',
@@ -67,7 +94,13 @@ const README_CONTENT = [
   'would stream binary; run the Storybook dev server instead and use',
   'GET /annotakit/api/threads.',
   '',
-].join('\n');
+];
+const README_CONTENT = [README_MARKER, ...README_PROSE].join('\n');
+/** Pre-marker store branches (v0.5.0–v0.6.0, markerless) — exact-content
+ *  acceptance so existing deployments keep adopting after the marker lands;
+ *  the second variant covers the trailing-newline difference an older build
+ *  once shipped. Genuinely foreign READMEs still read as foreign. */
+const LEGACY_README_CONTENTS = [README_PROSE.join('\n'), README_PROSE.join('\n') + '\n'];
 
 const SHA_RE = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 const BRANCH_PRIMARY = 'annotakit';
@@ -187,8 +220,14 @@ export function createAutoSync(opts: {
   let branch = BRANCH_PRIMARY;
   let restorePromise: Promise<void> | null = null;
   let readmeSha: string | null = null;
+  let legacyReadmeShas: Set<string> | null = null;
   /** Whether we have ever successfully pushed (durability reporting). */
   let everPushed = false;
+  /** v0.6.1 (issue #16): machine-readable push health. */
+  let consecutivePushFailures = 0;
+  let lastPushError: string | null = null;
+  let lastSyncAt: string | null = null;
+  let lastSyncAttemptAt: string | null = null;
 
   const enabled = opts.autoSyncEnabled && gitMode && isGitRepo(root);
   const repo = opts.repo;
@@ -203,20 +242,45 @@ export function createAutoSync(opts: {
 
   const logOnce = (msg: string): void => {
     const safe = redact(msg);
-    if (safe !== lastError) {
-      lastError = safe;
-      console.warn(`[storybook-annotakit] store-sync: ${safe}`);
+    lastError = safe; // always current for the health surface — only STDOUT is deduped
+    const n = (logCounts.get(safe) ?? 0) + 1;
+    logCounts.set(safe, n);
+    // v0.6.1 (issue #16): plain logOnce hid PERMANENT failure — the same
+    // message printed once, then silence forever, indistinguishable from a
+    // healthy quiet sync. Re-log at 1/5/25/then-every-100 with a counter, so
+    // a persistently failing push stays visible in the dev-server log.
+    if (n === 1 || n === 5 || n === 25 || (n > 25 && n % 100 === 0)) {
+      console.warn(`[storybook-annotakit] store-sync: ${safe}${n > 1 ? ` (x${n})` : ''}`);
     }
   };
+  const logCounts = new Map<string, number>();
 
   const commitEnv = (): Record<string, string> => ({ ...COMMIT_ENV });
 
-  /** A14: does the given ref's tip tree contain OUR README blob? (Adoption
-   *  check — a foreign branch with the same name must not be touched.) */
-  const refHasOurReadme = async (ref: string): Promise<boolean> => {
+  /** Lazy sha set of the frozen pre-marker README variants (see
+   *  LEGACY_README_CONTENTS). */
+  const getLegacyReadmeShas = async (): Promise<Set<string>> => {
+    if (legacyReadmeShas) return legacyReadmeShas;
+    const shas = new Set<string>();
+    for (const content of LEGACY_README_CONTENTS) {
+      const h = await gitAsync(root, ['hash-object', '-t', 'blob', '-w', '--stdin'], 8000, { stdin: content });
+      if (h.ok && SHA_RE.test(h.out.trim())) shas.add(h.out.trim());
+    }
+    legacyReadmeShas = shas;
+    return shas;
+  };
+
+  /** A14 (v0.6.1, issue #16): classify a ref's tip tree by its README blob —
+   *  'ours' (current marker prose), 'legacy' (pre-marker, adopted once and
+   *  self-healed to the marker on the next push), 'no-readme' (empty or
+   *  non-store branch), 'foreign' (someone else's branch — never touched).
+   *  The old boolean conflated no-readme with foreign and the log could not
+   *  tell a miss from a genuinely foreign branch. */
+  type StoreRefKind = 'ours' | 'legacy' | 'no-readme' | 'foreign';
+  const refReadmeKind = async (ref: string): Promise<StoreRefKind> => {
     if (!readmeSha) {
       const h = await gitAsync(root, ['hash-object', '-t', 'blob', '-w', '--stdin'], 8000, { stdin: README_CONTENT });
-      if (!h.ok || !SHA_RE.test(h.out.trim())) return false;
+      if (!h.ok || !SHA_RE.test(h.out.trim())) return 'no-readme';
       readmeSha = h.out.trim();
     }
     // `<ref>:README` resolves the blob sha CWD-INDEPENDENTLY. The previous
@@ -231,17 +295,42 @@ export function createAutoSync(opts: {
     // gates on the same check), and resolveBranch flipped to the fallback
     // name after the first successful push. See issue #16.
     const blob = await gitAsync(root, ['rev-parse', `${ref}:README`], 6000);
-    return blob.ok && SHA_RE.test(blob.out.trim()) && blob.out.trim() === readmeSha;
+    const sha = blob.ok ? blob.out.trim() : '';
+    if (!blob.ok || !SHA_RE.test(sha)) return 'no-readme';
+    if (sha === readmeSha) return 'ours';
+    // v0.6.1 marker-line match: PROSE-AGNOSTIC — the marker on line 1 is the
+    // contract; any rewording below it must not de-orphan the branch (that
+    // was the whole point of replacing byte-fragile blob equality). gitAsync
+    // caps output at 300 chars — the first line is all we read, so that is
+    // fine here (legacy exact-match stays SHA-based below).
+    const content = await gitAsync(root, ['show', `${ref}:README`], 6000);
+    const line1 = content.ok ? (content.out.split('\n')[0] ?? '').trim() : '';
+    if (line1 === README_MARKER) return 'ours';
+    const legacy = await getLegacyReadmeShas();
+    if (legacy.has(sha)) return 'legacy';
+    return 'foreign';
+  };
+
+  /** Boolean adoption gate — ours or legacy (both are adopted/self-healed). */
+  const refHasOurReadme = async (ref: string): Promise<boolean> => {
+    const kind = await refReadmeKind(ref);
+    return kind === 'ours' || kind === 'legacy';
   };
 
   /** A14: pick the branch name — primary unless an EXISTING local or remote
-   *  ref of that name does not look like ours (no README blob at its tip). */
+   *  ref of that name does not look like ours (no README / foreign README
+   *  at its tip). v0.6.1: the no-readme and foreign cases log DISTINCTLY. */
   const resolveBranch = async (): Promise<string> => {
     // local branch check
     const localHead = await gitAsync(root, ['rev-parse', '--verify', '--quiet', `refs/heads/${BRANCH_PRIMARY}`], 5000);
     if (localHead.ok && SHA_RE.test(localHead.out.trim())) {
-      if (!(await refHasOurReadme(`refs/heads/${BRANCH_PRIMARY}`))) {
-        logOnce(`refs/heads/${BRANCH_PRIMARY} exists but is not an annotakit store branch — using ${BRANCH_FALLBACK} instead (A14)`);
+      const kind = await refReadmeKind(`refs/heads/${BRANCH_PRIMARY}`);
+      if (kind === 'no-readme' || kind === 'foreign') {
+        logOnce(
+          kind === 'no-readme'
+            ? `refs/heads/${BRANCH_PRIMARY} exists but its tip has NO README (empty or non-store branch) — using ${BRANCH_FALLBACK} instead (A14)`
+            : `refs/heads/${BRANCH_PRIMARY} exists but is not an annotakit store branch (README mismatch — genuinely foreign) — using ${BRANCH_FALLBACK} instead (A14)`,
+        );
         return BRANCH_FALLBACK;
       }
     }
@@ -394,9 +483,17 @@ export function createAutoSync(opts: {
           return;
         }
         // A14: validate the ref the head ACTUALLY came from (a fresh clone
-        // only has refs/remotes/origin/<branch> until our first fetch)
-        if (!(await refHasOurReadme(remote.ref))) {
-          logOnce(`remote refs/heads/${branch} is not an annotakit store branch — not adopting it (A14)`);
+        // only has refs/remotes/origin/<branch> until our first fetch).
+        // v0.6.1: no-readme and foreign log DISTINCTLY (issue #16 — the
+        // single old message made a README miss and a genuinely foreign
+        // branch indistinguishable in forensics).
+        const kind = await refReadmeKind(remote.ref);
+        if (kind === 'no-readme' || kind === 'foreign') {
+          logOnce(
+            kind === 'no-readme'
+              ? `remote refs/heads/${branch} tip has NO README — pre-annotakit or empty branch, not adopting it (A14)`
+              : `remote refs/heads/${branch} is not an annotakit store branch (README mismatch — genuinely foreign), not adopting it (A14)`,
+          );
           state = `remote ${branch} is foreign; local store unaffected`;
           return;
         }
@@ -482,10 +579,17 @@ export function createAutoSync(opts: {
       const remoteHead = await fetchRemote(timeoutMs);
       trace(`syncOnce(${reason}): remoteHead=${remoteHead ? remoteHead.slice(0, 8) : 'none'}`);
       let parent = remoteHead;
-      if (parent && !(await refHasOurReadme(REMOTE_CACHE_REF))) {
-        // remote branch exists but is foreign — never build on it (A14)
-        logOnce(`remote refs/heads/${branch} is foreign — not parenting on it (A14)`);
-        parent = null;
+      if (parent) {
+        const kind = await refReadmeKind(REMOTE_CACHE_REF);
+        if (kind === 'no-readme' || kind === 'foreign') {
+          // remote branch exists but is not adoptable — never build on it (A14)
+          logOnce(
+            kind === 'no-readme'
+              ? `remote refs/heads/${branch} tip has NO README — not parenting on it (A14)`
+              : `remote refs/heads/${branch} is foreign — not parenting on it (A14)`,
+          );
+          parent = null;
+        }
       }
 
       // ALWAYS-MERGE: fold the remote doc into the local store BEFORE the
@@ -558,15 +662,27 @@ export function createAutoSync(opts: {
       }
       if (!push.ok) {
         if (repo) {
+          // v0.6.1 (issue #16): machine-readable push health — the counter
+          // feeds /health (git.consecutivePushFailures) and degrades
+          // durability() while failing; the old string-only surface could
+          // not say WHY a git-push store wasn't pushing.
+          consecutivePushFailures += 1;
+          lastPushError = redact(push.out).slice(0, 200) || 'git push failed';
+          lastSyncAttemptAt = new Date().toISOString();
           logOnce(`git push failed (${push.out})${ghToken() ? '' : ' — no ANNOTAKIT_GH_TOKEN in .env?'}`);
           state = 'committed locally; push failed (retry on next mutation)';
         } else {
           state = 'orphan branch updated locally (no remote to push)';
+          lastSyncAttemptAt = new Date().toISOString();
           await gitAsync(root, ['update-ref', `refs/heads/${branch}`, commit], timeoutMs);
         }
         return false;
       }
       everPushed = true;
+      consecutivePushFailures = 0;
+      lastPushError = null;
+      lastSyncAt = new Date().toISOString();
+      lastSyncAttemptAt = lastSyncAt;
       // A4.4: move the local refs only AFTER a successful push (CAS where the
       // expected old value is known, so a racing writer cannot be silently
       // overtaken)
@@ -672,13 +788,48 @@ export function createAutoSync(opts: {
   };
   const storeMode = (): 'git' | 'classic' => (gitMode ? 'git' : 'classic');
 
+  /** v0.6.1 (issue #16): force one git store cycle NOW — POST /sync chains
+   *  this so an agent can flush the orphan branch without waiting for the
+   *  mutation debounce or a shutdown. Returns the cycle's success. */
+  const syncNow = (reason = 'api'): Promise<boolean> => syncOnce(9000, reason);
+
   const durability = (): 'git-push' | 'git-commit' | 'disk-only' => {
     if (!enabled) return 'disk-only';
     if (!repo) return 'git-commit';
     // A remote without credentials cannot actually be pushed to — claiming
     // "git-push" in local mode (no token yet) would overstate durability.
-    return ghToken() || everPushed ? 'git-push' : 'git-commit';
+    if (ghToken() || everPushed) {
+      // v0.6.1 (issue #16): honest degradation — while pushes are CURRENTLY
+      // failing, data is only as durable as the LOCAL orphan branch. Report
+      // git-commit until a push succeeds again (git.healthy carries detail).
+      return consecutivePushFailures > 0 ? 'git-commit' : 'git-push';
+    }
+    return 'git-commit';
   };
+
+  const gitHealth = (): {
+    autoSync: boolean;
+    mode: 'git-push' | 'git-commit' | 'disk-only';
+    branch: string;
+    remote: string | null;
+    consecutivePushFailures: number;
+    lastPushError: string | null;
+    lastSyncAt: string | null;
+    lastSyncAttemptAt: string | null;
+    healthy: boolean;
+    describe: string;
+  } => ({
+    autoSync: enabled,
+    mode: durability(),
+    branch,
+    remote: repo,
+    consecutivePushFailures,
+    lastPushError,
+    lastSyncAt,
+    lastSyncAttemptAt,
+    healthy: consecutivePushFailures === 0,
+    describe: state,
+  });
 
   if (enabled) {
     console.warn(
@@ -688,5 +839,5 @@ export function createAutoSync(opts: {
     console.warn(`[storybook-annotakit] store sync ${state} — the .db file still persists to disk`);
   }
 
-  return { notify, describe, durability, restore, storeBranch: storeBranchName, storeMode, stop };
+  return { notify, describe, durability, gitHealth, syncNow, restore, storeBranch: storeBranchName, storeMode, stop };
 }

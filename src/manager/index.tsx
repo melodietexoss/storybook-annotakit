@@ -562,17 +562,17 @@ function ReviewPanel(): React.ReactElement {
           <span
             style={{
               ...chip(
-                ghStat.lastError ? '#dc262622' : ghStat.queue > 0 ? '#f59e0b22' : '#16a34a22',
-                ghStat.lastError ? '#b91c1c' : ghStat.queue > 0 ? '#b45309' : '#15803d',
+                ghStat.suppressed ? '#92400e22' : ghStat.lastError ? '#dc262622' : ghStat.queue > 0 ? '#f59e0b22' : '#16a34a22',
+                ghStat.suppressed ? '#b45309' : ghStat.lastError ? '#b91c1c' : ghStat.queue > 0 ? '#b45309' : '#15803d',
               ),
               fontSize: 10,
             }}
-            title={`Client-side publishing → ${ghStat.repo} · labels: ${(ghStat.labels ?? []).join(', ') || 'annotakit'} · queue: ${ghStat.queue}${ghStat.flushing ? ' (flushing)' : ''}${ghStat.lastError ? ` · error: ${ghStat.lastError}` : ''}${ghStat.lastPullAt ? ` · pulled ${ago(ghStat.lastPullAt)}` : ''}${ghStat.suppressed ? ' · DISABLED (local override)' : ''}`}
+            title={`Client-side publishing${ghStat.suppressed ? ' — DISABLED by local settings (queued feedback holds until re-enabled)' : ` → ${ghStat.repo ?? '(not set)'} · labels: ${(ghStat.labels ?? []).join(', ') || 'annotakit'} · queue: ${ghStat.queue}${ghStat.flushing ? ' (flushing)' : ''}${ghStat.parked ? ` · parked: ${ghStat.parked}` : ''}`}${ghStat.lastError ? ` · error: ${ghStat.lastError}` : ''}${ghStat.lastPullAt && !ghStat.suppressed ? ` · pulled ${ago(ghStat.lastPullAt)}` : ''}`}
           >
             {ghStat.suppressed
-              ? 'static · client GH off'
+              ? `static · client GH off${ghStat.queue > 0 ? ` · ${ghStat.queue} queued` : ''}`
               : ghStat.lastError
-                ? 'static → github · error'
+                ? `static → github · error${ghStat.queue > 0 ? ` · queued ${ghStat.queue}` : ''}`
                 : ghStat.queue > 0
                   ? `static → github · queued ${ghStat.queue}`
                   : 'static → github'}
@@ -638,11 +638,11 @@ function ReviewPanel(): React.ReactElement {
         <div style={{ padding: '8px 0', borderBottom: `1px solid ${theme.appBorderColor}`, fontSize: 11, display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
             <span style={{ ...chip(ghStat?.configured && !ghStat.suppressed ? '#16a34a22' : '#f59e0b22', ghStat?.configured && !ghStat.suppressed ? '#15803d' : '#b45309') }}>
-              {ghStat?.configured ? (ghStat.suppressed ? 'client GH disabled' : `client publish → ${ghStat.repo}`) : 'client GH unconfigured'}
+              {ghStat?.configured ? (ghStat.suppressed ? 'client GH disabled' : `client publish → ${ghStat.repo ?? '(not set)'}`) : 'client GH unconfigured'}
             </span>
             {ghStat?.configured && !ghStat.suppressed && (
               <span style={{ color: theme.textMutedColor }}>
-                queue {ghStat.queue}{ghStat.flushing ? ' (flushing)' : ''}{ghStat.lastPushAt ? ` · pushed ${ago(ghStat.lastPushAt)}` : ''}{ghStat.lastPullAt ? ` · pulled ${ago(ghStat.lastPullAt)}` : ''}{ghStat.pollMs > 0 ? ` · polls every ${Math.round(ghStat.pollMs / 1000)}s` : ' · polling off'}
+                queue {ghStat.queue}{ghStat.flushing ? ' (flushing)' : ''}{ghStat.parked ? ` · parked ${ghStat.parked}` : ''}{ghStat.lastPushAt ? ` · pushed ${ago(ghStat.lastPushAt)}` : ''}{ghStat.lastPullAt ? ` · pulled ${ago(ghStat.lastPullAt)}` : ''}{ghStat.pollMs > 0 ? ` · polls every ${Math.round(ghStat.pollMs / 1000)}s` : ' · polling off'}
               </span>
             )}
           </div>

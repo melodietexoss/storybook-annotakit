@@ -437,9 +437,135 @@ const CASES = {
     ctx.check('migration idempotent (still 2 threads)', h2.threads === 2, `threads=${h2.threads}`);
     await srv2.kill();
   },
-};
+  marker: async (ctx) => {
+    const { repo } = ctx;
+    // v0.6.1 (issue #16): versioned store-branch README marker. The frozen
+    // pre-marker prose (v0.5.0–v0.6.0 deployments):
+    const LEGACY = [
+      '# annotakit store branch', '',
+      'Managed by storybook-annotakit — do not merge into code branches,',
+      'do not commit here manually. The tree is exactly README + threads.db',
+      '(a sqlite snapshot, WAL-checkpointed). Divergence between machines is',
+      'resolved by a logical union merge performed by the addon itself.', '',
+      'If you are reading this out of curiosity: `git show annotakit:threads.db`',
+      'would stream binary; run the Storybook dev server instead and use',
+      'GET /annotakit/api/threads.', '',
+    ].join('\n');
 
-/* ------------------------------- case harness -------------------------------- */
+    // git with stdin (mktree / hash-object --stdin)
+    const gitIn = (cwd, args, input) => {
+      const r = spawnSync('git', ['-C', cwd, ...args], { input, encoding: 'utf8', timeout: 15_000 });
+      return { ok: r.status === 0, out: String(r.stdout ?? '').trim() };
+    };
+
+    // seed a REAL store branch (current build → marker README)
+    const srv = await ctx.serve(repo);
+    await ctx.create(srv, 'T_seed', 'marker case seed');
+    const seeded = await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit']).ok, 20_000);
+    ctx.check('marker: seed branch pushed', seeded);
+    await srv.kill();
+
+    // rewrite the remote branch tip with a custom README (same db blob) —
+    // pure plumbing, work tree untouched
+    sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit:refs/annotakit/remote']);
+    const seedHead = sh(repo.work, ['rev-parse', 'refs/annotakit/remote']).out;
+    const dbBlob = sh(repo.work, ['rev-parse', `${seedHead}:threads.db`]).out;
+    const rewriteBranch = (readmeText) => {
+      const r = gitIn(repo.work, ['hash-object', '-t', 'blob', '-w', '--stdin'], readmeText);
+      if (!r.ok) throw new Error('hash-object failed');
+      const tree = gitIn(repo.work, ['mktree'], `100644 blob ${dbBlob}\tthreads.db\n100644 blob ${r.out}\tREADME\n`);
+      if (!tree.ok) throw new Error('mktree failed');
+      const commit = sh(repo.work, ['commit-tree', '-m', 'marker fixture', tree.out]);
+      if (!commit.ok) throw new Error('commit-tree failed');
+      const p = sh(repo.work, ['push', '-q', 'origin', `+${commit.out}:refs/heads/annotakit`]);
+      if (!p.ok) throw new Error('push failed: ' + p.err);
+    };
+
+    // (a) LEGACY markerless branch → adopted + self-heals to the marker
+    rewriteBranch(LEGACY);
+    const c1 = makeClone(repo, 'sandbox-marker-legacy');
+    const srvA = await ctx.serve(c1);
+    const restoredA = await waitFor(async () => (await ctx.list(srvA)).length === 1, 20_000);
+    ctx.check('marker: legacy (markerless) branch still adopted', restoredA);
+    await ctx.create(srvA, 'T_mk2', 'marker heal push');
+    const healed = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit:refs/annotakit/remote']);
+      const head = sh(repo.work, ['show', 'refs/annotakit/remote:README']).out;
+      return head.startsWith('annotakit-store: v1');
+    }, 25_000);
+    ctx.check('marker: next push backfills the marker (self-heal)', healed);
+    await srvA.kill();
+
+    // (b) reworded prose WITH the marker → still ours (prose no longer matters)
+    rewriteBranch('annotakit-store: v1\n# completely reworded prose, nothing like the original\n');
+    const c2 = makeClone(repo, 'sandbox-marker-reworded');
+    const srvB = await ctx.serve(c2);
+    const restoredB = await waitFor(async () => (await ctx.list(srvB)).length === 1, 20_000);
+    ctx.check('marker: reworded prose with marker adopted (prose-agnostic)', restoredB);
+    await srvB.kill();
+
+    // (c) markerless FOREIGN readme → NOT adopted, distinct log (boot restore
+    // is async + bootstrap lazy — poll health to trigger it, then the log)
+    rewriteBranch('# a totally foreign readme, no marker, no legacy prose\n');
+    const c3 = makeClone(repo, 'sandbox-marker-foreign');
+    const srvC = await ctx.serve(c3);
+    const foreignLogged = await waitFor(async () => {
+      await ctx.health(srvC);
+      return /genuinely foreign/.test(srvC.logs.join(''));
+    }, 20_000);
+    const hC = await ctx.health(srvC);
+    ctx.check('marker: markerless foreign readme NOT adopted', hC.threads === 0, `threads=${hC.threads}`);
+    ctx.check('marker: foreign logs the DISTINCT message', foreignLogged, (srvC.logs.join('') || '').slice(-300));
+    await srvC.kill();
+  },
+
+  githealth: async (ctx) => {
+    const { repo } = ctx;
+    // v0.6.1 (issue #16): machine-readable git health + honest durability +
+    // POST /sync forcing a git cycle. Pushes are made to FAIL with a
+    // pre-receive hook that rejects everything.
+    const hook = path.join(repo.remote, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(hook, 0o755);
+    // a token makes the durability gate observable (ghToken() true →
+    // git-push when healthy, git-commit while failing). The server script
+    // pins ANNOTAKIT_GH_AUTO=0 so the MIRROR stays off — store sync only.
+    process.env.ANNOTAKIT_GH_TOKEN = 'ghp_fake_token_for_health_case';
+    try {
+      const srv = await ctx.serve(repo);
+      const h0 = await ctx.health(srv);
+      ctx.check('githealth: healthy at boot', h0.git?.healthy === true && h0.git?.consecutivePushFailures === 0);
+      ctx.check('githealth: mode git-push when healthy', h0.git?.mode === 'git-push' && h0.agentSurfaces?.durability === 'git-push', JSON.stringify(h0.git ?? {}).slice(0, 160));
+
+      await ctx.create(srv, 'T_h', 'health case thread');
+      const failing = await waitFor(async () => (await ctx.health(srv)).git?.consecutivePushFailures >= 1, 30_000);
+      const h1 = await ctx.health(srv);
+      ctx.check('githealth: consecutivePushFailures counts push failures', failing && h1.git?.consecutivePushFailures >= 1, JSON.stringify(h1.git ?? {}).slice(0, 200));
+      ctx.check('githealth: lastPushError surfaces the reason', typeof h1.git?.lastPushError === 'string' && h1.git.lastPushError.length > 0);
+      ctx.check('githealth: durability degrades to git-commit while failing', h1.agentSurfaces?.durability === 'git-commit' && h1.git?.healthy === false);
+
+      // POST /sync forces a git cycle (syncNow) — while pushes still fail it
+      // must report the failure machine-readably in the RESPONSE body
+      const sync1 = await j(srv, 'POST', '/annotakit/api/sync');
+      ctx.check('githealth: POST /sync carries gitSync health', sync1.body?.gitSync?.consecutivePushFailures >= 1 && sync1.body?.gitSync?.healthy === false, JSON.stringify(sync1.body?.gitSync ?? {}).slice(0, 200));
+
+      // heal: remove the hook → POST /sync pushes within the roundtrip (no
+      // 6s debounce wait — the forced cycle is the only pusher)
+      fs.rmSync(hook);
+      const tBefore = Date.now();
+      const sync2 = await j(srv, 'POST', '/annotakit/api/sync');
+      ctx.check('githealth: forced cycle succeeds after healing', sync2.body?.gitSyncForced === true && sync2.body?.gitSync?.healthy === true && sync2.body?.gitSync?.consecutivePushFailures === 0, JSON.stringify(sync2.body?.gitSync ?? {}).slice(0, 200));
+      ctx.check('githealth: lastSyncAt stamped', typeof sync2.body?.gitSync?.lastSyncAt === 'string' && new Date(sync2.body.gitSync.lastSyncAt).getTime() >= tBefore - 60_000);
+      const remoteBranch = sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit']).ok;
+      ctx.check('githealth: store landed on the remote after the forced cycle', remoteBranch);
+      const h2 = await ctx.health(srv);
+      ctx.check('githealth: durability restored to git-push', h2.agentSurfaces?.durability === 'git-push' && h2.git?.healthy === true);
+      await srv.kill();
+    } finally {
+      delete process.env.ANNOTAKIT_GH_TOKEN;
+    }
+  },
+};
 
 async function runCase(caseId) {
   let passed = 0;

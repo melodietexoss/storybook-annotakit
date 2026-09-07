@@ -175,8 +175,48 @@ resetStaticStoreForTests(); // scope switched in test 7 — drop the cached stor
   const s = await getStaticStore();
   const md = renderStaticDigest(s.list());
   ok('digest has headline', md.includes('body th_seed1'));
-  ok('digest marks static storage', md.includes('storage: local'));
+  ok('digest marks static storage', md.includes('storage: browser localStorage'));
   ok('digest renders story header', md.includes('## T / n'));
+  // v0.6.1: hostile/absent dates degrade to ''/raw text, never "Invalid Date"
+  // or "undefined" in digest lines
+  ok('digest tolerates absent comment date', !md.includes('undefined'));
+}
+
+/* 9 — v0.6.1: huge first comment is display-clipped (server digest parity):
+ * the v0.6.0 static digest left the HEADLINE un-clipped while replies were
+ * capped at 200 — a 1MB first comment produced a 1MB digest line. */
+{
+  const s = await getStaticStore();
+  const big = 'x'.repeat(5000);
+  const t = await s.create({ id: 'th_big', storyId: 's1', target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null }, comments: [{ id: 'c_big', author: 'r', body: big, createdAt: new Date().toISOString() }] });
+  const md = renderStaticDigest(s.list());
+  const line = md.split('\n').find((l) => l.includes('th_big') && l.startsWith('###')) ?? md.split('\n').find((l) => l.startsWith('### #') && l.includes('xxxx'));
+  ok('headline clipped to 200 chars + ellipsis', Boolean(line && line.length <= 200 + 60 && line.endsWith('…')));
+  await s.deleteThread(t.id);
+}
+
+/* 10 — v0.6.1: a persist that CANNOT write (quota) surfaces via info().
+ * lastStorageError instead of vanishing on reload with zero signal. */
+{
+  const real = globalThis.localStorage.setItem;
+  globalThis.localStorage.setItem = (k, v) => { if (String(k).startsWith('annotakit:static:')) throw new Error('QuotaExceededError'); return real.call(globalThis.localStorage, k, v); };
+  const s = await getStaticStore();
+  await s.create({ id: 'th_quota', storyId: 's1', target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null }, comments: [{ id: 'c_q', author: 'r', body: 'will not persist', createdAt: new Date().toISOString() }] });
+  globalThis.localStorage.setItem = real;
+  ok('quota failure surfaces via info().lastStorageError', typeof s.info().lastStorageError === 'string' && String(s.info().lastStorageError).includes('storage write failed'));
+  ok('thread still in memory (no crash)', s.list().some((x) => x.id === 'th_quota'));
+}
+
+/* 11 — v0.6.1: provenance — imported github comments are marked (via github)
+ * in the digest (agent prompts must be able to treat them as untrusted). */
+{
+  const s = await getStaticStore();
+  const t = s.list().find((x) => x.id === 'th_seed1') ?? (await s.create({ id: 'th_prov', storyId: 's1', target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null }, comments: [{ id: 'c_p', author: 'r', body: 'seed body', createdAt: new Date().toISOString() }] }));
+  if (t) {
+    await s.patch({ ...t, comments: [...t.comments, { id: 'c_gh_prov', author: 'someone-else', body: 'imported from gh', createdAt: new Date().toISOString(), source: 'github' }] });
+    const md = renderStaticDigest(s.list());
+    ok('digest marks (via github) provenance', md.includes('(via github)'));
+  }
 }
 
 console.log(`\n${passed} passed, 0 failed (static-store suite)`);

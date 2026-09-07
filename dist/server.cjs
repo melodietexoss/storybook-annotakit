@@ -499,6 +499,10 @@ function readConfig(configDir) {
   }
 }
 
+// src/shared/types.ts
+var MAX_BODY_CHARS = 64e3;
+var DIGEST_CLIP_CHARS = 200;
+
 // src/shared/describe.ts
 function clip(s, n) {
   const t = s.trim();
@@ -703,6 +707,7 @@ function kitRepo() {
 
 // src/server/digest.ts
 function fmtDate(iso) {
+  if (!iso) return "";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toISOString().replace("T", " ").slice(5, 16);
@@ -710,9 +715,13 @@ function fmtDate(iso) {
 function oneLine(body) {
   return body.replace(/\s+/g, " ").trim();
 }
+function clip2(body) {
+  const line = oneLine(body);
+  return line.length > DIGEST_CLIP_CHARS ? line.slice(0, DIGEST_CLIP_CHARS) + "\u2026" : line;
+}
 function threadBlock(t, snapshotUrl) {
   const first = t.comments[0];
-  const headline = first ? oneLine(first.body) : "(no text)";
+  const headline = first ? clip2(first.body) : "(no text)";
   const status = t.status === "open" ? "OPEN" : "resolved";
   const out = [];
   out.push(`### #${t.number} ${status} \u2014 ${headline}`);
@@ -747,7 +756,8 @@ function threadBlock(t, snapshotUrl) {
   }
   const replies = t.comments.slice(1);
   for (const r of replies) {
-    out.push(`  - ${r.author} ${fmtDate(r.createdAt)}: ${oneLine(r.body).slice(0, 200)}`);
+    const via = r.source === "github" ? " (via github)" : "";
+    out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip2(r.body)}`);
   }
   if (t.status === "resolved" && t.resolvedAt) {
     out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
@@ -767,7 +777,8 @@ function renderDigest(stories, opts) {
   out.push("");
   for (const s of stories) {
     const st = s.story;
-    out.push(`## ${st.title ?? st.storyId} / ${st.name ?? ""}`);
+    const storyTitle = [st.title ?? st.storyId, st.name].filter(Boolean).join(" / ");
+    out.push(`## ${storyTitle}`);
     out.push("");
     out.push(`story id: \`${st.storyId}\``);
     if (st.importPath) out.push(`story file: ${repoRelPath(st.importPath) ?? st.importPath}`);
@@ -862,6 +873,12 @@ async function ghError(res, method, pathname) {
   }
   if (res.status === 404) {
     throw Object.assign(new Error(`GitHub 404 on ${method} ${pathname} (${text.slice(0, 160)})`), { status: 404 });
+  }
+  if (res.status === 422) {
+    throw Object.assign(
+      new Error(`GitHub rejected the request body (422: ${text.slice(0, 200)}) \u2014 not retried automatically; the offending thread's body needs editing`),
+      { status: 422 }
+    );
   }
   throw Object.assign(
     new Error(`GitHub API ${res.status} on ${method} ${pathname}: ${text.slice(0, 300)}`),
@@ -1199,7 +1216,18 @@ reopened in Storybook \u2014 thread #${t.number}.`;
       if (issueActive) {
         const ghComments = await listIssueComments(tk, rp, mir.issue, since);
         const known = new Set(t.comments.map((c) => c.ghId).filter((x) => Boolean(x)));
-        fresh = ghComments.filter((c) => !known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)).sort((a, b) => a.created_at.localeCompare(b.created_at));
+        let malformed = 0;
+        for (const c of ghComments) {
+          if (typeof c?.body !== "string" || c.created_at !== void 0 && typeof c.created_at !== "string") {
+            malformed++;
+            continue;
+          }
+          if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
+        }
+        if (malformed > 0) {
+          console.warn(`[storybook-annotakit] pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at) \u2014 treated as untrusted input, not imported`);
+        }
+        fresh.sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
       }
       if (statusChange || fresh.length > 0 || mir.state !== issue.state || issueActive) {
         let reason = null;
@@ -1228,7 +1256,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
               id: newId().replace(/^th_/, "c_"),
               author: c.user?.login ?? "github",
               body: c.body.replace(SENTINEL_RE, "").trimEnd(),
-              createdAt: c.created_at,
+              createdAt: typeof c.created_at === "string" && c.created_at ? c.created_at : nowIso(),
               ghId: String(c.id),
               source: "github"
             });
@@ -1460,7 +1488,8 @@ function logicalMerge(local, remote) {
 // src/server/sync.ts
 var DEBOUNCE_MS = 6e3;
 var BOOT_MS = Date.now();
-var README_CONTENT = [
+var README_MARKER = "annotakit-store: v1";
+var README_PROSE = [
   "# annotakit store branch",
   "",
   "Managed by storybook-annotakit \u2014 do not merge into code branches,",
@@ -1472,7 +1501,9 @@ var README_CONTENT = [
   "would stream binary; run the Storybook dev server instead and use",
   "GET /annotakit/api/threads.",
   ""
-].join("\n");
+];
+var README_CONTENT = [README_MARKER, ...README_PROSE].join("\n");
+var LEGACY_README_CONTENTS = [README_PROSE.join("\n"), README_PROSE.join("\n") + "\n"];
 var SHA_RE = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 var BRANCH_PRIMARY = "annotakit";
 var BRANCH_FALLBACK = "annotakit-store";
@@ -1560,11 +1591,15 @@ function createAutoSync(opts) {
   let inflight = null;
   let stopped = false;
   let state = "init";
-  let lastError = "";
   let branch = BRANCH_PRIMARY;
   let restorePromise = null;
   let readmeSha = null;
+  let legacyReadmeShas = null;
   let everPushed = false;
+  let consecutivePushFailures = 0;
+  let lastPushError = null;
+  let lastSyncAt = null;
+  let lastSyncAttemptAt = null;
   const enabled = opts.autoSyncEnabled && gitMode && isGitRepo(root);
   const repo = opts.repo;
   if (!opts.autoSyncEnabled) {
@@ -1576,26 +1611,53 @@ function createAutoSync(opts) {
   }
   const logOnce = (msg) => {
     const safe = redact(msg);
-    if (safe !== lastError) {
-      lastError = safe;
-      console.warn(`[storybook-annotakit] store-sync: ${safe}`);
+    const n = (logCounts.get(safe) ?? 0) + 1;
+    logCounts.set(safe, n);
+    if (n === 1 || n === 5 || n === 25 || n > 25 && n % 100 === 0) {
+      console.warn(`[storybook-annotakit] store-sync: ${safe}${n > 1 ? ` (x${n})` : ""}`);
     }
   };
+  const logCounts = /* @__PURE__ */ new Map();
   const commitEnv = () => ({ ...COMMIT_ENV });
-  const refHasOurReadme = async (ref) => {
+  const getLegacyReadmeShas = async () => {
+    if (legacyReadmeShas) return legacyReadmeShas;
+    const shas = /* @__PURE__ */ new Set();
+    for (const content of LEGACY_README_CONTENTS) {
+      const h = await gitAsync(root, ["hash-object", "-t", "blob", "-w", "--stdin"], 8e3, { stdin: content });
+      if (h.ok && SHA_RE.test(h.out.trim())) shas.add(h.out.trim());
+    }
+    legacyReadmeShas = shas;
+    return shas;
+  };
+  const refReadmeKind = async (ref) => {
     if (!readmeSha) {
       const h = await gitAsync(root, ["hash-object", "-t", "blob", "-w", "--stdin"], 8e3, { stdin: README_CONTENT });
-      if (!h.ok || !SHA_RE.test(h.out.trim())) return false;
+      if (!h.ok || !SHA_RE.test(h.out.trim())) return "no-readme";
       readmeSha = h.out.trim();
     }
     const blob = await gitAsync(root, ["rev-parse", `${ref}:README`], 6e3);
-    return blob.ok && SHA_RE.test(blob.out.trim()) && blob.out.trim() === readmeSha;
+    const sha = blob.ok ? blob.out.trim() : "";
+    if (!blob.ok || !SHA_RE.test(sha)) return "no-readme";
+    if (sha === readmeSha) return "ours";
+    const content = await gitAsync(root, ["show", `${ref}:README`], 6e3);
+    const line1 = content.ok ? (content.out.split("\n")[0] ?? "").trim() : "";
+    if (line1 === README_MARKER) return "ours";
+    const legacy = await getLegacyReadmeShas();
+    if (legacy.has(sha)) return "legacy";
+    return "foreign";
+  };
+  const refHasOurReadme = async (ref) => {
+    const kind = await refReadmeKind(ref);
+    return kind === "ours" || kind === "legacy";
   };
   const resolveBranch = async () => {
     const localHead = await gitAsync(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${BRANCH_PRIMARY}`], 5e3);
     if (localHead.ok && SHA_RE.test(localHead.out.trim())) {
-      if (!await refHasOurReadme(`refs/heads/${BRANCH_PRIMARY}`)) {
-        logOnce(`refs/heads/${BRANCH_PRIMARY} exists but is not an annotakit store branch \u2014 using ${BRANCH_FALLBACK} instead (A14)`);
+      const kind = await refReadmeKind(`refs/heads/${BRANCH_PRIMARY}`);
+      if (kind === "no-readme" || kind === "foreign") {
+        logOnce(
+          kind === "no-readme" ? `refs/heads/${BRANCH_PRIMARY} exists but its tip has NO README (empty or non-store branch) \u2014 using ${BRANCH_FALLBACK} instead (A14)` : `refs/heads/${BRANCH_PRIMARY} exists but is not an annotakit store branch (README mismatch \u2014 genuinely foreign) \u2014 using ${BRANCH_FALLBACK} instead (A14)`
+        );
         return BRANCH_FALLBACK;
       }
     }
@@ -1734,8 +1796,11 @@ function createAutoSync(opts) {
           state = `no remote store yet (${branch}) \u2014 first snapshot will create it`;
           return;
         }
-        if (!await refHasOurReadme(remote.ref)) {
-          logOnce(`remote refs/heads/${branch} is not an annotakit store branch \u2014 not adopting it (A14)`);
+        const kind = await refReadmeKind(remote.ref);
+        if (kind === "no-readme" || kind === "foreign") {
+          logOnce(
+            kind === "no-readme" ? `remote refs/heads/${branch} tip has NO README \u2014 pre-annotakit or empty branch, not adopting it (A14)` : `remote refs/heads/${branch} is not an annotakit store branch (README mismatch \u2014 genuinely foreign), not adopting it (A14)`
+          );
           state = `remote ${branch} is foreign; local store unaffected`;
           return;
         }
@@ -1794,9 +1859,14 @@ function createAutoSync(opts) {
         const remoteHead = await fetchRemote(timeoutMs);
         trace(`syncOnce(${reason}): remoteHead=${remoteHead ? remoteHead.slice(0, 8) : "none"}`);
         let parent = remoteHead;
-        if (parent && !await refHasOurReadme(REMOTE_CACHE_REF)) {
-          logOnce(`remote refs/heads/${branch} is foreign \u2014 not parenting on it (A14)`);
-          parent = null;
+        if (parent) {
+          const kind = await refReadmeKind(REMOTE_CACHE_REF);
+          if (kind === "no-readme" || kind === "foreign") {
+            logOnce(
+              kind === "no-readme" ? `remote refs/heads/${branch} tip has NO README \u2014 not parenting on it (A14)` : `remote refs/heads/${branch} is foreign \u2014 not parenting on it (A14)`
+            );
+            parent = null;
+          }
         }
         if (parent) {
           const remoteDoc = await readRemoteDoc(parent);
@@ -1854,15 +1924,23 @@ function createAutoSync(opts) {
         }
         if (!push.ok) {
           if (repo) {
+            consecutivePushFailures += 1;
+            lastPushError = redact(push.out).slice(0, 200) || "git push failed";
+            lastSyncAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
             logOnce(`git push failed (${push.out})${ghToken() ? "" : " \u2014 no ANNOTAKIT_GH_TOKEN in .env?"}`);
             state = "committed locally; push failed (retry on next mutation)";
           } else {
             state = "orphan branch updated locally (no remote to push)";
+            lastSyncAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
             await gitAsync(root, ["update-ref", `refs/heads/${branch}`, commit], timeoutMs);
           }
           return false;
         }
         everPushed = true;
+        consecutivePushFailures = 0;
+        lastPushError = null;
+        lastSyncAt = (/* @__PURE__ */ new Date()).toISOString();
+        lastSyncAttemptAt = lastSyncAt;
         if (remoteHead) {
           await gitAsync(root, ["update-ref", REMOTE_CACHE_REF, commit, remoteHead], timeoutMs);
           await gitAsync(root, ["update-ref", `refs/heads/${branch}`, commit, remoteHead], timeoutMs);
@@ -1945,11 +2023,27 @@ function createAutoSync(opts) {
     return branch;
   };
   const storeMode = () => gitMode ? "git" : "classic";
+  const syncNow = (reason = "api") => syncOnce(9e3, reason);
   const durability = () => {
     if (!enabled) return "disk-only";
     if (!repo) return "git-commit";
-    return ghToken() || everPushed ? "git-push" : "git-commit";
+    if (ghToken() || everPushed) {
+      return consecutivePushFailures > 0 ? "git-commit" : "git-push";
+    }
+    return "git-commit";
   };
+  const gitHealth = () => ({
+    autoSync: enabled,
+    mode: durability(),
+    branch,
+    remote: repo,
+    consecutivePushFailures,
+    lastPushError,
+    lastSyncAt,
+    lastSyncAttemptAt,
+    healthy: consecutivePushFailures === 0,
+    describe: state
+  });
   if (enabled) {
     console.warn(
       `[storybook-annotakit] store sync ON (v0.5 orphan branch): ${opts.storePath} \u2192 refs/heads/${branch}${repo ? ` \u2192 ${repo}` : " (no remote)"} \u2014 survives branch switches, checkouts and clean`
@@ -1957,7 +2051,7 @@ function createAutoSync(opts) {
   } else {
     console.warn(`[storybook-annotakit] store sync ${state} \u2014 the .db file still persists to disk`);
   }
-  return { notify, describe, durability, restore, storeBranch: storeBranchName, storeMode, stop };
+  return { notify, describe, durability, gitHealth, syncNow, restore, storeBranch: storeBranchName, storeMode, stop };
 }
 
 // src/shared/events.ts
@@ -1965,7 +2059,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.0";
+var VERSION = "0.6.1";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2078,7 +2172,7 @@ function afterMutation(rt, payload) {
   rt.sync.notify();
   if (payload.threadId) rt.ghsync.enqueue(payload.threadId);
 }
-async function sendMutationJson(rt, res, status, body) {
+async function sendMutationJson(rt, res, status, body, opts) {
   try {
     const s = await rt.ghsync.status();
     if (s.mode === "auto" && (s.stalled > 0 || s.lastError)) {
@@ -2088,6 +2182,11 @@ async function sendMutationJson(rt, res, status, body) {
       );
     }
   } catch {
+  }
+  if (opts?.replayed) {
+    res.setHeader("X-Annotakit-Replayed", "1");
+    sendJson(res, status, body && typeof body === "object" ? { ...body, replayed: true } : body);
+    return;
   }
   sendJson(res, status, body);
 }
@@ -2135,6 +2234,7 @@ function applyCors(req, res, methods = "GET,POST,PATCH,DELETE,OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Methods", methods);
     res.setHeader("Access-Control-Allow-Headers", "content-type");
+    res.setHeader("Access-Control-Expose-Headers", "X-Annotakit-Replayed, X-Annotakit-Mirror");
     res.setHeader("Vary", "Origin");
   } else {
     res.setHeader("Vary", "Origin");
@@ -2152,16 +2252,21 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let oversize = false;
     req.on("data", (c) => {
+      if (oversize) return;
       size += c.length;
       if (size > 2e6) {
-        reject(Object.assign(new Error("body too large"), { status: 413 }));
-        req.destroy();
+        oversize = true;
+        chunks.length = 0;
+        console.warn("[storybook-annotakit] 413: request body exceeds 2MB \u2014 comment bodies are capped at 64000 chars; PUT snapshots at 96KB");
+        reject(Object.assign(new Error("request body too large (max 2MB \u2014 comment bodies are capped at 64000 chars, snapshots at 96KB)"), { status: 413 }));
         return;
       }
       chunks.push(c);
     });
     req.on("end", () => {
+      if (oversize) return;
       if (!chunks.length) return resolve({});
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
@@ -2172,8 +2277,18 @@ function readBody(req) {
     req.on("error", reject);
   });
 }
-function notFound(res) {
-  sendJson(res, 404, { error: "not found" });
+function notFound(res, hint) {
+  sendJson(res, 404, { error: hint ? `not found \u2014 ${hint}` : "not found" });
+}
+var THREAD_404_HINT = "GET /annotakit/api/threads lists thread ids";
+var ROUTE_404_HINT = "unknown route \u2014 GET /annotakit/api/schema documents every endpoint";
+var warnedStories = /* @__PURE__ */ new Set();
+function warnUnknownStory(storyId, hasImportPath) {
+  if (hasImportPath || warnedStories.has(storyId)) return;
+  warnedStories.add(storyId);
+  console.warn(
+    `[storybook-annotakit] note: thread created for storyId ${JSON.stringify(storyId)} WITHOUT story metadata (importPath) \u2014 digests will show a bare story-id section with no story file. Pass story: {title, name, importPath} when you have it; a typo'd storyId is invisible to the server.`
+  );
 }
 function fail(res, err) {
   const status = err?.status ?? 500;
@@ -2246,6 +2361,9 @@ function validateThreadInput(body) {
   }
   for (const c of comments) {
     if (!c.body?.trim()) throw Object.assign(new Error("comment body is required"), { status: 400 });
+    if (c.body.length > MAX_BODY_CHARS) {
+      throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars \u2014 the full body stays in the store/json export; keep evidence links instead of pasting whole logs)`), { status: 413 });
+    }
     normalizeComment(c);
   }
   return body;
@@ -2303,23 +2421,44 @@ async function handleApi(req, res, url, configDir, origin) {
     sendJson(res, 200, {
       ok: true,
       version: VERSION,
+      // route index (Track B: 404s gave no pointers; agents had to read the
+      // README to discover endpoints — now the API self-documents them)
+      endpoints: [
+        ["GET", `${API_BASE}/health`, "agentSurfaces, store, gh + git state \u2014 detect your path here first"],
+        ["GET", `${API_BASE}/schema`, "this document"],
+        ["GET", `${API_BASE}/threads`, "ALL threads \u2014 envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array)"],
+        ["GET", `${API_BASE}/threads?storyId=<id>&status=<open|resolved>`, "filtered (an EMPTY storyId param is treated as absent, not a filter)"],
+        ["POST", `${API_BASE}/threads`, "create \u2192 201; idempotent replay (same id) \u2192 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only \u2014 amend via PATCH"],
+        ["GET", `${API_BASE}/threads/<id>`, "one thread doc"],
+        ["PATCH", `${API_BASE}/threads/<id>`, "partial {status} (JSON-merge) or full doc \u2014 see PATCH below"],
+        ["POST", `${API_BASE}/threads/<id>/comments`, "reply \u2192 201 with the FULL updated thread doc (not the new comment); key comments by thread id, never by your own comment id (ids are re-hashed)"],
+        ["DELETE", `${API_BASE}/threads/<id>`, "delete (path form; legacy DELETE /threads?id=<id> equivalent)"],
+        ["GET|PUT", `${API_BASE}/threads/<id>/snapshot`, "plan-b DOM evidence \u2014 GET \u2192 JSON, GET ?format=html \u2192 human view; PUT replaces (idempotent, 96KB cap)"],
+        ["GET", `${API_BASE}/export?format=md|json`, "digest \u2014 md clips comment bodies at 200 chars for display; json keeps FULL bodies. NOTE the json envelope is {generatedAt, stories:[...]} (story-grouped), NOT the {threads:[...]} shape of GET /threads"],
+        ["GET|POST", `${API_BASE}/sync`, "mirror status / force reconcile \u2014 POST also forces one git store cycle first (v0.6.1)"]
+      ],
       POST: {
         url: `${API_BASE}/threads`,
         body: THREAD_INPUT_EXAMPLE,
-        note: 'body.id is the IDEMPOTENCY KEY: a replayed POST with the same id returns 200 (existing thread), a fresh id (or none) returns 201 \u2014 send a stable id (e.g. "fix-header-overflow") whenever a retry might replay the POST, or you mint duplicate threads. Server assigns per-story numbers; comment ids are deterministically re-hashed server-side (your comment id may come back different \u2014 key by thread id).'
+        note: 'body.id is the IDEMPOTENCY KEY: a replayed POST with the same id returns 200 (existing thread, flagged replayed:true \u2014 your new body does NOT land; amend via PATCH), a fresh id (or none) returns 201 \u2014 send a stable id (e.g. "fix-header-overflow") whenever a retry might replay the POST, or you mint duplicate threads. Server assigns per-story numbers; comment ids are deterministically re-hashed server-side (your comment id may come back different \u2014 key by thread id). Threads without story.importPath render as bare digest sections (pass story metadata when you have it).'
       },
       PATCH: {
         url: `${API_BASE}/threads/<id>`,
         partialBody: { status: "resolved" },
-        note: "partial (JSON-merge) or full-document both accepted; comments always union-merge by id"
+        note: 'partial (JSON-merge) or full-document both accepted; status must be exactly "open" or "resolved" (case-insensitive, normalized \u2014 anything else is a 400, the server stamps resolvedAt on open\u2192resolved); comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt)'
       },
-      COMMENT: { url: `${API_BASE}/threads/<id>/comments`, body: { author: "agent", body: "fixed in abc123" } },
+      COMMENT: {
+        url: `${API_BASE}/threads/<id>/comments`,
+        body: { author: "agent", body: "fixed in abc123" },
+        note: "returns the FULL updated thread doc (201), not the comment; comment bodies capped at 64000 chars"
+      },
       DELETE: { url: `${API_BASE}/threads/<id>` },
       SNAPSHOT: {
         url: `${API_BASE}/threads/<id>/snapshot`,
         methods: ["GET", "PUT"],
-        note: 'GET \u2192 JSON { html, clipped, capturedAt, width, height } (plan-b evidence: story DOM at pin time, pinned element carries data-annota-snap="1"); GET ?format=svg \u2192 human-viewable foreignObject wrapper; PUT replaces (idempotent)'
-      }
+        note: 'GET \u2192 JSON { html, clipped, capturedAt, width, height } (plan-b evidence: story DOM at pin time, pinned element carries data-annota-snap="1"); GET ?format=html \u2192 human-viewable inert render (CSP script-src none; unknown format values \u2192 400); PUT replaces (idempotent, 96KB cap)'
+      },
+      limits: { maxCommentBodyChars: MAX_BODY_CHARS, maxRequestBodyBytes: 2e6, maxSnapshotBytes: 96 * 1024 }
     });
     return true;
   }
@@ -2352,6 +2491,7 @@ async function handleApi(req, res, url, configDir, origin) {
         ghSync,
         labels: rt.ghLabels
       },
+      git: rt.sync.gitHealth(),
       ...rt.bootWarnings.length ? { warnings: rt.bootWarnings } : {}
     };
     if (method === "HEAD") {
@@ -2376,8 +2516,9 @@ async function handleApi(req, res, url, configDir, origin) {
       const input = validateThreadInput(await readBody(req));
       const preexisting = input.id ? await store.getThread(input.id) : null;
       const thread = await store.createThread(input);
+      warnUnknownStory(input.storyId, Boolean(input.story?.importPath));
       afterMutation(rt, { storyId: thread.storyId, threadId: thread.id, reason: "created" });
-      await sendMutationJson(rt, res, preexisting ? 200 : 201, thread);
+      await sendMutationJson(rt, res, preexisting ? 200 : 201, thread, { replayed: Boolean(preexisting) });
       return true;
     }
     if (method === "DELETE") {
@@ -2399,7 +2540,7 @@ async function handleApi(req, res, url, configDir, origin) {
     if (method === "DELETE" && !isComments) {
       const prev = await store.getThread(id);
       const ok = await store.deleteThread(id);
-      if (!ok) return notFound(res), true;
+      if (!ok) return notFound(res, THREAD_404_HINT), true;
       if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
       afterMutation(rt, { storyId: prev?.storyId, threadId: void 0, reason: "updated" });
       sendJson(res, 200, { ok: true });
@@ -2407,7 +2548,7 @@ async function handleApi(req, res, url, configDir, origin) {
     }
     if (method === "GET" && !isComments) {
       const thread = await store.getThread(id);
-      if (!thread) return notFound(res), true;
+      if (!thread) return notFound(res, THREAD_404_HINT), true;
       sendJson(res, 200, thread);
       return true;
     }
@@ -2417,8 +2558,18 @@ async function handleApi(req, res, url, configDir, origin) {
         throw Object.assign(new Error("id mismatch between URL and body"), { status: 400 });
       }
       const prev = await store.getThread(id);
-      if (!prev) return notFound(res), true;
+      if (!prev) return notFound(res, THREAD_404_HINT), true;
       const full = buildPatchCandidate(prev, body);
+      if ("status" in body && full.status !== void 0) {
+        const norm = String(full.status).toLowerCase();
+        if (norm !== "open" && norm !== "resolved") {
+          throw Object.assign(
+            new Error(`status must be "open" or "resolved" (got ${JSON.stringify(full.status)}) \u2014 {"status":"resolved"} resolves (server stamps resolvedAt), {"status":"open"} reopens`),
+            { status: 400 }
+          );
+        }
+        full.status = norm;
+      }
       if (prev.status === "open" && full.status === "resolved" && !full.resolvedAt) {
         full.resolvedAt = nowIso();
       }
@@ -2436,9 +2587,15 @@ async function handleApi(req, res, url, configDir, origin) {
           if (pc.ghId && !c.ghId) c.ghId = pc.ghId;
           if (pc.source && !c.source) c.source = pc.source;
         }
+        if ((!pc || pc.body !== c.body) && typeof c.body !== "string") {
+          throw Object.assign(new Error("comment body must be a string"), { status: 400 });
+        }
+        if ((!pc || pc.body !== c.body) && c.body.length > MAX_BODY_CHARS) {
+          throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars \u2014 new/changed comments only; stored bodies are exempt)`), { status: 413 });
+        }
       }
       const updated = await store.updateThread(full);
-      if (!updated) return notFound(res), true;
+      if (!updated) return notFound(res, THREAD_404_HINT), true;
       afterMutation(rt, {
         storyId: updated.storyId,
         threadId: updated.id,
@@ -2450,10 +2607,13 @@ async function handleApi(req, res, url, configDir, origin) {
     if (method === "POST" && isComments) {
       const body = await readBody(req);
       const thread = await store.getThread(id);
-      if (!thread) return notFound(res), true;
+      if (!thread) return notFound(res, THREAD_404_HINT), true;
       const author = typeof body.author === "string" && body.author.trim() ? body.author.trim() : "anonymous";
       const commentBody = typeof body.body === "string" ? body.body : "";
       if (!commentBody.trim()) throw Object.assign(new Error("comment body is required"), { status: 400 });
+      if (commentBody.length > MAX_BODY_CHARS) {
+        throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars \u2014 keep evidence links instead of pasting whole logs)`), { status: 413 });
+      }
       const comment = normalizeComment({
         id: "",
         author,
@@ -2492,8 +2652,12 @@ async function handleApi(req, res, url, configDir, origin) {
     }
     if (method === "GET" || method === "HEAD") {
       const snap = await store.getSnapshot(id);
-      if (!snap) return notFound(res), true;
-      if (url.searchParams.get("format") === "html") {
+      if (!snap) return notFound(res, THREAD_404_HINT), true;
+      const fmt = url.searchParams.get("format");
+      if (fmt !== null && fmt !== "html" && fmt !== "json") {
+        throw Object.assign(new Error(`unknown format ${JSON.stringify(fmt)} \u2014 use ?format=html (human view) or omit for JSON`), { status: 400 });
+      }
+      if (fmt === "html") {
         const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'"><title>annotakit snapshot ${id}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped at 32KB</div>' : ""}</body></html>`;
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
         res.end(method === "HEAD" ? void 0 : page);
@@ -2515,6 +2679,9 @@ async function handleApi(req, res, url, configDir, origin) {
     const stories = groupByStory(threads, origin);
     const snapshotIds = await store.listSnapshotIds();
     const format = (url.searchParams.get("format") ?? "md").toLowerCase();
+    if (format !== "md" && format !== "json" && format !== "jsonl") {
+      throw Object.assign(new Error(`unknown format ${JSON.stringify(format)} \u2014 use ?format=md (lean markdown digest) or ?format=json (full-fidelity bundle; jsonl is a json alias)`), { status: 400 });
+    }
     if (format === "json" || format === "jsonl") {
       const bundle = { generatedAt: (/* @__PURE__ */ new Date()).toISOString(), exportUrl: `${origin}${API_BASE}/export`, stories };
       sendJson(res, 200, bundle);
@@ -2535,8 +2702,9 @@ async function handleApi(req, res, url, configDir, origin) {
     }
     if (method === "POST") {
       await rt.sync.restore().catch(() => void 0);
+      const gitOk = await rt.sync.syncNow("api").catch(() => false);
       const summary = await rt.ghsync.syncAll();
-      sendJson(res, 200, summary);
+      sendJson(res, 200, { ...summary, gitSync: rt.sync.gitHealth(), gitSyncForced: gitOk });
       return true;
     }
   }
@@ -2568,7 +2736,7 @@ function resolveNotHandled(res, pathname) {
       return;
     }
   }
-  notFound(res);
+  notFound(res, ROUTE_404_HINT);
 }
 function createMiddleware(configDir) {
   return (req, res, next) => {
@@ -2593,6 +2761,12 @@ function createMiddleware(configDir) {
       return;
     }
     if (url.pathname.startsWith(API_BASE)) {
+      if (url.pathname.length > API_BASE.length + 1 && url.pathname.endsWith("/")) {
+        try {
+          url.pathname = url.pathname.replace(/\/+$/, "");
+        } catch {
+        }
+      }
       applyCors(req, res);
       if (req.method === "OPTIONS") {
         res.writeHead(204);

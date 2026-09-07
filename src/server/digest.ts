@@ -10,12 +10,14 @@
  */
 
 import type { ExportedStory, Thread } from '../shared/types';
+import { DIGEST_CLIP_CHARS } from '../shared/types';
 import { elementSummary } from '../shared/describe';
 import { repoRelPath } from './env';
 
-function fmtDate(iso: string): string {
+function fmtDate(iso: string | undefined): string {
+  if (!iso) return '';
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
+  if (Number.isNaN(d.getTime())) return iso; // hostile/remote dates degrade to raw text, never "Invalid Date"
   return d.toISOString().replace('T', ' ').slice(5, 16); // MM-DD HH:mm
 }
 
@@ -23,9 +25,17 @@ function oneLine(body: string): string {
   return body.replace(/\s+/g, ' ').trim();
 }
 
+/** Display clip with an honest ellipsis — headline and replies use the SAME
+ *  budget (parity; the v0.6.0 digest left the FIRST comment un-clipped, so a
+ *  1.5MB body produced a 1.5MB digest line while every reply was capped). */
+function clip(body: string): string {
+  const line = oneLine(body);
+  return line.length > DIGEST_CLIP_CHARS ? line.slice(0, DIGEST_CLIP_CHARS) + '…' : line;
+}
+
 function threadBlock(t: Thread, snapshotUrl?: string): string[] {
   const first = t.comments[0];
-  const headline = first ? oneLine(first.body) : '(no text)';
+  const headline = first ? clip(first.body) : '(no text)';
   const status = t.status === 'open' ? 'OPEN' : 'resolved';
   const out: string[] = [];
   out.push(`### #${t.number} ${status} — ${headline}`);
@@ -66,7 +76,11 @@ function threadBlock(t: Thread, snapshotUrl?: string): string[] {
 
   const replies = t.comments.slice(1);
   for (const r of replies) {
-    out.push(`  - ${r.author} ${fmtDate(r.createdAt)}: ${oneLine(r.body).slice(0, 200)}`);
+    // provenance marker (v0.6.1): bodies imported from GitHub are
+    // third-party content an agent will consume — mark them so agent prompts
+    // can treat them as untrusted input (prompt-injection surface, Track A P3)
+    const via = r.source === 'github' ? ' (via github)' : '';
+    out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip(r.body)}`);
   }
   if (t.status === 'resolved' && t.resolvedAt) {
     out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
@@ -95,7 +109,10 @@ export function renderDigest(
 
   for (const s of stories) {
     const st = s.story;
-    out.push(`## ${st.title ?? st.storyId} / ${st.name ?? ''}`);
+    // title degrade fix (Track B): no more `## <id> / ` with a trailing
+    // separator and empty name when story metadata is absent
+    const storyTitle = [st.title ?? st.storyId, st.name].filter(Boolean).join(' / ');
+    out.push(`## ${storyTitle}`);
     out.push('');
     out.push(`story id: \`${st.storyId}\``);
     if (st.importPath) out.push(`story file: ${repoRelPath(st.importPath) ?? st.importPath}`);

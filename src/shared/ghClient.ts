@@ -87,7 +87,12 @@ export interface GhClientStatus {
   repo: string | null;
   labels: string[];
   leader: boolean;
+  /** Ops waiting to flush (excludes parked — see `parked`). */
   queue: number;
+  /** Ops terminally parked after a non-retryable rejection (422: GitHub
+   *  refused the body itself). Kept in the outbox for inspection, never
+   * retried. 0 in the healthy case. */
+  parked: number;
   flushing: boolean;
   lastError?: string;
   lastPushAt?: string;
@@ -115,8 +120,13 @@ interface GhOp {
   issue?: number;
   enqueuedAt: string;
   attempts?: number;
+  /** Retry-not-before timestamp (ms epoch). Infinity-parked ops set
+   * `parked` instead. */
   notBefore?: number;
   lastError?: string;
+  /** Terminally parked (422 body rejection): never retried, kept for
+   * inspection, surfaced via status().parked. */
+  parked?: boolean;
 }
 
 /* ------------------------------ transport shim ------------------------------ */
@@ -157,6 +167,14 @@ async function ghError(res: Response, method: string, pathname: string): Promise
   }
   if (res.status === 404) {
     throw Object.assign(new Error(`GitHub 404 on ${method} ${pathname} (${text.slice(0, 160)})`), { status: 404 });
+  }
+  if (res.status === 422) {
+    // The BODY itself is rejected (too long / validation) — no retry, no
+    // backoff loop can ever fix it. Park the op (named below by thread).
+    throw Object.assign(
+      new Error(`GitHub rejected the request body (422: ${text.slice(0, 200)}) — this op will not be retried automatically; edit or delete the offending thread feedback.`),
+      { status: 422, park: true },
+    );
   }
   throw Object.assign(new Error(`GitHub API ${res.status} on ${method} ${pathname}: ${text.slice(0, 300)}`), {
     status: 502,
@@ -479,7 +497,11 @@ function writeQueue(ops: GhOp[]): void {
   try {
     store.setItem(queueKey(), JSON.stringify({ v: 1, ops }));
   } catch {
-    /* quota — the in-flight flush still runs; worst case ops re-enqueue */
+    // quota — the in-flight flush still runs; worst case ops re-enqueue.
+    // But a queue that CANNOT persist is a mirror gap the UI must know
+    // about (ops only exist at mutation time; freed space does not
+    // retroactively mirror them).
+    if (state) state.lastError = 'outbox write failed (storage full) — publishing paused for new feedback; free space or export + re-add later';
   }
 }
 
@@ -510,12 +532,34 @@ function removeOp(id: string): void {
   writeQueue(readQueue().filter((o) => o.id !== id));
 }
 
+/** Any config write (Save, Reset) means "the user just acted" — clear the
+ * retry backoff of every non-parked op so the next flush re-attempts NOW
+ * (one transport call per user action, not a ~2min silent wait), and drop
+ * the stale per-op error text so the UI stops crying wolf. Attempts are
+ * KEPT (continued failures still back off exponentially). Parked ops stay
+ * parked — a config change cannot fix a 422 body rejection. */
+function clearOpBackoff(): void {
+  const ops = readQueue();
+  if (!ops.some((o) => !o.parked && ((o.notBefore ?? 0) > 0 || o.lastError))) return;
+  writeQueue(ops.map((o) => (o.parked ? o : { ...o, notBefore: 0, lastError: undefined })));
+}
+
 function bumpOp(id: string, err: unknown): { transient: boolean } {
   const ops = readQueue();
   const idx = ops.findIndex((o) => o.id === id);
   const transient = Boolean((err as { transient?: boolean })?.transient) || [429, 502, 503, 504].includes(Number((err as { status?: number })?.status));
+  const park = Boolean((err as { park?: boolean })?.park);
   if (idx >= 0) {
     const op = ops[idx];
+    if (park) {
+      // 422 body rejection: terminally parked — never retried, kept
+      // inspectable, surfaced in status().parked. The message names the
+      // thread (close ops name the issue) so the gap is actionable.
+      const ref = op.kind === 'sync' ? `thread ${op.threadId}` : `issue #${op.issue}`;
+      ops[idx] = { ...op, parked: true, lastError: `parked (422 — GitHub rejected the body, ${ref}): ${err instanceof Error ? err.message.slice(0, 200) : String(err)}` };
+      writeQueue(ops);
+      return { transient: false };
+    }
     const attempts = (op.attempts ?? 0) + 1;
     const retryMs = Number((err as { retryMs?: number })?.retryMs) || Math.min(15_000 * 2 ** Math.min(attempts, 5), MAX_BACKOFF_MS);
     ops[idx] = { ...op, attempts, notBefore: Date.now() + retryMs, lastError: err instanceof Error ? err.message.slice(0, 300) : String(err) };
@@ -647,12 +691,14 @@ async function processCloseOp(cfg: GhClientConfig, op: GhOp): Promise<void> {
 async function flushOnce(base: StaticStore): Promise<void> {
   if (!state || state.flushing) return;
   state.flushing = true;
+  let ranWork = false; // did this invocation actually process an op?
   try {
     for (;;) {
       const cfg = await probeGhConfig(); // re-resolved every cycle — settings changes apply live
-      if (!cfg) return;
-      const ops = readQueue().filter((o) => (o.notBefore ?? 0) <= Date.now());
+      if (!cfg) return; // disabled/unconfigured — ops stay queued for a real wake (P0: the finally-gate below must NOT re-arm)
+      const ops = readQueue().filter((o) => !o.parked && (o.notBefore ?? 0) <= Date.now());
       if (!ops.length) return;
+      ranWork = true;
       const op = ops[0] as GhOp;
       try {
         if (op.kind === 'sync') await processSyncOp(base, cfg, op);
@@ -662,18 +708,24 @@ async function flushOnce(base: StaticStore): Promise<void> {
       } catch (err) {
         const { transient } = bumpOp(op.id, err);
         if (state) state.lastError = err instanceof Error ? err.message : String(err);
-        if (!transient) return; // 401/404 — needs a settings fix, stop hammering
+        if (!transient) return; // 401/404/422-parked — needs a settings/body fix, stop hammering
         return; // backoff applied — the sweep timer retries later
       }
     }
   } finally {
     if (state) {
       state.flushing = false;
-      // a wake that arrived MID-flush was swallowed by the guard above while
+      // A wake that arrived MID-flush was swallowed by the guard above while
       // the in-flight loop had already read the queue — if anything is still
-      // eligible, run another cycle immediately (no 30s-sweep wait; failed
-      // ops carry notBefore, so this cannot spin)
-      if (readQueue().some((o) => (o.notBefore ?? 0) <= Date.now())) void flushOnce(base);
+      // eligible, run another cycle immediately (failed ops carry notBefore,
+      // so this cannot spin). GUARD (P0 fix, v0.6.1): only re-arm when this
+      // invocation actually did work. A no-work exit (cfg null because
+      // client GH is disabled, or nothing eligible) used to re-arm forever
+      // against cached-resolved promises — a microtask loop that starved
+      // the event loop (frozen tab, 100%+ CPU, every reload). Disabled-with-
+      // queued-ops now simply waits for the next real wake (enqueue,
+      // saveSettings, storage event, 30s sweep); re-enabling drains it.
+      if (ranWork && readQueue().some((o) => !o.parked && (o.notBefore ?? 0) <= Date.now())) void flushOnce(base);
     }
   }
 }
@@ -736,9 +788,21 @@ async function pullOnce(base: StaticStore): Promise<number> {
     if (issueActive) {
       const ghComments = await listIssueCommentsRemote(cfg, mir.issue, since);
       const known = new Set(t.comments.map((c) => c.ghId).filter((x): x is string => Boolean(x)));
-      fresh = ghComments
-        .filter((c) => !known.has(String(c.id)) && !c.body.includes(GH_SENTINEL))
-        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+      // v0.6.1 hostile-input hardening (Track A, client edition): one
+      // malformed remote comment (body/created_at not strings) used to
+      // TypeError and abort the WHOLE pull. Skip with a counter instead.
+      let malformed = 0;
+      for (const c of ghComments) {
+        if (typeof c?.body !== 'string' || (c.created_at !== undefined && typeof c.created_at !== 'string')) {
+          malformed++;
+          continue;
+        }
+        if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
+      }
+      if (malformed > 0 && state) {
+        state.lastError = `pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at)`;
+      }
+      fresh.sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')));
     }
 
     if (statusChange || fresh.length > 0 || mir.state !== issue.state || issueActive) {
@@ -771,7 +835,7 @@ async function pullOnce(base: StaticStore): Promise<number> {
           id: `c_gh_${Math.random().toString(36).slice(2, 10)}`,
           author: c.user?.login ?? 'github',
           body: c.body.replace(SENTINEL_RE, '').trimEnd(),
-          createdAt: c.created_at,
+          createdAt: typeof c.created_at === 'string' && c.created_at ? c.created_at : new Date().toISOString(),
           ghId: String(c.id),
           source: 'github',
         });
@@ -866,9 +930,12 @@ function buildStatus(): GhClientStatus {
     repo: resolved?.repo ?? override?.repo ?? null,
     labels: resolved?.labels ?? override?.labels ?? [],
     leader: state?.leader ?? false,
-    queue: ops.length,
+    queue: ops.filter((o) => !o.parked).length,
+    parked: ops.filter((o) => Boolean(o.parked)).length,
     flushing: state?.flushing ?? false,
-    lastError: (state?.lastError ?? undefined) || ops.find((o) => o.lastError)?.lastError,
+    // parked errors FIRST: they are terminal + name the thread (actionable);
+    // the raw state error would otherwise shadow them with a generic message
+    lastError: ops.find((o) => o.parked && o.lastError)?.lastError || (state?.lastError ?? undefined) || ops.find((o) => o.lastError)?.lastError,
     lastPushAt: state?.lastPushAt,
     lastPullAt: state?.lastPullAt,
     lastPullCount: state?.lastPullCount,
@@ -930,11 +997,13 @@ export async function getGhLinkedStaticStore(): Promise<LinkedStaticStore> {
     status: buildStatus,
     saveSettings(patch: GhClientSettings) {
       writeOverride(patch);
+      clearOpBackoff(); // the user just changed the config — retry NOW, not after the old backoff
       if (state?.leader) void flushOnce(base);
     },
     clearSettings() {
       const store = ls();
       if (store) store.removeItem(cfgKey());
+      clearOpBackoff();
       if (state?.leader) void flushOnce(base);
     },
     async syncNow() {

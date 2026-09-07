@@ -21,10 +21,11 @@ Self-contained repo — no dependency on any other project.
 
 ```bash
 bun install                          # repo root
-bun run build                        # REQUIRED: builds dist/ (preset needs it)
+bun run build                        # refreshes dist/ (dist is git-TRACKED — a
+                                     # fresh clone runs without building)
 cd examples/nimbus && bun install    # demo deps
 bun run storybook                    # http://localhost:6006
-curl localhost:6006/annotakit/api/health   # → {"ok":true,"store":"sqlite","gh":{...}}
+curl localhost:6006/annotakit/api/health   # → {"ok":true,"store":"sqlite","gh":{...},"git":{...}}
 ```
 
 Known wart (harmless, but don't panic): the demo's `file:../..` dependency
@@ -123,12 +124,15 @@ python3 scripts/serve-static.py examples/nimbus/dist-storybook 3000
   PATH (`directory=`), never chdir — a rebuild that wipes the output dir
   deletes the process cwd and kills every request handler (cost a debug
   round in v0.5.3 E2E).
-- Unit suites: `node scripts/static-store-test.mjs` (26 checks: scope
-  isolation, seed merge/rebake, tombstones, numbering, digest) and
-  `node scripts/ghclient-test.mjs` (55 checks: config resolution,
+- Unit suites: `node scripts/static-store-test.mjs` (31 checks: scope
+  isolation, seed merge/rebake, tombstones, numbering, digest, headline
+  clip, quota surface, provenance) and
+  `node scripts/ghclient-test.mjs` (72 checks: config resolution,
   lifecycle mirror parity, outbox durability across "reload", idempotency,
   pull import/dedupe/self-heal, follower enqueue-only, 401/404 handling, AND-
-  label filter wire format + foreign-workstream exclusion).
+  label filter wire format + foreign-workstream exclusion, disabled-mode
+  freeze regression (the v0.6.1 P0), backoff-clear on config writes, 422
+  parking, outbox-quota surfacing).
 
 Container command safety: never loop your platform's control-plane
 commands (reverse-proxy reloads, supervisor actions — some lock the session
@@ -174,16 +178,23 @@ echo '{"ghRepo":"owner/name"}' > .storybook/annotakit.config.json
 ```
 
 Env knobs (all optional, all read at boot): `ANNOTAKIT_GH_TOKEN` (PAT) ·
-`ANNOTAKIT_GH_REPO` (owner/name) · `ANNOTAKIT_GH_AUTO=0|false|off` (disable
-the mirror → local mode) · `ANNOTAKIT_GH_POLL=<sec>` (pull interval, 0 = pull
-only on POST /sync) · `ANNOTAKIT_GH_INTERVAL=<ms>` (worker tick) ·
-`ANNOTAKIT_GH_API=<base>` (GitHub Enterprise / test fake).
+`ANNOTAKIT_GH_REPO` (owner/name) · `ANNOTAKIT_GH_LABELS` (a,b — all applied
+on create, AND-combined in the pull filter; the multi-workstream knob) ·
+`ANNOTAKIT_GH_AUTO=0|false|off|no` (disable the mirror → local mode) ·
+`ANNOTAKIT_GH_POLL=<sec>` (pull interval, 0 = pull only on POST /sync) ·
+`ANNOTAKIT_GH_INTERVAL=<ms>` (worker tick) · `ANNOTAKIT_GH_API=<base>`
+(GitHub Enterprise / test fake) · `ANNOTAKIT_API_KEY` (opt-in shared secret
+for NON-loopback API clients — loopback is always free, non-loopback without
+the `x-annotakit-key` header gets 403).
 
 Non-default port: `storybook dev -p <port>` — the API base simply follows it
 (`<port>/annotakit/api`).
 
 Consumer git notes: auto-sync commits into whatever enclosing repo `git`
-finds (it walks up) — if that's not what you want, set `"autoSync": false`.
+finds (it walks up — a NON-git Storybook project nested inside another repo
+adopts the ENCLOSING repo's git dir and pushes its store branch there; git-init
+your project or set `"autoSync": false` to keep the store local) — if that's
+not what you want, set `"autoSync": false`.
 Add `*.db-wal` / `*.db-shm` to YOUR .gitignore (sidecars are volatile;
 threads.db itself should stay tracked). Caveat for local `file:` installs:
 bun copies the entire addon working directory into node_modules (including
@@ -271,13 +282,20 @@ that omits comments the server has (imported replies) is MERGED server-side —
 stale snapshots never drop data.
 
 **Envelope quirks**: `GET /threads` returns `{"threads": [...]}` (unwrap the
-array — JSON.parse(resp).threads, not resp[0]); everything else returns the
-raw doc. POST /threads: 201 for new, 200 for an idempotent replay — BUT the
-idempotency key is the TOP-LEVEL `id` field, which the old /schema example
-omitted: replaying that body verbatim minted DUPLICATES (201 + 201, verified
-by a cold onboarding agent). Always POST with a stable `id` (e.g.
+array — JSON.parse(resp).threads, not resp[0]); the JSON EXPORT uses a
+different, story-grouped envelope `{generatedAt, stories:[...]}`; everything
+else returns the raw doc. POST /threads: 201 for new, 200 for an idempotent
+replay — the replay is FLAGGED (`replayed: true` in the body + the
+`X-Annotakit-Replayed` header) because a replay of a DIFFERENT body returns
+the OLD doc and your amendments do NOT land: POST is create-only, amend via
+PATCH. Always POST with a stable `id` (e.g.
 "fix-header-overflow") when a retry might replay; the /schema example and
-note now include it. Comment ids are deterministically re-hashed server-side
+note include it. PATCH status is a validated enum (`open`/`resolved`,
+case-insensitive; anything else is a 400 — the server stamps `resolvedAt`
+only on real open→resolved transitions). Comment bodies are capped at 64,000
+chars (413 beyond) — keep evidence as links, not pasted logs; the full body
+still lives in the store and the JSON export. Comment ids are deterministically
+re-hashed server-side
 (your `c_1` may come back as `c_3YmnHIe9QNA9`) — key comments by thread id,
 never by your own comment id.
 Thread `number` is PER-STORY (two stories can each have a #1 — key threads
@@ -329,10 +347,23 @@ always the source of truth and never blocked on GitHub.
   tracked dbs are migrated row-by-row (mtime-triggered, idempotent, file
   left untouched — remove with `git rm` when convenient).
 - Token safety: pushes authenticate via an http extraHeader — the PAT never
-  appears in URLs, argv, or logs (git output is redacted regardless).
+  appears in URLs, argv, or logs (git output is redacted regardless). Rotate
+  any token that ever appeared in tool output/terminal scrollback.
 - **Verify pushes with `git ls-remote origin refs/heads/annotakit`** — NOT
   `git status`/ahead-count. The sync pushes via a URL and never touches
   remote config; remote-tracking refs are updated best-effort but may lag.
+- **Versioned store marker (v0.6.1)**: every store branch README starts with
+  `annotakit-store: v1` — adoption matches THAT LINE (prose-agnostic; any
+  rewording below it stays ours). Pre-marker branches (v0.5.0–v0.6.0 prose)
+  are accepted once by frozen content and self-heal to the marker on their
+  next push. A no-README tip reads as `no-readme`, a foreign README as
+  `foreign` — distinct log lines.
+- **Machine-readable git health (v0.6.1)**: `/health` carries a `git` block
+  (`consecutivePushFailures`, `lastPushError`, `lastSyncAt`, `healthy`),
+  `agentSurfaces.durability` DEGRADES to `git-commit` while pushes are
+  currently failing, and `POST /sync` runs a forced git cycle FIRST (response
+  gains `gitSync` + `gitSyncForced`) — an agent can flush the store without
+  waiting for the 6s mutation debounce or a shutdown.
 - **Git topology here**: the store is at `<repo>/.git/annotakit/threads.db`
   of THIS repo (the kit). In a fresh adoption it's YOUR project's git dir —
   run git commands at your repo root. Debug breadcrumbs:
@@ -374,7 +405,7 @@ always the source of truth and never blocked on GitHub.
 ```bash
 bun run build        # tsup: manager.mjs + preview.mjs (esm) + server.cjs (node)
 bun run typecheck
-node scripts/api-test.mjs            # 67/67 against a RUNNING dev server
+node scripts/api-test.mjs            # 87/87 against a RUNNING dev server
                                      #   (run it with ANNOTAKIT_GH_AUTO=0 to keep
                                      #   contract runs off real GitHub)
 node scripts/ghsync-fake.mjs         # 61/61 lifecycle + stress engine tests (mirror-body format IS asserted — run on any ghsync change)
@@ -382,6 +413,10 @@ node scripts/ghsync-fake.mjs         # 61/61 lifecycle + stress engine tests (mi
                                      #   concurrency, orphan guard, 404-heal,
                                      #   rate-limit backoff, API budget, PATCH
                                      #   union, 405/404/CORS semantics)
+node scripts/release-check.mjs       # release gate: dist chunk drift + version
+                                     #   agreement (pkg/routes/README) + npm-pack
+                                     #   leak guard; --selftest plants a ghost
+node scripts/ghclient-test.mjs       # 72/72 client-side publisher tests
 node scripts/stress-live.mjs         # 20/20 LIVE-process stress: GH unreachable,
                                      #   kill -9 + restart backfill (no dupes),
                                      #   black-hole timeout, 500-retry, poll
@@ -589,6 +624,21 @@ examples/nimbus/        demo project (fresh SB 10.6)
   works on modern Node in practice but is not portable; `require('fs')`
   resolves everywhere. (Also: `node -e` scripts in package.json need
   double-escaped quotes in JSON.)
+- **A "wake"-style re-arm must NEVER fire when the invocation did no work**
+  (the v0.6.1 P0): a flusher whose `finally` re-armed unconditionally spun
+  forever the moment its main loop exited early (config null → disabled)
+  with eligible ops — every `await` resolved against cached promises, so the
+  microtask queue never drained: the tab froze at 100%+ CPU, timers starved,
+  and every reload re-froze at boot-drain. The gate (`ranWork`) must be set
+  only when the loop actually PROCESSED something; a no-work exit waits for
+  the next real wake. General rule: any "re-check in finally" pattern needs
+  a did-work guard, or an early-exit path turns it into a microtask
+  busy-loop that nothing can debug (even DevTools times out).
+- **Respond BEFORE you destroy the socket** (the v0.6.1 ECONNRESET fix):
+  `req.destroy()` inside a body-size guard killed the connection before the
+  413 written by the rejection handler could land — clients saw a raw TCP
+  reset, the server log said nothing, and agents retried blind. Write the
+  response first, then let node close the connection; drain, don't RST.
 
 ## 8. Verification checklist (before reporting success)
 
@@ -597,14 +647,19 @@ examples/nimbus/        demo project (fresh SB 10.6)
    needed)
 2b. [needs adoptee ../fresh-adopt] `node scripts/stress-live.mjs` → 20/20
    (live restart/crash/fragility; spawns real SB ~3 min, port 6017)
-2c. [cold-runnable] `node scripts/store-robust.mjs` → 9/9 cases / 43 checks
+2c. [cold-runnable] `node scripts/store-robust.mjs` → 11/11 cases / 63 checks
    (git-durable store, real repos + bare remote, incl. case 9 `subdir` — the
-   subdirectory-project topology from issue #16)
+   subdirectory-project topology from issue #16; case 10 `marker` — README
+   marker adoption/self-heal; case 11 `githealth` — push-failure counters +
+   forced sync cycles)
+2d. [cold-runnable] `node scripts/release-check.mjs` → CLEAN (dist chunk
+   drift, version agreement, npm-pack leak; `--selftest` proves the gates
+   bite)
 3. [needs dev server] Dev server up; `curl localhost:<port>/annotakit/api/health`
-   → sqlite + `agentSurfaces` block + (when configured)
+   → sqlite + `agentSurfaces` block + `git` health block + (when configured)
    `gh.ghSync.mapped == threads` + `lastError: null` (6006 local dev; 3000
    when serving behind a preview gateway — §0)
-4. [needs dev server] `node scripts/api-test.mjs` → 67/67 (run with
+4. [needs dev server] `node scripts/api-test.mjs` → 87/87 (run with
    ANNOTAKIT_GH_AUTO=0)
 5. [needs browser] Browser: pins render on story enter + immediately after submit; composer
    opens with the elementSummary line + `component:`/`jsx:` rows and stays
@@ -681,11 +736,18 @@ examples/nimbus/        demo project (fresh SB 10.6)
   reply via the panel → comment lands on GitHub anyway (queue drains via the
   still-loaded page); restart the server after.
 12. [needs browser + baked GH config] **Client-side GH publishing shipped (v0.5.3)?** `node scripts/ghclient-
-    test.mjs` → 55/55 (incl. §13: labels must be COMMA-joined — GitHub treats
+    test.mjs` → 72/72 (incl. §13: labels must be COMMA-joined — GitHub treats
     repeated labels= params as last-wins, so the v0.5.3 wire form broke the
-    AND filter). Bake log shows the `annotakit-gh.json` line (token
+    AND filter; §14: the disabled-mode P0 freeze — local-only pin/reply must
+    keep the event loop alive; §15-17: backoff-clear, 422 parking, outbox
+    quota). Bake log shows the `annotakit-gh.json` line (token
     masked, repo, labels, poll). Public-edge browser: chip `static →
     github`, queue 0 after submit; `annotakit:ghq:<scope>` ops empty;
     thread has `gh.issue` + comment `ghId`. Full round-trip + the
-    dead-server reply proof (§7 recipe). Engine 61/61 + static 26/26 +
-    store 9/9 gates.
+    dead-server reply proof (§7 recipe). Engine 61/61 + static 31/31 +
+    store 11/11 gates.
+13. [needs browser] **Local-only (client GH disabled) never freezes**: settings
+    → disable → pin/reply → page stays responsive (timers fire, chip shows
+    `static · client GH off · N queued`) → re-enable → backlog drains to
+    exactly one issue (§14 of ghclient-test pins this headlessly; the browser
+    pass is the end-to-end proof of the v0.6.1 P0 fix).
