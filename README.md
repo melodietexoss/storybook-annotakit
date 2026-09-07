@@ -53,7 +53,7 @@ That's the entire setup — **local mode works with zero configuration**: pinnin
 1. `npm run storybook` → any story
 2. **Annotakit toolbar buttons** (native Storybook toolbar): pin · region · threads (+count) · show/hide pins — or press **`⌥C`** and click an element (**`⌥R`** → drag a region)
 3. The composer shows the exact element identity — `<button#save.primary.btn:nth(2) [testid=save-btn] "Save">` — the SAME string the agent later reads in the digest
-4. Type → **Pin it** (⌘/Ctrl+Enter). Saved. Automatically. That's the fix for "Failed to save annotation: do I need to set up a DB?"
+4. Type → **Pin it** (⌘/Ctrl+Enter). Saved, automatically — there is no DB setup to fail.
 5. Threads live in the **Annotakit** panel (bottom dock): reply, resolve, export, sync status, and a 📷 *dom* chip per thread opening the captured DOM evidence
 6. Pins follow their element through re-renders, HMR, and DOM changes (multi-selector anchoring with text/attr fallbacks — ported unchanged from AnnotaKit's proven engine)
 7. With a GitHub token configured, **every thread mirrors to exactly one GitHub issue, automatically** — create → issue, reply → comment, resolve → close, reopen → reopen, delete → close+note. No publish button, no duplicate issues, ever.
@@ -107,14 +107,14 @@ curl "$BASE/annotakit/api/export?format=json&status=open"  # lean JSON bundle
   - The local DB (`threads.db`, git-tracked) is the **status source of truth**; each thread's `gh.issue` field pins its mirror.
   - **Push on every mutation** (debounced, serialized): thread → issue, reply → comment, resolve → close, reopen → reopen, delete → close + note. Idempotent — `POST /annotakit/api/sync` reconciles both directions and creates **zero** duplicates, no matter how often you call it. A thread deleted while its issue is being created self-closes it (no orphans).
   - **Pull every 60s** (configurable): an agent closing the issue on GitHub resolves the thread in Storybook within a minute, importing its comments as replies (`source: "github"`). Reopening re-opens the thread; commenting on a closed issue still imports.
-  - **Failure behavior**: 401 → self-healing a/b/c steps, mirror pauses, local mode keeps working. Rate limits → timed backoff (Retry-After respected). Remote issue deleted → mapping resets and heals. Fetch timeouts, pagination (>100), and comment-`since` gating keep the API budget flat as threads grow. Verified live end-to-end on a real issue during development (tabular-nums feedback → agent commit → evidence comment → close → thread resolved in Storybook within one poll).
+  - **Failure behavior**: 401 → self-healing a/b/c steps, mirror pauses, local mode keeps working. Rate limits → timed backoff (Retry-After respected). Remote issue deleted → mapping resets and heals. Fetch timeouts, pagination (>100), and comment-`since` gating keep the API budget flat as threads grow.
   - Knobs: `ANNOTAKIT_GH_AUTO=0` (local mode) · `ANNOTAKIT_GH_POLL=<sec>` · `ANNOTAKIT_GH_REPO` · `ANNOTAKIT_GH_API` (GHE) · `ANNOTAKIT_GH_INTERVAL=<ms>`.
-  - `POST /gh` is kept as a legacy alias of `POST /sync` — digest publishing is gone (v0.2.0 digest issues in existing repos should be closed manually once).
+  - `POST /gh` is kept as a legacy alias of `POST /sync` (the old bulk-digest publishing is gone).
 - Loop: reviewer pins → issue appears → agent fixes code at the `jsx:` path → agent comments evidence + closes → thread resolves in Storybook (60s poll) → reviewer re-checks, may reopen → issue reopens. Hands-free both directions; without GitHub, the same loop runs entirely over Path B.
 
 ## Lean exports (feedback-driven)
 
-The previous kit's JSON was "extremely verbose" and the markdown "too cluttered". This one: no W3C envelope, no outerHTML dumps, no anchor forensics — one line per fact, the comment is the headline, `outerHTML` clipped to 200 chars and only in the full thread docs, resolved threads folded into a `<details>` block. 3 threads ≈ 3.2 KB of JSON.
+No W3C envelope, no outerHTML dumps, no anchor forensics — one line per fact, the comment as headline, `outerHTML` clipped to 200 chars (full thread docs only), resolved threads folded into `<details>`. 3 threads ≈ 3.2 KB.
 
 ## Configuration (all optional)
 
@@ -133,7 +133,7 @@ The previous kit's JSON was "extremely verbose" and the markdown "too cluttered"
 | store location (v0.5.0) | `<git-common-dir>/annotakit/threads.db` — immune to branch switches and `git clean -fdx`, structurally un-gitignorable; durability = the `annotakit` orphan branch (see below). ⚠ the git dir is found by walking UP from your Storybook project — a non-git project nested inside another repo adopts the ENCLOSING repo's git dir (and pushes its store branch there); `git init` your project or set `"autoSync": false` to keep the store local |
 | static GH config (v0.5.3) | baked `annotakit-gh.json` (see [static builds](#static-builds--review-without-a-dev-server-v05x)) + runtime overrides in the panel → GitHub settings |
 
-**Hotkey migration note (0.4 → 0.5):** shortcut defaults changed to Alt/⌥-prefixed (`alt+c` etc.) because plain single keys collide with story interactions. A 0.4-era config like `hotkeys: { pin: 'c' }` still works — but only with ⌥/Alt held (the legacy compatibility path requires it), a silent semantic shift that is easy to miss. The addon now logs a one-time `console.info` when it detects a legacy plain-key spec; make the intent explicit by updating the config to `'alt+c'`-style values.
+**Hotkey migration (0.4 → 0.5):** defaults are Alt/⌥-prefixed (plain keys collide with story interactions). A 0.4-era `hotkeys: { pin: 'c' }` still works but only with ⌥/Alt held — a silent semantic shift; a one-time `console.info` flags it. Update configs to `'alt+c'`-style values.
 
 All env vars are read once at boot — restart `storybook dev` after changing `.env`. `.env` holds a secret: `echo ".env" >> .gitignore` BEFORE writing the token into it (the engine never commits it, but `git add -A` would).
 
@@ -144,25 +144,21 @@ All env vars are read once at boot — restart `storybook dev` after changing `.
 ```bash
 cd examples/nimbus && bun install && bun run storybook
 # → http://localhost:6006 → press ⌥C (Alt+C) → click an element
-node scripts/api-test.mjs          # 87/87 contract tests (run from repo root, needs the dev server up)
-node scripts/ghsync-fake.mjs       # 61/61 lifecycle + stress engine tests (no server needed)
-node scripts/ghclient-test.mjs     # 72/72 client-side publisher tests (no server needed)
-node scripts/release-check.mjs     # release gate: dist chunk drift + version agreement + pack-leak guard (selftest: --selftest)
+node scripts/api-test.mjs          # contract tests (repo root; needs the dev server up)
+node scripts/ghsync-fake.mjs       # lifecycle + stress engine tests (no server needed)
+node scripts/ghclient-test.mjs     # client-side publisher tests (no server needed)
+node scripts/release-check.mjs     # release gate: chunk drift + version agreement + pack-leak guard (--selftest)
 ```
 
 ## Repo layout
 
 ```
-preset.js               # Storybook preset: managerEntries, previewAnnotations,
-                        #   viteFinal (react dedupe), experimental_devServer, experimental_serverChannel
+preset.js               # Storybook preset: entries + viteFinal (react dedupe) + devServer/serverChannel
 src/shared/             # types + channel events (identical strings across bundles)
-src/server/             # middleware + SQLite store + lean digest + GH lifecycle
-                        #   mirror engine ghsync.ts (CJS bundle)
-src/preview/            # decorator + overlay UI + fiber inspection + anchor engine (ESM)
+src/server/             # REST + SQLite store + digest + GH lifecycle mirror (CJS)
+src/preview/            # decorator + overlay + fiber inspection + anchor engine (ESM)
 src/manager/            # review panel + toolbar tool (ESM)
-scripts/api-test.mjs    # 67-check contract test (against a running dev server)
-scripts/ghclient-test.mjs# 55-check client-side GH publisher test (fake GitHub, in-process)
-scripts/ghsync-fake.mjs # 61-check lifecycle+stress engine test (fake GitHub, in-process)
+scripts/                # contract/engine/publisher/store/release suites (totals self-report)
 examples/nimbus/        # demo project
 ```
 
@@ -170,7 +166,7 @@ examples/nimbus/        # demo project
 
 The original direction was "fork storybookjs/storybook and make surgical changes". Research (2026-09) showed SB ≥ 9.1.16 ships the exact hooks a fork would have provided: `experimental_devServer` (mount anything on the dev server), `experimental_serverChannel` (server→client broadcast), `managerEntries`/`previewAnnotations` (full React UI in both surfaces). The result is fork-depth integration that survives every `storybook upgrade`. If a literal fork is ever needed, `src/manager` and `src/preview` transplant directly.
 
-Landscape at time of writing: Chromatic does cloud screenshot-pin comments (not live DOM, no local mode); Greenroom (`@igility/greenroom-addon`, pre-release) does pins + MCP but anchors by a single CSS selector and has no React component metadata. Neither is local-first + dev-server-embedded + component-aware.
+Landscape: Chromatic does cloud screenshot-pin comments (not live DOM, no local mode); Greenroom (`@igility/greenroom-addon`, pre-release) does pins + MCP but single-selector anchors, no React metadata. Neither is local-first + dev-server-embedded + component-aware.
 
 ## Store durability across branches and machines (v0.5.0)
 
@@ -182,13 +178,13 @@ Feedback threads are per-PROJECT, not per-branch — you review `feature-x`'s St
 - **fresh clones / agent sandboxes boot-restore** from the remote branch (offline-capable right after clone via the tracking ref); a legacy v0.4 tracked db is migrated row-by-row, the old file left untouched
 - no repo / `autoSync:false` → classic `<configDir>/annotakit/threads.db`, disk-only (your choice, no git flow)
 
-Caveats, documented: `--mirror`/`--all` pushes will carry the orphan branch too (harmless); monorepos share ONE store; `git checkout annotakit` out of curiosity shows a README, not code; branch protection that forbids new refs degrades durability to local-commit with a clear log.
+Caveats: `--mirror`/`--all` pushes carry the orphan branch too (harmless); monorepos share ONE store; `git checkout annotakit` shows a README, not code; branch protection forbidding new refs degrades durability to local-commit (logged).
 
 ### Multiple consumers sharing one store branch (the multi-sandbox pattern)
 
-Several environments — two review sandboxes, a CI build, an agent session — can push to the **same orphan branch** concurrently. This is supported by design and tested under real traffic: every snapshot is the logical union of local + remote (always-merge before every tree build), commits are namespaced per environment (`db=annotakit@<project-dir>` in the commit message), and a machine that loses a push race (non-FF or ref-lock) re-fetches, re-merges, and retries once — the union is idempotent. Tombstones propagate (a delete on machine A wins over machine B's stale copy), resolved-wins keeps the closing state stable, and comment union means two reviewers replying in parallel both survive.
+Several environments (sandboxes, CI, agent sessions) can push the **same orphan branch** concurrently — supported by design and tested under real traffic: every snapshot is the logical union of local + remote (always-merge before each tree build), commits namespaced per environment (`db=annotakit@<project-dir>`), push-race losers (non-FF/ref-lock) re-fetch, re-merge, retry once — the union is idempotent; tombstones and parallel replies both survive.
 
-The convergence model is **eventual, at next activity**: a machine merges the remote state into its local store when IT runs a cycle (its own next mutation, its boot restore, or its shutdown flush) — there is no background polling of the store branch. If machine B must see machine A's threads "now", trigger a cycle on B (any mutation, or a restart). The union on the branch itself is complete as soon as both machines have pushed once.
+Convergence is **eventual, at next activity**: a machine merges remote state when IT runs a cycle (next mutation, boot restore, shutdown flush) — no background polling. If B must see A's threads "now", trigger a cycle on B.
 
 ## Static builds — review without a dev server (v0.5.x)
 
@@ -219,10 +215,10 @@ node node_modules/storybook-annotakit/scripts/bake-static-threads.mjs <sb-output
 
 ## Status
 
-v0.6.1 — hardening round after a 4-track audit (code robustness, cold-consumer agent friction, human UX, docs/release integrity) (MIT; not yet on the npm registry — install via `file:` or tarball). E2E-verified in-session: pin→save→reply→resolve→re-anchor-after-DOM-change→export→GitHub 1:1 lifecycle mirror (auto create/close/reopen/tombstone + 60s pull-back), including a full remote-agent round trip (fix commit → evidence comment → close → auto-resolve in Storybook). 87/87 API contract tests + 61/61 lifecycle engine tests + 20/20 live-process stress + 11/11 store-robustness cases (branch switch, clean -fdx, fresh-clone restore, two-machine divergence merge, delete-wins tombstones, foreign-branch adoption, empty-store guard, legacy migration, subdir monorepo topology, README-marker adoption/self-heal, git-health counters) + 31/31 static-store checks + 72/72 client-publisher checks — all against real git repos and a local bare remote. Static mode E2E-verified in-session through a public preview gateway: seeded pins render, create/reply/resolve persist across reloads, scope isolation, re-bake merge — and **client-side GH publishing end-to-end**: browser-created pin → issue, agent reply via API → imported into the panel by the client pull, panel resolve → issue closed, and a reply typed **while the file server was killed** landed on GitHub anyway — the backend can die, feedback can't.
+v0.6.2 — docs-deflate round (MIT; not yet on the npm registry — install via `file:` or tarball). Full battery green — API contract, lifecycle engine, store robustness (branch switch, clean -fdx, fresh-clone restore, two-machine divergence, delete-wins tombstones, subdir monorepo, marker adoption), static store, client publisher — against real git repos and a live GitHub mirror; static mode E2E-verified through a public preview gateway, including client-side GH publishing with the file server killed mid-reply (the backend can die, feedback can't).
 
-**v0.6.1 — hardening round:** local-only mode (client GH off) used to **hard-freeze the tab** at 100%+ CPU on any pin/reply — an infinite microtask re-arm in the flusher; gated (plus regression tests incl. the boot-drain path). Agent-facing contracts: PATCH status is now a validated enum (`open`/`resolved`, case-normalized — garbage statuses used to store silently and never stamp `resolvedAt`); idempotent POST replays are FLAGGED (body `replayed:true` + `X-Annotakit-Replayed` header) so an amended-body replay can't masquerade as landed; comment bodies are capped at 64,000 chars at every door (server 413, composer maxLength — JSON exports were unbounded); ≥2MB requests get a real HTTP 413 instead of a silent TCP reset; 404s carry pointers (`GET /threads lists ids`); trailing slashes tolerated; unknown export/snapshot formats 400; `/schema` gained a full endpoints index and stopped advertising a `?format=svg` that never existed. Store durability is now machine-readable (`/health` `git` block: `consecutivePushFailures`, `lastPushError`, `lastSyncAt`, `healthy` — and `durability` honestly degrades to `git-commit` while pushes fail); `POST /sync` forces a git store cycle immediately (no more waiting for the mutation debounce); store branches carry a versioned README marker (`annotakit-store: v1`, prose-agnostic — rewording no longer de-orphans deployed branches); logOnce-style logs re-log at 1/5/25/100 so permanent push failure stays visible. Client: Save/Reset retries queued ops immediately (one re-attempt per user action instead of ~2min of silent backoff); 422 body rejections park the op (named, surfaced, never retried); localStorage-quota failures surface in the canvas; pins work with a thread popup open; Esc on a non-empty draft is two-stage; pin dots are keyboard-reachable; minified component names are suppressed in the UI; digests clip headlines at 200 chars (parity with replies) and mark imported GitHub bodies `(via github)`. Release hygiene: the npm `files` whitelist no longer ships the private staging script or the dev SKILL.md (verified by a pack guard), and `npm run release-check` gates chunk drift + version agreement before tagging.
+**v0.6.1 — hardening round:** fixed the local-only tab freeze (infinite microtask re-arm in the flusher; regression-tested incl. boot-drain). Agent contracts: PATCH status validated enum; idempotent POST replays FLAGGED (`replayed:true` + `X-Annotakit-Replayed`); comment bodies capped at 64,000 chars at every door (413s + composer maxLength); ≥2MB requests get a real 413 (was a silent TCP reset); 404 hints; trailing-slash tolerance; unknown formats 400; `/schema` endpoints index (+ the never-existing `?format=svg` removed). Durability: machine-readable git health (`/health` `git` block, durability degrades to `git-commit` while pushes fail, POST /sync forces the git cycle); versioned store-branch marker (`annotakit-store: v1`, prose-agnostic); deduped failures re-log at 1/5/25/100. Client: Save/Reset retries queued ops immediately (one per user action); 422 rejections park ops (named, surfaced); quota failures surface in the canvas; pins work with a thread popup open; two-stage Esc; keyboard-reachable pin dots; minified names suppressed; digests clip headlines (200 chars) + `(via github)` provenance. Release hygiene: npm `files` whitelist (no private staging script / dev SKILL in the tarball — pack-guard verified) + `npm run release-check` gate.
 
-**v0.6.0 — public-release hardening:** the client-side pull listing now sends its label filter **comma-joined** (`labels=a,b`). GitHub treats repeated `labels=a&labels=b` query params as last-wins (verified live against the REST API), so the v0.5.3 form silently filtered by the LAST label only — breaking the AND contract the multi-workstream separation relies on. The fake-GitHub test harness now models real GitHub semantics (comma=AND, repeated=last-wins) and a regression test pins both the wire format and the exclusion of foreign-workstream issues (ghclient 51→55 checks). Docs: stale hotkey copy fixed ("press C" → "⌥C"), test counts trued up across README/SKILL/PLAN, LICENSE added, demo `.env`/store data kept out of the release tree.
+**v0.6.0 — public release:** client pull label filter fixed to comma-joined form (repeated `labels=` params are last-wins on GitHub — silently broke the AND contract); fake-GitHub harness models real semantics + regression test; docs trued; LICENSE added.
 
-**v0.4.1 — hardened by dogfooding the full review loop on a real project** (a 51-story production app, 3 competing design variants, 14 pin threads, fix→verify→reopen→re-resolve round trips): RESTful `DELETE /threads/<id>` (path form, both shapes now work); `jsx:` file:line now **sourcemap-corrected** — raw React `_debugStack` lines reference Vite's esbuild-transformed module (often ~2× source length, causing impossible line numbers); pins on story-owned wrapper DOM report `story render (Storybook wrapper)` + the story file instead of `unboundStoryFn`/preview.tsx internals; `/health` exposes `bootedAt` so agents can verify restarts actually happened (stale-process trap). Known gaps as of v0.4.1: no screenshot evidence per pin, no MCP server (REST + GitHub issues + digests are the agent surface), fiber metadata is dev-mode-only by React's own design.
+**v0.4.1 — dogfood hardening:** RESTful `DELETE /threads/<id>`; sourcemap-corrected `jsx:` lines; story-wrapper pin reporting; `bootedAt` restart verification. No MCP server by design (REST + issues + digests are the agent surface).

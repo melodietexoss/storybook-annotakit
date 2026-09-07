@@ -34,7 +34,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.1';
+const VERSION = '0.6.2';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();

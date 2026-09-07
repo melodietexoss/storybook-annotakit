@@ -2059,7 +2059,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.1";
+var VERSION = "0.6.2";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
