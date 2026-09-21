@@ -369,7 +369,13 @@ async function tryFetchGhFile(url: string): Promise<GhClientSettings | null> {
 }
 
 /** Fetch the baked `annotakit-gh.json` (cached per document). Candidates
- *  mirror the seed probe: own doc dir → manager (parent) dir → origin root. */
+ *  mirror the seed probe: own doc dir → manager (parent) dir → origin root.
+ *  A null result is NOT cached: the file can be missing TRANSIENTLY (a
+ *  static deploy mid atomic-swap, a slow static server still booting, a
+ *  carrier blip) and every re-probe (the publisher's poll cycle, the
+ *  panel's next open) must be allowed to see it land. Caching the null
+ *  would pin the failure for the page lifetime and turn every retry into
+ *  dead code. */
 export function probeBakedGhConfig(): Promise<GhClientSettings | null> {
   if (bakedPromise) return bakedPromise;
   bakedPromise = (async (): Promise<GhClientSettings | null> => {
@@ -388,6 +394,11 @@ export function probeBakedGhConfig(): Promise<GhClientSettings | null> {
         return body;
       }
     }
+    /* transient failure — release the cache so the next call re-probes.
+     * Timing note: the async body has already passed real `await`s, so
+     * this assignment lands AFTER the outer `bakedPromise = …` and
+     * sticks (a sync body would let the outer assignment clobber it). */
+    bakedPromise = null;
     return null;
   })();
   return bakedPromise;

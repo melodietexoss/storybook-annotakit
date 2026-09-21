@@ -65,6 +65,7 @@ var mirrorStateOf = (status) => status === "resolved" ? "closed" : "open";
 var MAX_BODY_CHARS = 64e3;
 var DIGEST_CLIP_CHARS = 200;
 var ISSUE_BODY_LIMIT = 6e4;
+var MIRROR_VERBATIM_MARKER = "(verbatim):**";
 
 // src/shared/describe.ts
 function clip(s, n) {
@@ -150,6 +151,7 @@ function probeSeed() {
       const body = await tryFetchJson(url);
       if (body) return body.threads ?? [];
     }
+    seedPromise = null;
     return null;
   })();
   return seedPromise;
@@ -267,6 +269,9 @@ function getStaticStore() {
           if (prev.status === "resolved" && norm !== "resolved") delete patched.resolvedAt;
         }
         const merged = { ...prev, ...patched, updatedAt: nowIso() };
+        if (prev.status === "resolved" && merged.status !== "resolved") {
+          delete merged.resolvedAt;
+        }
         threads[idx] = merged;
         persist();
         for (const cb of listeners) cb();
@@ -420,6 +425,7 @@ export {
   mirrorStateOf,
   MAX_BODY_CHARS,
   ISSUE_BODY_LIMIT,
+  MIRROR_VERBATIM_MARKER,
   elementSummary,
   newThreadId,
   staticScope,

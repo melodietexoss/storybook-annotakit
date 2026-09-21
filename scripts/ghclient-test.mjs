@@ -226,6 +226,21 @@ const queueOps = (ghc) => {
 
 /* ------------------------------- scenarios ---------------------------------- */
 
+/* 0 — probeBakedGhConfig must NOT memoize failure: the baked annotakit-gh.json
+ *   can be missing TRANSIENTLY (a static deploy mid atomic-swap, a slow
+ *   static server still booting) and the publisher's poll cycle + panel opens
+ *   re-probe it — a cached null pins the failure for the page lifetime and
+ *   turns every re-probe into dead code. */
+{
+  const ghc = await fresh(null); // no baked file yet — fetch 404s
+  const miss = await ghc.probeBakedGhConfig();
+  ok('probe miss returns null (transient 404)', miss === null);
+  bakedConfig = { token: 'tok_LATE', repo: 'late/deploy', labels: ['annotakit'] }; // the file LANDS
+  const late = await ghc.probeBakedGhConfig();
+  ok('re-probe after the file lands RESOLVES (null not memoized)', late?.token === 'tok_LATE' && late?.repo === 'late/deploy');
+  bakedConfig = null;
+}
+
 const ghc = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit', 'ws-a'], pollMs: 600_000 });
 
 /* 1 — config resolution */

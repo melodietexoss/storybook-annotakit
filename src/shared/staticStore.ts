@@ -102,7 +102,14 @@ async function tryFetchJson(url: string): Promise<{ threads?: Thread[] } | null>
 /** Fetch the baked seed (cached). null = no seed (dev mode or unbaked static).
  *  Candidates: own doc dir → manager (parent) dir → origin root — covers
  *  every Storybook static layout (iframe.html and index.html share the deploy
- *  root in ≤9; SB 10 splits sb-preview/ but the parent/root anchors hold). */
+ *  root in ≤9; SB 10 splits sb-preview/ but the parent/root anchors hold).
+ *  A null result is NOT cached: the seed can be missing TRANSIENTLY (a
+ *  static deploy mid atomic-swap, a slow static server still booting) while
+ *  probeMode's callers RETRY — preview/layer.tsx re-probes up to 5× with
+ *  backoff precisely so "a transient boot failure must not permanently
+ *  hide pins". Caching the null pins the failure for the page lifetime and
+ *  turns every one of those retries into dead code (the probe keeps
+ *  answering the first cached null). */
 export function probeSeed(): Promise<Thread[] | null> {
   if (seedPromise) return seedPromise;
   seedPromise = (async () => {
@@ -118,6 +125,11 @@ export function probeSeed(): Promise<Thread[] | null> {
       const body = await tryFetchJson(url);
       if (body) return body.threads ?? [];
     }
+    /* transient failure — release the cache so the next call re-probes.
+     * Timing note: the async body has already passed real `await`s, so
+     * this assignment lands AFTER the outer `seedPromise = …` and sticks
+     * (a sync body would let the outer assignment clobber it). */
+    seedPromise = null;
     return null;
   })();
   return seedPromise;

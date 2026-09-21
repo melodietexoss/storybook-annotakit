@@ -1,10 +1,11 @@
 import {
   ISSUE_BODY_LIMIT,
+  MIRROR_VERBATIM_MARKER,
   getStaticStore,
   mirrorStateOf,
   renderThreadBlock,
   staticScope
-} from "./chunk-MLHFKDNW.mjs";
+} from "./chunk-MGB6FA4X.mjs";
 
 // src/shared/ghClient.ts
 var GH_FILE = "annotakit-gh.json";
@@ -139,6 +140,9 @@ function addIssueCommentRemote(cfg, issue, body) {
 function setIssueStateRemote(cfg, issue, state2) {
   return ghJson(cfg, "PATCH", `/repos/${cfg.repo}/issues/${issue}`, { state: state2 });
 }
+function editIssueRemote(cfg, issue, fields) {
+  return ghJson(cfg, "PATCH", `/repos/${cfg.repo}/issues/${issue}`, fields);
+}
 function getIssueRemote(cfg, issue) {
   return ghJson(cfg, "GET", `/repos/${cfg.repo}/issues/${issue}`);
 }
@@ -197,6 +201,7 @@ function probeBakedGhConfig() {
         return body;
       }
     }
+    bakedPromise = null;
     return null;
   })();
   return bakedPromise;
@@ -237,12 +242,12 @@ async function probeGhConfig() {
   const baked = await probeBakedGhConfig();
   return resolveGhConfig(baked, readOverride());
 }
-function issueTitle(t) {
+function mirrorIssueTitle(t) {
   const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
   const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
   return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 160);
 }
-function issueBody(t, cfg) {
+function mirrorIssueBody(t, cfg) {
   const origin = staticScope();
   const storyUrl = t.story?.url ?? `${origin}?path=/story/${t.storyId}`;
   const out = [];
@@ -276,6 +281,21 @@ function mirrorBody(c) {
 function parseSentinel(body) {
   const m = body.match(SENTINEL_RE);
   return m ? m[1] : null;
+}
+function mirrorHealFields(t, remote, cfg) {
+  const fields = {};
+  if (typeof remote.title === "string" && remote.title) {
+    const want = mirrorIssueTitle(t);
+    if (want !== remote.title && want.startsWith(remote.title)) fields.title = want;
+  }
+  if (typeof remote.body === "string" && remote.body) {
+    const oldFormat = t.comments.length > 0 && remote.body.includes(`- thread id: ${t.id}`) && !remote.body.includes(MIRROR_VERBATIM_MARKER);
+    if (oldFormat) {
+      const want = mirrorIssueBody(t, cfg);
+      if (want.length >= remote.body.length) fields.body = want;
+    }
+  }
+  return Object.keys(fields).length ? fields : null;
 }
 function resolutionNotice(t) {
   return `${GH_SENTINEL}
@@ -374,7 +394,7 @@ async function processSyncOp(base, cfg, op) {
   const t = freshThread(base, String(op.threadId));
   if (!t) return;
   if (!t.gh) {
-    const created = await createIssueRemote(cfg, { title: issueTitle(t), body: issueBody(t, cfg) });
+    const created = await createIssueRemote(cfg, { title: mirrorIssueTitle(t), body: mirrorIssueBody(t, cfg) });
     const cur = freshThread(base, t.id);
     if (!cur) {
       await addIssueCommentRemote(cfg, created.number, `${GH_SENTINEL}
@@ -504,6 +524,12 @@ async function pullOnce(base) {
         }
         throw err;
       }
+    }
+    try {
+      const heal = mirrorHealFields(t, issue, cfg);
+      if (heal) await editIssueRemote(cfg, mir.issue, heal);
+    } catch (err) {
+      if (state) state.lastError = `mirror heal failed (issue #${mir.issue}): ${err instanceof Error ? err.message : String(err)}`;
     }
     let statusChange = null;
     if (issue.state === "closed" && t.status !== "resolved") statusChange = "resolved";
@@ -721,6 +747,8 @@ export {
   probeBakedGhConfig,
   resolveGhConfig,
   probeGhConfig,
+  mirrorIssueTitle,
+  mirrorIssueBody,
   ghClientStatus,
   getGhLinkedStaticStore,
   __ghResetForTests
