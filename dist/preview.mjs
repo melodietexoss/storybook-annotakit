@@ -8,14 +8,14 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-GQOT3JEX.mjs";
+} from "./chunk-XM4L6WNP.mjs";
 import {
   getGhLinkedStaticStore
-} from "./chunk-R7L24GTE.mjs";
+} from "./chunk-Y3KBXHJT.mjs";
 import {
   MAX_BODY_CHARS,
   elementSummary
-} from "./chunk-UO3SMM6I.mjs";
+} from "./chunk-LNF6XYUQ.mjs";
 
 // src/preview/index.ts
 import React2 from "react";
@@ -1472,6 +1472,9 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     if (hintTimer.current) window.clearTimeout(hintTimer.current);
   }, []);
   const [storageError, setStorageError] = useState(null);
+  const dismissedStorageError = useRef(null);
+  const draftBodyRef = useRef("");
+  const discardArmedDocRef = useRef(false);
   const [tick, setTick] = useState(0);
   const [hoverBox, setHoverBox] = useState(null);
   const [dragRect, setDragRect] = useState(null);
@@ -1497,8 +1500,15 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     return () => {
       mountedRef.current = false;
       if (retryTimer.current) clearTimeout(retryTimer.current);
+      document.body.classList.remove("annota-cursor");
     };
   }, []);
+  useEffect(() => {
+    if (!composer) {
+      draftBodyRef.current = "";
+      discardArmedDocRef.current = false;
+    }
+  }, [composer]);
   const dataRef = useRef({
     list: getThreads,
     create: createThread,
@@ -1641,7 +1651,8 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     if (apiOk === false) return;
     const root = storyRoot();
     let timer;
-    const obs = new MutationObserver(() => {
+    const obs = new MutationObserver((records) => {
+      if (records.length && records.every((r) => r.target.closest?.("[data-annota-overlay]"))) return;
       clearTimeout(timer);
       timer = setTimeout(resolveAll, 350);
     });
@@ -1661,41 +1672,6 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       window.removeEventListener("resize", onReflow);
     };
   }, [apiOk, resolveAll]);
-  useEffect(() => {
-    const ch = sbChannel();
-    const onFocus = (threadId) => {
-      focusThread(threadId);
-    };
-    const onToggle = (state) => {
-      const next = typeof state === "boolean" ? state : !visible;
-      setVisible(next);
-    };
-    const onCommand = (cmd) => {
-      if (!cmd?.command) return;
-      if (cmd.command === "pin" || cmd.command === "region") {
-        if (!composer) {
-          const m = cmd.command;
-          enterMode(mode === m ? "idle" : m);
-        } else {
-          showHint("Submit or cancel the open comment first (Esc)");
-        }
-      } else if (cmd.command === "drawer") {
-        setDrawerOpen((d) => !d);
-      } else if (cmd.command === "layer") {
-        setVisible((v) => !v);
-      } else if (cmd.command === "help") {
-        setHelpOpen((h) => !h);
-      }
-    };
-    ch.on(FOCUS_THREAD, onFocus);
-    ch.on(TOGGLE_LAYER, onToggle);
-    ch.on(UI_COMMAND, onCommand);
-    return () => {
-      ch.removeListener(FOCUS_THREAD, onFocus);
-      ch.removeListener(TOGGLE_LAYER, onToggle);
-      ch.removeListener(UI_COMMAND, onCommand);
-    };
-  });
   const emitLayerState = useCallback((v) => {
     try {
       sbChannel().emit(LAYER_STATE, v);
@@ -1750,6 +1726,46 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     dragStart.current = null;
     document.body.classList.remove("annota-cursor");
   }, []);
+  const channelEffect = () => {
+    const ch = sbChannel();
+    const onFocus = (threadId) => {
+      focusThread(threadId);
+    };
+    const onToggle = (state) => {
+      const next = typeof state === "boolean" ? state : !visible;
+      setVisible(next);
+    };
+    const onCommand = (cmd) => {
+      if (!cmd?.command) return;
+      if (cmd.command === "pin" || cmd.command === "region") {
+        if (apiOk === false) {
+          showHint("AnnotaKit is offline \u2014 pinning is unavailable (see the badge)");
+          return;
+        }
+        if (!composer) {
+          const m = cmd.command;
+          enterMode(mode === m ? "idle" : m);
+        } else {
+          showHint("Submit or cancel the open comment first (Esc)");
+        }
+      } else if (cmd.command === "drawer") {
+        setDrawerOpen((d) => !d);
+      } else if (cmd.command === "layer") {
+        setVisible((v) => !v);
+      } else if (cmd.command === "help") {
+        setHelpOpen((h) => !h);
+      }
+    };
+    ch.on(FOCUS_THREAD, onFocus);
+    ch.on(TOGGLE_LAYER, onToggle);
+    ch.on(UI_COMMAND, onCommand);
+    return () => {
+      ch.removeListener(FOCUS_THREAD, onFocus);
+      ch.removeListener(TOGGLE_LAYER, onToggle);
+      ch.removeListener(UI_COMMAND, onCommand);
+    };
+  };
+  useEffect(channelEffect, [focusThread, visible, composer, mode, enterMode, apiOk]);
   useEffect(() => {
     if (mode === "idle") return void 0;
     const skipOverlay = (el) => {
@@ -1848,17 +1864,25 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       }
       if (e.key.toLowerCase() === "escape") {
         if (mode !== "idle") exitMode();
-        else if (composer) setComposer(null);
-        else if (activeThread) setActiveThread(null);
+        else if (composer) {
+          if (draftBodyRef.current.trim() && !discardArmedDocRef.current) {
+            discardArmedDocRef.current = true;
+            showHint("Press Esc again to discard the draft");
+            return;
+          }
+          setComposer(null);
+        } else if (activeThread) setActiveThread(null);
         else if (drawerOpen) setDrawerOpen(false);
         else if (helpOpen) setHelpOpen(false);
         return;
       }
       if (altOf(hkPin)) {
-        if (!composer) enterMode(mode === "pin" ? "idle" : "pin");
+        if (apiOk === false) showHint("AnnotaKit is offline \u2014 pinning is unavailable (see the badge)");
+        else if (!composer) enterMode(mode === "pin" ? "idle" : "pin");
         else showHint("Submit or cancel the open comment first (Esc)");
       } else if (altOf(hkRegion)) {
-        if (!composer) enterMode(mode === "region" ? "idle" : "region");
+        if (apiOk === false) showHint("AnnotaKit is offline \u2014 pinning is unavailable (see the badge)");
+        else if (!composer) enterMode(mode === "region" ? "idle" : "region");
         else showHint("Submit or cancel the open comment first (Esc)");
       } else if (altOf(hkLayer)) {
         setVisible((v) => !v);
@@ -1868,7 +1892,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [mode, composer, activeThread, drawerOpen, helpOpen, enterMode, exitMode, hkPin, hkRegion, hkLayer, hkDrawer, hkHelp, hotkeys]);
+  }, [mode, composer, activeThread, drawerOpen, helpOpen, enterMode, exitMode, hkPin, hkRegion, hkLayer, hkDrawer, hkHelp, hotkeys, apiOk, showHint]);
   const submitThread = useCallback(
     async (body) => {
       if (!composer) return;
@@ -2013,7 +2037,17 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       },
       thread.number
     )
-  ), hint && mode === "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint", role: "status" }, hint), staticMode && storageError && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, "\u26A0 ", storageError, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setStorageError(null) }, "\u2715")), hoverBox && /* @__PURE__ */ React.createElement("div", { className: "annota-hover-box", style: { left: hoverBox.x, top: hoverBox.y, width: hoverBox.w, height: hoverBox.h } }), dragRect && /* @__PURE__ */ React.createElement("div", { className: "annota-drag-rect", style: { left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h } }), error && !composer && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, error, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setError(null) }, "\u2715")), composer && /* @__PURE__ */ React.createElement(
+  ), hint && mode === "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint", role: "status" }, hint), staticMode && storageError && storageError !== dismissedStorageError.current && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, "\u26A0 ", storageError, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      className: "annota-btn is-small",
+      onClick: () => {
+        dismissedStorageError.current = storageError;
+        setStorageError(null);
+      }
+    },
+    "\u2715"
+  )), hoverBox && /* @__PURE__ */ React.createElement("div", { className: "annota-hover-box", style: { left: hoverBox.x, top: hoverBox.y, width: hoverBox.w, height: hoverBox.h } }), dragRect && /* @__PURE__ */ React.createElement("div", { className: "annota-drag-rect", style: { left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h } }), error && !composer && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, error, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setError(null) }, "\u2715")), composer && /* @__PURE__ */ React.createElement(
     ComposerCard,
     {
       x: composer.x,
@@ -2023,7 +2057,11 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       component: composerMeta,
       context: composer.target.context,
       onSubmit: submitThread,
-      onCancel: () => setComposer(null)
+      onCancel: () => setComposer(null),
+      onDraftChange: (b) => {
+        draftBodyRef.current = b;
+        if (b.trim()) discardArmedDocRef.current = false;
+      }
     }
   ), activeT && !composer && /* @__PURE__ */ React.createElement(
     ThreadCard,
@@ -2094,6 +2132,7 @@ function ComposerCard(props) {
       onChange: (e) => {
         setDiscardArmed(false);
         setBody(e.target.value);
+        props.onDraftChange?.(e.target.value);
       },
       onKeyDown: (e) => {
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && body.trim()) {

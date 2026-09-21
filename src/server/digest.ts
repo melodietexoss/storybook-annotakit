@@ -25,6 +25,17 @@ function oneLine(body: string): string {
   return body.replace(/\s+/g, ' ').trim();
 }
 
+/** Hardening C22 (H-B-09): metadata lines (element summary, css selector,
+ * props, chain, story paths) are ATTACKER-INFLUENCED strings — newlines in
+ * them inject fake digest/mirror structure (fake `### headings`, fake
+ * `- thread id:` stamps), and unbounded length pushed the header past the
+ * 60k clip so every verbatim marker was lost (H-B-02's infinite-heal loop).
+ * Every metadata value is single-lined and capped before it hits a digest. */
+function metaLine(value: string, cap = 300): string {
+  const line = oneLine(String(value ?? ''));
+  return line.length > cap ? line.slice(0, cap) + '…' : line;
+}
+
 /** First line of a body, single-line-safe for markdown headings (full mode). */
 function firstLine(body: string, n = 80): string {
   const line = oneLine(body.split('\n')[0] ?? '');
@@ -54,37 +65,40 @@ function clip(body: string): string {
 function threadBlock(t: Thread, snapshotUrl?: string, full?: boolean): string[] {
   const first = t.comments[0];
   const headline = first ? (full ? firstLine(first.body) || '(no text)' : clip(first.body)) : '(no text)';
-  const status = t.status === 'open' ? 'OPEN' : t.status === 'fixed' ? 'FIXED' : 'RESOLVED';
+  // H-B-15 (P3): an unknown/legacy status used to render as RESOLVED and
+  // then VANISH from every bucket (not open/fixed/resolved) — threads
+  // silently disappeared from digests. Unknown → OPEN everywhere.
+  const status = t.status === 'fixed' ? 'FIXED' : t.status === 'resolved' ? 'RESOLVED' : 'OPEN';
   const out: string[] = [];
   out.push(`### #${t.number} ${status} — ${headline}`);
   out.push('');
 
   if (t.story) {
     const ip = repoRelPath(t.story.importPath) ?? t.story.importPath;
-    if (t.story.importPath) out.push(`- story: ${t.story.title ?? ''}/${t.story.name ?? ''} (${ip})`);
+    if (t.story.importPath) out.push(`- story: ${metaLine(`${t.story.title ?? ''}/${t.story.name ?? ''} (${ip})`)}`);
   }
   out.push(`- thread id: ${t.id}`);
   const comp = t.component;
   if (comp) {
-    if (comp.name) out.push(`- component: ${comp.name}${comp.key ? ` (key="${comp.key}")` : ''}`);
+    if (comp.name) out.push(`- component: ${metaLine(comp.name + (comp.key ? ` (key="${comp.key}")` : ''))}`);
     if (comp.source) {
       const f = repoRelPath(comp.source.file) ?? comp.source.file;
-      out.push(`- jsx: ${f}:${comp.source.line ?? '?'}`);
+      out.push(`- jsx: ${metaLine(`${f}:${comp.source.line ?? '?'}`)}`);
     }
     if (comp.chain?.length > 1) {
-      out.push(`- chain: ${comp.chain.slice(0, 5).join(' > ')}`);
+      out.push(`- chain: ${metaLine(comp.chain.slice(0, 5).join(' > '))}`);
     }
     const props = comp.props ? Object.entries(comp.props).slice(0, 6) : [];
     if (props.length) {
-      out.push(`- props: ${props.map(([k, v]) => `${k}=${v}`).join(' ')}`);
+      out.push(`- props: ${metaLine(props.map(([k, v]) => `${k}=${v}`).join(' '))}`);
     }
   }
   const ctx = t.target.context;
   // v0.5.0: the shared one-line identity — SAME string the reviewer saw in
   // the composer when pinning (id/classes/testid/nth/form metadata/own text).
-  out.push(`- element: ${elementSummary(ctx)}`);
+  out.push(`- element: ${metaLine(elementSummary(ctx), 400)}`);
   if (t.target.selector.cssSelector) {
-    out.push(`- selector: ${t.target.selector.cssSelector}`);
+    out.push(`- selector: ${metaLine(t.target.selector.cssSelector, 400)}`);
   }
   // plan-b evidence pointer (local digests only — GH issue bodies would carry
   // a localhost URL foreign to the repo; agents on the repo have the server)
@@ -158,7 +172,7 @@ export function renderDigest(
       out.push('');
       continue;
     }
-    const openThreads = s.threads.filter((t) => t.status === 'open');
+    const openThreads = s.threads.filter((t) => t.status !== 'fixed' && t.status !== 'resolved');
     const reviewThreads = s.threads.filter((t) => t.status === 'fixed');
     const done = s.threads.filter((t) => t.status === 'resolved');
     // local mode: point agents at the plan-b evidence when it exists

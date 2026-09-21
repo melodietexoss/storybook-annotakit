@@ -276,9 +276,34 @@ function jsonStore(storePath) {
   let doc = { threads: [], counters: {}, tombstones: [], snapshots: {}, deleted: [] };
   let queue = Promise.resolve();
   let loaded = false;
+  let lastReadError = null;
   const load = async () => {
+    let raw;
     try {
-      const parsed = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+      raw = await fs.promises.readFile(storePath, "utf8");
+    } catch (err) {
+      const code = err.code;
+      if (code === "ENOENT") {
+        doc = { threads: [], counters: {}, tombstones: [], snapshots: {}, deleted: [] };
+        lastReadError = null;
+        loaded = true;
+        return;
+      }
+      lastReadError = `store read failed (${code ?? "unknown"}): ${err instanceof Error ? err.message : String(err)}`;
+      loaded = true;
+      return;
+    }
+    if (!raw.trim()) {
+      doc = { threads: [], counters: {}, tombstones: [], snapshots: {}, deleted: [] };
+      lastReadError = null;
+      loaded = true;
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("not a store document");
+      }
       doc = {
         threads: parsed.threads ?? [],
         counters: parsed.counters ?? {},
@@ -286,8 +311,9 @@ function jsonStore(storePath) {
         snapshots: parsed.snapshots ?? {},
         deleted: parsed.deleted ?? []
       };
-    } catch {
-      doc = { threads: [], counters: {}, tombstones: [], snapshots: {}, deleted: [] };
+      lastReadError = null;
+    } catch (err) {
+      lastReadError = `store file unparsable (${raw.length} bytes): ${err instanceof Error ? err.message : String(err)}`;
     }
     loaded = true;
   };
@@ -300,6 +326,12 @@ function jsonStore(storePath) {
   const mutate = (fn) => {
     const p = queue.then(async () => {
       await load();
+      if (lastReadError) {
+        throw Object.assign(
+          new Error(`store file not safely readable \u2014 mutation refused (in-memory data intact): ${lastReadError}`),
+          { status: 500 }
+        );
+      }
       const out = await fn();
       await persist();
       return out;
@@ -718,6 +750,10 @@ function fmtDate(iso) {
 function oneLine(body) {
   return body.replace(/\s+/g, " ").trim();
 }
+function metaLine(value, cap = 300) {
+  const line = oneLine(String(value ?? ""));
+  return line.length > cap ? line.slice(0, cap) + "\u2026" : line;
+}
 function firstLine(body, n = 80) {
   const line = oneLine(body.split("\n")[0] ?? "");
   return line.length > n ? line.slice(0, n) + "\u2026" : line;
@@ -729,34 +765,34 @@ function clip2(body) {
 function threadBlock(t, snapshotUrl, full) {
   const first = t.comments[0];
   const headline = first ? full ? firstLine(first.body) || "(no text)" : clip2(first.body) : "(no text)";
-  const status = t.status === "open" ? "OPEN" : t.status === "fixed" ? "FIXED" : "RESOLVED";
+  const status = t.status === "fixed" ? "FIXED" : t.status === "resolved" ? "RESOLVED" : "OPEN";
   const out = [];
   out.push(`### #${t.number} ${status} \u2014 ${headline}`);
   out.push("");
   if (t.story) {
     const ip = repoRelPath(t.story.importPath) ?? t.story.importPath;
-    if (t.story.importPath) out.push(`- story: ${t.story.title ?? ""}/${t.story.name ?? ""} (${ip})`);
+    if (t.story.importPath) out.push(`- story: ${metaLine(`${t.story.title ?? ""}/${t.story.name ?? ""} (${ip})`)}`);
   }
   out.push(`- thread id: ${t.id}`);
   const comp = t.component;
   if (comp) {
-    if (comp.name) out.push(`- component: ${comp.name}${comp.key ? ` (key="${comp.key}")` : ""}`);
+    if (comp.name) out.push(`- component: ${metaLine(comp.name + (comp.key ? ` (key="${comp.key}")` : ""))}`);
     if (comp.source) {
       const f = repoRelPath(comp.source.file) ?? comp.source.file;
-      out.push(`- jsx: ${f}:${comp.source.line ?? "?"}`);
+      out.push(`- jsx: ${metaLine(`${f}:${comp.source.line ?? "?"}`)}`);
     }
     if (comp.chain?.length > 1) {
-      out.push(`- chain: ${comp.chain.slice(0, 5).join(" > ")}`);
+      out.push(`- chain: ${metaLine(comp.chain.slice(0, 5).join(" > "))}`);
     }
     const props = comp.props ? Object.entries(comp.props).slice(0, 6) : [];
     if (props.length) {
-      out.push(`- props: ${props.map(([k, v]) => `${k}=${v}`).join(" ")}`);
+      out.push(`- props: ${metaLine(props.map(([k, v]) => `${k}=${v}`).join(" "))}`);
     }
   }
   const ctx = t.target.context;
-  out.push(`- element: ${elementSummary(ctx)}`);
+  out.push(`- element: ${metaLine(elementSummary(ctx), 400)}`);
   if (t.target.selector.cssSelector) {
-    out.push(`- selector: ${t.target.selector.cssSelector}`);
+    out.push(`- selector: ${metaLine(t.target.selector.cssSelector, 400)}`);
   }
   if (snapshotUrl) {
     out.push(`- dom-snapshot: ${snapshotUrl} (story DOM at pin time; append ?format=html to render)`);
@@ -811,7 +847,7 @@ function renderDigest(stories, opts) {
       out.push("");
       continue;
     }
-    const openThreads = s.threads.filter((t) => t.status === "open");
+    const openThreads = s.threads.filter((t) => t.status !== "fixed" && t.status !== "resolved");
     const reviewThreads = s.threads.filter((t) => t.status === "fixed");
     const done = s.threads.filter((t) => t.status === "resolved");
     const snapUrl = (t) => !opts?.mirror && opts?.snapshotIds?.has(t.id) ? `${opts?.origin ?? ""}/annotakit/api/threads/${encodeURIComponent(t.id)}/snapshot` : void 0;
@@ -881,7 +917,10 @@ function retryAfterMs(res) {
   const reset = res.headers.get("x-ratelimit-reset");
   if (reset) {
     const n = Number.parseInt(reset, 10);
-    if (Number.isFinite(n) && n > 0) return Math.min((n - Math.floor(Date.now() / 1e3)) * 1e3, 9e5);
+    if (Number.isFinite(n) && n > 0) {
+      const waitMs = (n - Math.floor(Date.now() / 1e3)) * 1e3;
+      if (waitMs > 0) return Math.min(waitMs, 9e5);
+    }
   }
   return void 0;
 }
@@ -937,11 +976,15 @@ async function ghJson(token, method, pathname, body) {
   if (res.status === 204 || method === "HEAD") return {};
   return await res.json();
 }
-async function ghJsonPaged(token, pathname, maxPages = 5) {
+async function ghJsonPaged(token, pathname, maxPages = 10) {
   const out = [];
   let url = `${ghApiBase()}${pathname}`;
   let res = null;
+  let truncated = false;
   for (let page = 0; page < maxPages && url; page++) {
+    if (page === maxPages - 1) {
+      truncated = true;
+    }
     try {
       res = await fetch(url, {
         headers: {
@@ -964,13 +1007,19 @@ async function ghJsonPaged(token, pathname, maxPages = 5) {
     const next = link.match(/<([^>]+)>;\s*rel="next"/);
     if (!next) {
       url = null;
+      truncated = false;
     } else {
       try {
         url = new URL(next[1]).origin === new URL(ghApiBase()).origin ? next[1] : null;
+        if (!url) truncated = false;
       } catch {
         url = null;
+        truncated = false;
       }
     }
+  }
+  if (truncated && url) {
+    console.warn(`[storybook-annotakit] \u26A0 GitHub pagination cap hit (${maxPages} pages) on ${pathname} \u2014 results truncated; raise the cap if this repo really has more data`);
   }
   return out;
 }
@@ -998,12 +1047,141 @@ function listLabeledIssues(token, repo, label = "annotakit") {
   return ghJsonPaged(
     token,
     `/repos/${repo}/issues?labels=${encodeURIComponent(labels)}&state=all&per_page=100&sort=updated&direction=desc`,
-    5
+    10
   );
 }
 function listIssueComments(token, repo, issue, since) {
   const q = since ? `?per_page=100&since=${encodeURIComponent(since)}` : "?per_page=100";
-  return ghJsonPaged(token, `/repos/${repo}/issues/${issue}/comments${q}`, 3);
+  return ghJsonPaged(token, `/repos/${repo}/issues/${issue}/comments${q}`, 10);
+}
+
+// src/shared/legacyMirror.ts
+function fmtDate2(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toISOString().replace("T", " ").slice(5, 16);
+}
+function oneLine2(body) {
+  return body.replace(/\s+/g, " ").trim();
+}
+function clip200(body) {
+  const line = oneLine2(body);
+  return line.length > 200 ? line.slice(0, 200) + "\u2026" : line;
+}
+function mirrorBodyCommentsOf(t) {
+  const stamped = t.comments.filter((c) => c.ghId === "issue-body");
+  if (stamped.length) return stamped;
+  return t.comments.filter((c) => !c.ghId && c.source !== "github");
+}
+function dateNorm(body) {
+  return body.replace(/· \d{4}-\d{2}-\d{2} \d{2}:\d{2}/, "\xB7 <date>");
+}
+function legacyMirrorTitle(t) {
+  const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
+  const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 60);
+  return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 100);
+}
+function legacyThreadBlock(t, comments, o) {
+  const rel = o.relPath ?? ((p) => p);
+  const first = comments[0];
+  const headline = first ? (o.variant === "B" ? clip200(first.body) : oneLine2(first.body)) || "(no text)" : "(no text)";
+  const status = o.status === "open" ? "OPEN" : "resolved";
+  const out = [];
+  out.push(`### #${t.number} ${status} \u2014 ${headline}`);
+  out.push("");
+  if (t.story) {
+    if (t.story.importPath) out.push(`- story: ${t.story.title ?? ""}/${t.story.name ?? ""} (${rel(t.story.importPath)})`);
+  }
+  out.push(`- thread id: ${t.id}`);
+  if (o.storageNote) out.push(`- storage: ${o.storageNote}`);
+  const comp = t.component;
+  if (comp) {
+    if (comp.name) out.push(`- component: ${comp.name}${comp.key ? ` (key="${comp.key}")` : ""}`);
+    if (comp.source) out.push(`- jsx: ${rel(comp.source.file)}:${comp.source.line ?? "?"}`);
+    if (comp.chain?.length > 1) out.push(`- chain: ${comp.chain.slice(0, 5).join(" > ")}`);
+    const props = comp.props ? Object.entries(comp.props).slice(0, 6) : [];
+    if (props.length) out.push(`- props: ${props.map(([k, v]) => `${k}=${v}`).join(" ")}`);
+  }
+  const ctx = t.target?.context;
+  out.push(`- element: ${ctx ? elementSummary(ctx) : "?"}`);
+  if (t.target?.selector?.cssSelector) out.push(`- selector: ${t.target.selector.cssSelector}`);
+  for (const r of comments.slice(1)) {
+    const via = o.variant === "B" && r.source === "github" ? " (via github)" : "";
+    const body = o.variant === "B" ? clip200(r.body) : oneLine2(r.body).slice(0, 200);
+    out.push(`  - ${r.author}${via} ${fmtDate2(r.createdAt)}: ${body}`);
+  }
+  if (o.status === "resolved" && t.resolvedAt) out.push(`  - resolved ${fmtDate2(t.resolvedAt)}`);
+  out.push("");
+  return out;
+}
+var LEGACY_SERVER_FOOTER = "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread \u2014 close this issue (the Storybook review thread mirrors it automatically). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.";
+function legacyServerBodyCandidates(t, opts) {
+  const comments = mirrorBodyCommentsOf(t);
+  if (!comments.length) return [];
+  const st = { ...t.story, url: t.story?.url ?? `${opts.origin}/?path=/story/${t.storyId}` };
+  const candidates = [];
+  for (const status of ["open", "resolved"]) {
+    const open = status === "open" ? 1 : 0;
+    const resolved = status === "open" ? 0 : 1;
+    for (const variant of ["A", "B"]) {
+      const out = [];
+      out.push(`# UI review \u2014 ${st.title ?? st.storyId}`);
+      out.push("");
+      out.push(`${open} open / ${resolved} resolved \xB7 ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " ")}`);
+      out.push(`storybook: ${opts.origin}`);
+      out.push("");
+      const storyTitle = variant === "B" ? [st.title ?? st.storyId, st.name].filter(Boolean).join(" / ") : `${st.title ?? st.storyId} / ${st.name ?? ""}`;
+      out.push(`## ${storyTitle}`);
+      out.push("");
+      out.push(`story id: \`${st.storyId}\``);
+      if (st.importPath) out.push(`story file: ${opts.relPath(st.importPath)}`);
+      if (st.componentPath) out.push(`component file: ${opts.relPath(st.componentPath)}`);
+      out.push(`open: ${st.url}`);
+      out.push("");
+      if (status === "open") {
+        out.push(...legacyThreadBlock(t, comments, { variant, relPath: opts.relPath, status }));
+      } else {
+        out.push(`<details><summary>1 resolved</summary>`);
+        out.push("");
+        out.push(...legacyThreadBlock(t, comments, { variant, relPath: opts.relPath, status }));
+        out.push(`</details>`);
+        out.push("");
+      }
+      out.push("---");
+      out.push("");
+      out.push(LEGACY_SERVER_FOOTER);
+      out.push("");
+      candidates.push(out.join("\n"));
+    }
+  }
+  return candidates;
+}
+function decideMirrorHeal(args) {
+  const fields = {};
+  if (typeof args.remote.title === "string" && args.remote.title) {
+    if (args.remote.title === args.legacyTitle && args.wantedTitle !== args.remote.title) {
+      fields.title = args.wantedTitle;
+    }
+  }
+  if (typeof args.remote.body === "string" && args.remote.body) {
+    const machineWritten = args.remote.body.includes(`- thread id: ${args.threadId}`) && !args.remote.body.includes(MIRROR_VERBATIM_MARKER) && !args.remote.body.includes("\u2026 (clipped at ");
+    if (machineWritten && args.wantedBody !== args.remote.body && args.legacyBodies.some((c) => dateNorm(c) === dateNorm(args.remote.body))) {
+      fields.body = args.wantedBody;
+    } else if (machineWritten && typeof process !== "undefined" && process.env?.ANNOTAKIT_HEAL_DEBUG) {
+      const remote = dateNorm(args.remote.body);
+      for (const c of args.legacyBodies) {
+        const want = dateNorm(c).split("\n");
+        const got = remote.split("\n");
+        let li = 0;
+        while (li < Math.max(want.length, got.length) && want[li] === got[li]) li++;
+        console.error(`[heal-debug] no match vs candidate: first diff line ${li}
+  want: ${JSON.stringify(want[li])}
+  got:  ${JSON.stringify(got[li])}`);
+      }
+    }
+  }
+  return Object.keys(fields).length ? fields : null;
 }
 
 // src/server/ghsync.ts
@@ -1017,6 +1195,7 @@ function createGhSync(opts) {
   const queue = [];
   const queued = /* @__PURE__ */ new Set();
   const inflight = /* @__PURE__ */ new Set();
+  const touchedDuringFlight = /* @__PURE__ */ new Set();
   const retries = /* @__PURE__ */ new Map();
   const notBefore = /* @__PURE__ */ new Map();
   let started = false;
@@ -1084,27 +1263,55 @@ function createGhSync(opts) {
     return m ? m[1] : null;
   };
   function mirrorHealFields(t, remote) {
-    const fields = {};
-    if (typeof remote.title === "string" && remote.title) {
-      const want = issueTitle(t);
-      if (want !== remote.title && want.startsWith(remote.title)) fields.title = want;
-    }
-    if (typeof remote.body === "string" && remote.body) {
-      const oldFormat = t.comments.length > 0 && remote.body.includes(`- thread id: ${t.id}`) && !remote.body.includes(MIRROR_VERBATIM_MARKER);
-      if (oldFormat) {
-        const want = issueBody(t);
-        if (want.length >= remote.body.length) fields.body = want;
-      }
-    }
-    return Object.keys(fields).length ? fields : null;
+    return decideMirrorHeal({
+      threadId: t.id,
+      remote,
+      wantedTitle: issueTitle(t),
+      wantedBody: issueBody(t),
+      legacyTitle: legacyMirrorTitle(t),
+      legacyBodies: legacyServerBodyCandidates(t, { origin: opts.origin(), relPath: (p) => repoRelPath(p) ?? p })
+    });
   }
-  async function syncThread(id) {
+  function orphanIndexOf(issues, threads) {
+    const mapped = new Set(threads.filter((t) => t.gh).map((t) => t.gh?.issue));
+    const unmappedById = new Map(threads.filter((t) => !t.gh).map((t) => [t.id, t]));
+    const out = /* @__PURE__ */ new Map();
+    for (const issue of issues) {
+      if (mapped.has(issue.number)) continue;
+      if (typeof issue.body !== "string" || !issue.body) continue;
+      const stamp = issue.body.match(/^- thread id: (.+)$/m);
+      if (!stamp) continue;
+      const victim = unmappedById.get(stamp[1].trim());
+      if (victim && !out.has(victim.id)) out.set(victim.id, issue);
+    }
+    return out;
+  }
+  async function syncThread(id, orphanIndex) {
     const cfg = configured();
     if (cfg.error) throw Object.assign(new Error(cfg.error), { status: 400 });
     const t = await store.getThread(id);
     if (!t) return "noop";
     const { token: tk, repo: rp } = cfg;
     if (!t.gh) {
+      let orphan = orphanIndex?.get(id);
+      if (!orphan && orphanIndex === void 0) {
+        try {
+          orphan = orphanIndexOf(await listLabeledIssues(tk, rp, labelsOf()), [t]).get(id);
+        } catch {
+        }
+      }
+      if (orphan) {
+        const adopted = await store.mutateThread(id, (cur) => {
+          if (cur.gh) return;
+          cur.gh = { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: nowIso() };
+        });
+        if (adopted) {
+          opts.onEngineMutation(adopted, "updated");
+          lastPushAt = nowIso();
+          console.warn(`[storybook-annotakit] gh-sync: adopted orphaned mirror issue #${orphan.number} for thread ${id.slice(0, 12)}\u2026 (create-crash recovery)`);
+          return "pushed";
+        }
+      }
       const created = await createIssue(tk, rp, { title: issueTitle(t), body: issueBody(t), labels: labelsOf() });
       const still = await store.mutateThread(id, (cur) => {
         cur.gh = { issue: created.number, url: created.html_url, state: "open", syncedAt: nowIso() };
@@ -1191,9 +1398,14 @@ reopened in Storybook \u2014 thread #${t.number}.`;
         await syncThread(id);
         retries.delete(id);
         notBefore.delete(id);
+        if (touchedDuringFlight.delete(id)) {
+          queued.add(id);
+          queue.push(id);
+        }
       } catch (err) {
         hadFailure = true;
         failTask(id, err);
+        touchedDuringFlight.delete(id);
       } finally {
         inflight.delete(id);
       }
@@ -1343,6 +1555,28 @@ reopened in Storybook \u2014 thread #${t.number}.`;
         }
       }
     }
+    const mappedIssues = new Set(threads.filter((t) => t.gh).map((t) => t.gh?.issue));
+    const unmappedById = new Map(threads.filter((t) => !t.gh).map((t) => [t.id, t]));
+    for (const issue of remote.values()) {
+      if (mappedIssues.has(issue.number)) continue;
+      if (typeof issue.body !== "string" || !issue.body) continue;
+      const stamp = issue.body.match(/^- thread id: (.+)$/m);
+      if (!stamp) continue;
+      const victim = unmappedById.get(stamp[1].trim());
+      if (!victim || queued.has(victim.id) || inflight.has(victim.id)) continue;
+      const after = await store.mutateThread(victim.id, (cur) => {
+        if (cur.gh) return;
+        cur.gh = { issue: issue.number, url: issue.html_url, state: issue.state, syncedAt: pullStartedAt };
+      });
+      if (after) {
+        opts.onEngineMutation(after, "updated");
+        healed++;
+        enqueue(after.id);
+        console.warn(
+          `[storybook-annotakit] gh-sync: remapped orphaned mirror issue #${issue.number} to thread ${victim.id.slice(0, 12)}\u2026 (create-crash recovery)`
+        );
+      }
+    }
     for (const issueNumber of await store.listOpenTombstones()) {
       try {
         if (remote.get(issueNumber)?.state !== "closed") {
@@ -1371,7 +1605,11 @@ thread deleted in Storybook \u2014 closing.`);
   const enqueue = (threadId) => {
     if (!opts.enabled) return;
     if (!token() || !repo) return;
-    if (queued.has(threadId) || inflight.has(threadId)) return;
+    if (inflight.has(threadId)) {
+      touchedDuringFlight.add(threadId);
+      return;
+    }
+    if (queued.has(threadId)) return;
     queued.add(threadId);
     queue.push(threadId);
   };
@@ -1385,12 +1623,23 @@ thread deleted in Storybook \u2014 closing.`);
   const syncAllRaw = async () => {
     await drainQueue();
     const threadsNow = await store.listThreads();
+    let orphanIndex;
+    if (threadsNow.some((t) => !t.gh)) {
+      try {
+        const cfg0 = configured();
+        if (!cfg0.error) {
+          const { token: tk0, repo: rp0 } = cfg0;
+          orphanIndex = orphanIndexOf(await listLabeledIssues(tk0, rp0, labelsOf()), threadsNow);
+        }
+      } catch {
+      }
+    }
     let created = 0;
     let pushed = 0;
     let pushError = null;
     for (const t of threadsNow) {
       try {
-        const r = await syncThread(t.id);
+        const r = await syncThread(t.id, orphanIndex);
         if (r === "created") created++;
         if (r === "pushed") pushed++;
       } catch (err) {
@@ -1484,12 +1733,16 @@ thread deleted in Storybook \u2014 closing.`);
       lastError = err instanceof Error ? err.message : String(err);
     });
   };
-  const stop = () => {
+  const stop = async () => {
     if (workerTimer) clearInterval(workerTimer);
     if (pollTimer) clearInterval(pollTimer);
     workerTimer = null;
     pollTimer = null;
     started = false;
+    try {
+      await chain;
+    } catch {
+    }
   };
   return { enqueue, enqueueDelete, syncAll, pullOnce: () => run(pullOnceRaw), status, start, stop };
 }
@@ -1501,7 +1754,12 @@ function cloneThread(t) {
 function later(a, b) {
   const at = Date.parse(a.updatedAt ?? "");
   const bt = Date.parse(b.updatedAt ?? "");
-  return Number.isFinite(at) && Number.isFinite(bt) ? at >= bt ? a : b : a;
+  const aOk = Number.isFinite(at);
+  const bOk = Number.isFinite(bt);
+  if (aOk && bOk) return at >= bt ? a : b;
+  if (aOk) return a;
+  if (bOk) return b;
+  return a;
 }
 function unionComments(a, b) {
   const out = a.comments.map((c) => ({ ...c }));
@@ -1511,8 +1769,10 @@ function unionComments(a, b) {
     if (!existing) {
       out.push({ ...rc });
       byId.set(rc.id, rc);
-    } else if (!existing.body && rc.body) {
-      existing.body = rc.body;
+    } else {
+      if (!existing.body && rc.body) existing.body = rc.body;
+      if (!existing.ghId && rc.ghId) existing.ghId = rc.ghId;
+      if (!existing.source && rc.source) existing.source = rc.source;
     }
   }
   out.sort((x, y) => String(x.createdAt ?? "").localeCompare(String(y.createdAt ?? "")));
@@ -1579,6 +1839,29 @@ var SHA_RE = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 var BRANCH_PRIMARY = "annotakit";
 var BRANCH_FALLBACK = "annotakit-store";
 var REMOTE_CACHE_REF = "refs/annotakit/remote";
+var gitEnvConfigCapable = null;
+function gitSupportsEnvConfig() {
+  if (gitEnvConfigCapable !== null) return gitEnvConfigCapable;
+  const v = __require("child_process").spawnSync("git", ["--version"], { encoding: "utf8", timeout: 5e3 }).stdout ?? "";
+  const m = v.match(/git version (\d+)\.(\d+)/);
+  gitEnvConfigCapable = Boolean(m && (Number(m[1]) > 2 || Number(m[1]) === 2 && Number(m[2]) >= 31));
+  return gitEnvConfigCapable;
+}
+function gitAuthEnv(token) {
+  if (!token) return { args: [] };
+  const header = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
+  if (gitSupportsEnvConfig()) {
+    return {
+      args: [],
+      env: {
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0: header
+      }
+    };
+  }
+  return { args: ["-c", `http.https://github.com/.extraheader=${header}`] };
+}
 var COMMIT_ENV = {
   GIT_AUTHOR_NAME: "storybook-annotakit",
   GIT_AUTHOR_EMAIL: "annotakit@users.noreply.github.com",
@@ -1734,18 +2017,14 @@ function createAutoSync(opts) {
     }
     return BRANCH_PRIMARY;
   };
-  const fetchRemote = async (timeoutMs) => {
+  const fetchRemote = async (timeoutMs, targetBranch) => {
     if (!repo) return null;
+    const b = targetBranch ?? branch;
     const token = ghToken();
     const url = `https://github.com/${repo}.git`;
-    const args = token ? [
-      "-c",
-      `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
-      "fetch",
-      url,
-      `+refs/heads/${branch}:${REMOTE_CACHE_REF}`
-    ] : ["fetch", url, `+refs/heads/${branch}:${REMOTE_CACHE_REF}`];
-    const f = await gitAsync(root, args, timeoutMs);
+    const auth = gitAuthEnv(token);
+    const args = [...auth.args, "fetch", url, `+refs/heads/${b}:${REMOTE_CACHE_REF}`];
+    const f = await gitAsync(root, args, timeoutMs, auth.env ? { env: auth.env } : void 0);
     const head = await gitAsync(root, ["rev-parse", "--verify", "--quiet", REMOTE_CACHE_REF], 5e3);
     if (head.ok && SHA_RE.test(head.out.trim())) return head.out.trim();
     if (!f.ok) {
@@ -1797,18 +2076,12 @@ function createAutoSync(opts) {
       return { ok: false, out: "empty-sha guard" };
     }
     if (!repo) return { ok: false, out: "no remote" };
+    maybeWarnArgvAuth();
     const token = ghToken();
     const url = `https://github.com/${repo}.git`;
     const refspec = `${sha}:refs/heads/${branch}`;
-    const args = token ? [
-      "-c",
-      `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
-      "push",
-      "--no-verify",
-      url,
-      refspec
-    ] : ["push", "--no-verify", url, refspec];
-    return gitAsync(root, args, timeoutMs);
+    const auth = gitAuthEnv(token);
+    return gitAsync(root, [...auth.args, "push", "--no-verify", url, refspec], timeoutMs, auth.env ? { env: auth.env } : void 0);
   };
   const readRemoteDoc = async (commitSha) => {
     let sha = commitSha;
@@ -1867,13 +2140,26 @@ function createAutoSync(opts) {
           state = `no remote store yet (${branch}) \u2014 first snapshot will create it`;
           return;
         }
-        const kind = await refReadmeKind(remote.ref);
+        let kind = await refReadmeKind(remote.ref);
         if (kind === "no-readme" || kind === "foreign") {
-          logOnce(
-            kind === "no-readme" ? `remote refs/heads/${branch} tip has NO README \u2014 pre-annotakit or empty branch, not adopting it (A14)` : `remote refs/heads/${branch} is not an annotakit store branch (README mismatch \u2014 genuinely foreign), not adopting it (A14)`
-          );
-          state = `remote ${branch} is foreign; local store unaffected`;
-          return;
+          if (branch === BRANCH_PRIMARY) {
+            const fb = await fetchRemote(1e4, BRANCH_FALLBACK);
+            if (fb && await refHasOurReadme(REMOTE_CACHE_REF)) {
+              logOnce(
+                `remote refs/heads/${BRANCH_PRIMARY} is ${kind === "foreign" ? "foreign" : "README-less"} but ${BRANCH_FALLBACK} is ours \u2014 switching the store branch to ${BRANCH_FALLBACK} (A14/C17)`
+              );
+              branch = BRANCH_FALLBACK;
+              remote = { sha: fb, ref: REMOTE_CACHE_REF };
+              kind = await refReadmeKind(REMOTE_CACHE_REF);
+            }
+          }
+          if (kind === "no-readme" || kind === "foreign") {
+            logOnce(
+              kind === "no-readme" ? `remote refs/heads/${branch} tip has NO README \u2014 pre-annotakit or empty branch, not adopting it (A14)` : `remote refs/heads/${branch} is not an annotakit store branch (README mismatch \u2014 genuinely foreign), not adopting it (A14)`
+            );
+            state = `remote ${branch} is foreign; local store unaffected`;
+            return;
+          }
         }
         const remoteDoc = await readRemoteDoc(remote.sha);
         const localCount = await opts.countThreads();
@@ -2031,16 +2317,38 @@ function createAutoSync(opts) {
     p.then(
       () => {
         if (inflight === p) inflight = null;
+        if (dirtyDuringCycle && !stopped && !signalHandled) {
+          dirtyDuringCycle = false;
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(() => {
+            timer = null;
+            void syncOnce(9e3, "mutation-after-join");
+          }, DEBOUNCE_MS);
+          timer.unref?.();
+        }
       },
       () => {
         if (inflight === p) inflight = null;
+        dirtyDuringCycle = false;
       }
     );
     return p;
   };
   let signalHandled = false;
+  let dirtyDuringCycle = false;
+  const shutdownHooks = opts.onShutdownHooks ?? [];
+  let warnedArgvAuth = false;
+  const maybeWarnArgvAuth = () => {
+    if (warnedArgvAuth || !ghToken() || gitSupportsEnvConfig()) return;
+    warnedArgvAuth = true;
+    console.warn("[storybook-annotakit] \u26A0 this git (< 2.31) cannot take auth via environment config \u2014 the GitHub token is passed on the git command line, where other local users can read it via /proc. Upgrade git to \u2265 2.31.");
+  };
   const notify = () => {
     if (!enabled || stopped || signalHandled) return;
+    if (inflight) {
+      dirtyDuringCycle = true;
+      return;
+    }
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
@@ -2059,6 +2367,12 @@ function createAutoSync(opts) {
       if (inflight) {
         try {
           await inflight;
+        } catch {
+        }
+      }
+      for (const hook of shutdownHooks) {
+        try {
+          await hook();
         } catch {
         }
       }
@@ -2130,7 +2444,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.4";
+var VERSION = "0.6.5";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2167,6 +2481,7 @@ function bootstrap(configDir, port) {
   const envRepo = ghRepoEnv();
   const repo = configRepo ?? envRepo ?? detected.repo;
   const ghLabels = resolveGhLabels(config);
+  const shutdownHooks = [];
   const sync = createAutoSync({
     configDir,
     dataDir: loc.dir,
@@ -2177,7 +2492,8 @@ function bootstrap(configDir, port) {
     autoSyncEnabled: config.autoSync !== false,
     repo,
     // A7: restored/merged rows must reach every live surface immediately
-    onRestored: (reason) => broadcast({ reason })
+    onRestored: (reason) => broadcast({ reason }),
+    onShutdownHooks: shutdownHooks
   });
   const repoSource = configRepo ? `${CONFIG_FILE} ghRepo` : envRepo ? "ANNOTAKIT_GH_REPO env" : detected.source;
   const configToken = typeof config.ghToken === "string" ? config.ghToken : void 0;
@@ -2217,6 +2533,7 @@ function bootstrap(configDir, port) {
       sync.notify();
     }
   });
+  shutdownHooks.push(() => ghsync.stop());
   runtime = { store, sync, ghsync, config, root, configPath: `${configDir}/${CONFIG_FILE}`, repo, repoSource, ghLabels, origin: port ? `http://localhost:${port}` : "http://localhost:6006", started: true, bootWarnings };
   if (repo) {
     console.warn(`[storybook-annotakit] GitHub mirror target: ${repo} (${repoSource})`);
@@ -2271,6 +2588,7 @@ function isLoopbackPeer(req) {
 var warnedNonLoopback = false;
 function enforceApiAccess(req, res) {
   const key = process.env.ANNOTAKIT_API_KEY;
+  if (isLoopbackPeer(req)) return true;
   if (key) {
     const provided = req.headers["x-annotakit-key"];
     const ok = provided === key || Array.isArray(provided) && provided.includes(key);
@@ -2280,7 +2598,6 @@ function enforceApiAccess(req, res) {
     }
     return true;
   }
-  if (isLoopbackPeer(req)) return true;
   if (!warnedNonLoopback) {
     warnedNonLoopback = true;
     console.warn(
@@ -2340,9 +2657,13 @@ function readBody(req) {
       if (oversize) return;
       if (!chunks.length) return resolve({});
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      } catch {
-        reject(Object.assign(new Error("invalid JSON body"), { status: 400 }));
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("body must be a JSON object");
+        }
+        resolve(parsed);
+      } catch (err) {
+        reject(Object.assign(new Error(`invalid JSON body (${err instanceof Error ? err.message : String(err)})`), { status: 400 }));
       }
     });
     req.on("error", reject);
@@ -2400,38 +2721,43 @@ function normalizeComment(c) {
   c.id = stableCommentId(c.author, c.body, c.createdAt);
   return c;
 }
+function validateTargetShape(target, label = "target") {
+  if (!target || typeof target !== "object" || Array.isArray(target)) {
+    throw Object.assign(new Error(`${label} is required \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  const t = target;
+  if (t.kind !== "pin" && t.kind !== "region") {
+    throw Object.assign(new Error(`${label}.kind must be "pin" or "region" (got ${JSON.stringify(t.kind)}) \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  const selector = t.selector;
+  if (!selector || typeof selector !== "object" || Array.isArray(selector)) {
+    throw Object.assign(new Error(`${label}.selector must be an object {cssSelector?, textQuote?, fragment?} (got ${typeof selector}) \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  const bbox = t.bbox;
+  const isBBox = (b) => !!b && typeof b === "object" && ["x", "y", "w", "h"].every((k) => typeof b[k] === "number");
+  if (!isBBox(bbox)) {
+    throw Object.assign(new Error(`${label}.bbox must be {x,y,w,h} numbers (got ${JSON.stringify(bbox)?.slice(0, 80)}) \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  const context = t.context;
+  if (!context || typeof context !== "object" || Array.isArray(context) || typeof context.tag !== "string") {
+    throw Object.assign(new Error(`${label}.context must be an object with a string "tag" (got ${typeof context}) \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  if (t.captureViewportWidth != null && typeof t.captureViewportWidth !== "number") {
+    throw Object.assign(new Error(`${label}.captureViewportWidth must be a number when provided`), { status: 400 });
+  }
+}
 function validateThreadInput(body) {
   const storyId = typeof body.storyId === "string" ? body.storyId : "";
   const target = body.target;
   const comments = Array.isArray(body.comments) ? body.comments : [];
   if (!storyId) throw Object.assign(new Error("storyId is required"), { status: 400 });
-  if (!target || typeof target !== "object" || Array.isArray(target)) {
-    throw Object.assign(new Error(`target is required \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  if (target.kind !== "pin" && target.kind !== "region") {
-    throw Object.assign(new Error(`target.kind must be "pin" or "region" (got ${JSON.stringify(target.kind)}) \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  const selector = target.selector;
-  if (!selector || typeof selector !== "object" || Array.isArray(selector)) {
-    throw Object.assign(new Error(`target.selector must be an object {cssSelector?, textQuote?, fragment?} (got ${typeof selector}) \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  const bbox = target.bbox;
-  const isBBox = (b) => !!b && typeof b === "object" && ["x", "y", "w", "h"].every((k) => typeof b[k] === "number");
-  if (!isBBox(bbox)) {
-    throw Object.assign(new Error(`target.bbox must be {x,y,w,h} numbers (got ${JSON.stringify(bbox)?.slice(0, 80)}) \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  const context = target.context;
-  if (!context || typeof context !== "object" || Array.isArray(context) || typeof context.tag !== "string") {
-    throw Object.assign(new Error(`target.context must be an object with a string "tag" (got ${typeof context}) \u2014 ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  if (target.captureViewportWidth != null && typeof target.captureViewportWidth !== "number") {
-    throw Object.assign(new Error("target.captureViewportWidth must be a number when provided"), { status: 400 });
-  }
+  validateTargetShape(target);
   if (comments.length === 0) {
     throw Object.assign(new Error("at least one comment is required"), { status: 400 });
   }
   for (const c of comments) {
     if (!c.body?.trim()) throw Object.assign(new Error("comment body is required"), { status: 400 });
+    if (typeof c.body !== "string") throw Object.assign(new Error("comment body must be a string"), { status: 400 });
     if (c.body.length > MAX_BODY_CHARS) {
       throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars \u2014 the full body stays in the store/json export; keep evidence links instead of pasting whole logs)`), { status: 413 });
     }
@@ -2578,7 +2904,9 @@ async function handleApi(req, res, url, configDir, origin) {
     if (method === "GET") {
       const threads = await store.listThreads({
         storyId: url.searchParams.get("storyId") ?? void 0,
-        status: url.searchParams.get("status") ?? void 0
+        // H-A-12: the filter is case-exact in sqlite — normalize so
+        // ?status=Open (an easy agent typo) matches like the PATCH normalizer
+        status: url.searchParams.get("status")?.toLowerCase() || void 0
       });
       const snapshots = [...await store.listSnapshotIds()];
       sendJson(res, 200, { threads, snapshots });
@@ -2607,7 +2935,12 @@ async function handleApi(req, res, url, configDir, origin) {
   }
   const threadMatch = p.match(new RegExp(`^${API_BASE}/threads/([^/]+)(/comments)?$`));
   if (threadMatch) {
-    const id = decodeURIComponent(threadMatch[1] ?? "");
+    let id;
+    try {
+      id = decodeURIComponent(threadMatch[1] ?? "");
+    } catch {
+      throw Object.assign(new Error(`thread id is not valid percent-encoding (${JSON.stringify(threadMatch[1] ?? "")})`), { status: 400 });
+    }
     const isComments = Boolean(threadMatch[2]);
     if (method === "DELETE" && !isComments) {
       const prev = await store.getThread(id);
@@ -2626,12 +2959,25 @@ async function handleApi(req, res, url, configDir, origin) {
     }
     if (method === "PATCH" && !isComments) {
       const body = await readBody(req);
-      if (typeof body.id === "string" && body.id !== id) {
+      const bodyId = body.id;
+      if (bodyId !== void 0 && typeof bodyId !== "string") {
+        throw Object.assign(new Error("body.id must be a string when provided"), { status: 400 });
+      }
+      if (typeof bodyId === "string" && bodyId !== id) {
         throw Object.assign(new Error("id mismatch between URL and body"), { status: 400 });
       }
       const prev = await store.getThread(id);
       if (!prev) return notFound(res, THREAD_404_HINT), true;
       const full = buildPatchCandidate(prev, body);
+      if ("target" in body) validateTargetShape(full.target);
+      if (full.status === void 0) full.status = prev.status;
+      const prevIds = new Set(prev.comments.map((c) => c.id));
+      for (const c of full.comments) {
+        if (!c || typeof c !== "object" || Array.isArray(c)) {
+          throw Object.assign(new Error("comments entries must be objects"), { status: 400 });
+        }
+        if (!prevIds.has(c.id)) normalizeComment(c);
+      }
       if ("status" in body && full.status !== void 0) {
         const norm = String(full.status).toLowerCase();
         if (norm !== "open" && norm !== "fixed" && norm !== "resolved") {
@@ -2655,6 +3001,7 @@ async function handleApi(req, res, url, configDir, origin) {
         delete full.resolvedAt;
       }
       if (prev.gh) full.gh = prev.gh;
+      else delete full.gh;
       const bodyIds = new Set(full.comments.map((c) => c.id));
       for (const pc of prev.comments) {
         if (!bodyIds.has(pc.id)) full.comments.push(pc);
@@ -2708,7 +3055,13 @@ async function handleApi(req, res, url, configDir, origin) {
   }
   const snapMatch = p.match(new RegExp(`^${API_BASE}/threads/([^/]+)/snapshot$`));
   if (snapMatch) {
-    const id = decodeURIComponent(snapMatch[1] ?? "");
+    let snapId;
+    try {
+      snapId = decodeURIComponent(snapMatch[1] ?? "");
+    } catch {
+      throw Object.assign(new Error(`thread id is not valid percent-encoding (${JSON.stringify(snapMatch[1] ?? "")})`), { status: 400 });
+    }
+    const id = snapId;
     if (method === "PUT" || method === "POST") {
       const thread = await store.getThread(id);
       if (!thread) return notFound(res), true;
@@ -2752,7 +3105,7 @@ async function handleApi(req, res, url, configDir, origin) {
   }
   if (p === `${API_BASE}/export` && method === "GET") {
     const storyId = url.searchParams.get("storyId") ?? void 0;
-    const status = url.searchParams.get("status") ?? void 0;
+    const status = url.searchParams.get("status")?.toLowerCase() || void 0;
     const threads = await store.listThreads({ storyId, status });
     const stories = groupByStory(threads, origin);
     const snapshotIds = await store.listSnapshotIds();
@@ -2880,7 +3233,10 @@ function devServerHook(app, options) {
 }
 
 exports.createMiddleware = createMiddleware;
+exports.decideMirrorHeal = decideMirrorHeal;
 exports.devServerHook = devServerHook;
+exports.legacyMirrorTitle = legacyMirrorTitle;
+exports.legacyServerBodyCandidates = legacyServerBodyCandidates;
 exports.renderDigest = renderDigest;
 exports.serverChannelHook = serverChannelHook;
 exports.setChannelEmitter = setChannelEmitter;

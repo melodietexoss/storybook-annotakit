@@ -12,9 +12,14 @@
  *      quote the platform internals it scrubs) or .agents/SKILL.md
  *      (untransformed dev form). The v0.6.0 `files` field shipped BOTH —
  *      the whitelist now prevents it; this check keeps it prevented.
+ *   4. v0.6.5 (H-F-04): dist FRESHNESS — the built server.cjs embeds the
+ *      routes VERSION constant; "bump the version, forget the rebuild"
+ *      used to pass every gate and ship a /health reporting the OLD
+ *      version. The dist banner must agree with package.json.
  *
  * Self-test: `node scripts/release-check.mjs --selftest` plants a ghost
- * chunk and a fake version drift, expects BOTH to be caught, cleans up.
+ * chunk, a fake package.json version drift, AND a stale dist banner —
+ * expects ALL THREE to be caught, restoring state in finally.
  *
  * Exit codes: 0 = clean, 1 = release-dirty, 2 = selftest failure.
  */
@@ -49,7 +54,7 @@ const run = (cmd, args, opts = {}) => {
 }
 
 /* 2 — version agreement (package.json vs routes.ts vs README) */
-{
+function versionProblems() {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const routes = fs.readFileSync(path.join(root, 'src/server/routes.ts'), 'utf8');
   const m = routes.match(/VERSION = '([^']+)'/);
@@ -60,8 +65,27 @@ const run = (cmd, args, opts = {}) => {
   const rm = readme.match(/^v(\d+\.\d+\.\d+)\s+—/m);
   const readmeV = rm ? `v${rm[1]}` : '(not found)';
   if (pkg.version !== routesV || `v${pkg.version}` !== readmeV) {
-    problems.push(`version disagreement: package.json=${pkg.version} routes.ts=${routesV} README=${readmeV}`);
-  } else notes.push(`version agreement: ${pkg.version} (pkg + routes + README)`);
+    return [`version disagreement: package.json=${pkg.version} routes.ts=${routesV} README=${readmeV}`];
+  }
+  notes.push(`version agreement: ${pkg.version} (pkg + routes + README)`);
+  return [];
+}
+
+/* 4 — v0.6.5 (H-F-04): dist FRESHNESS — the shipped server bundle must embed
+ *  the CURRENT version ("commit the bump, forget the rebuild" shipped a
+ *  dist whose /health reported the previous release — every other gate was
+ *  green because they all read SRC, never the built artifact). */
+function distFreshnessProblems() {
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const dist = path.join(root, 'dist', 'server.cjs');
+  if (!fs.existsSync(dist)) return ['dist/server.cjs missing — run npm run build before tagging'];
+  const bundled = fs.readFileSync(dist, 'utf8').match(/VERSION = "([^"]+)"/);
+  const distV = bundled ? bundled[1] : null;
+  if (distV !== pkg.version) {
+    return [`dist is STALE: dist/server.cjs embeds VERSION=${distV ?? '(none)'} while package.json=${pkg.version} — run npm run build and re-stage`];
+  }
+  notes.push(`dist freshness: server.cjs embeds ${pkg.version}`);
+  return [];
 }
 
 /* 3 — npm-pack leak guard */
@@ -81,28 +105,44 @@ const run = (cmd, args, opts = {}) => {
 /* --------------------------------- selftest --------------------------------- */
 if (process.argv.includes('--selftest')) {
   const ghost = path.join(root, 'dist', 'chunk-DEADBEEF.mjs');
+  const pkgPath = path.join(root, 'package.json');
+  const distPath = path.join(root, 'dist', 'server.cjs');
   let failed = 0;
+  // H-F-05: the selftest used to assert INPUT inequality, not that the GATE
+  // bites — and restored package.json OUTSIDE finally (a throw left the tree
+  // patched). Both fixed: each planted defect must be CAUGHT by the real
+  // check functions, and ALL state restores in finally.
+  const origPkg = fs.readFileSync(pkgPath, 'utf8');
+  const origDist = fs.existsSync(distPath) ? fs.readFileSync(distPath, 'utf8') : null;
   try {
+    // (a) ghost chunk
     fs.writeFileSync(ghost, '// selftest ghost chunk\n');
     const out1 = run('git', ['status', '--porcelain', '--ignored', '--', 'dist/']) ?? '';
     if (!/DEADBEEF/.test(out1)) { console.error('selftest FAIL: ghost chunk not detected'); failed++; }
-    fs.rmSync(ghost, { force: true });
-    const pkgPath = path.join(root, 'package.json');
-    const orig = fs.readFileSync(pkgPath, 'utf8');
-    const patched = orig.replace(/"version": "[^"]+"/, '"version": "0.0.0-selftest"');
-    fs.writeFileSync(pkgPath, patched);
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-    const routes = fs.readFileSync(path.join(root, 'src/server/routes.ts'), 'utf8').match(/VERSION = '([^']+)'/);
-    if (pkg.version === routes[1]) { console.error('selftest FAIL: version drift not detectable'); failed++; }
-    fs.writeFileSync(pkgPath, orig);
+    // (b) version drift → the REAL gate must catch it
+    fs.writeFileSync(pkgPath, origPkg.replace(/"version": "[^"]+"/, '"version": "0.0.0-selftest"'));
+    const vp = versionProblems();
+    if (vp.length !== 1) { console.error(`selftest FAIL: version gate did not bite (reported ${vp.length})`); failed++; }
+    // (c) stale dist banner → the REAL freshness gate must catch it
+    //     (planted version must DIFFER from the (b) package.json patch —
+    //     identical fake versions would match each other and cancel out)
+    if (origDist !== null) {
+      const stale = origDist.replace(/VERSION = "[^"]+"/, 'VERSION = "9.9.9-stale"');
+      fs.writeFileSync(distPath, stale);
+      const fp = distFreshnessProblems();
+      if (fp.length !== 1) { console.error(`selftest FAIL: dist-freshness gate did not bite (reported ${fp.length})`); failed++; }
+    }
   } finally {
     fs.rmSync(ghost, { force: true });
+    fs.writeFileSync(pkgPath, origPkg);
+    if (origDist !== null) fs.writeFileSync(distPath, origDist);
   }
-  console.log(failed === 0 ? 'release-check selftest: PASS (ghost chunk + version drift both caught)' : 'release-check selftest: FAIL');
+  console.log(failed === 0 ? 'release-check selftest: PASS (ghost chunk + version drift + stale dist all caught)' : 'release-check selftest: FAIL');
   process.exit(failed === 0 ? 0 : 2);
 }
 
 /* --------------------------------- verdict ---------------------------------- */
+problems.push(...versionProblems(), ...distFreshnessProblems());
 for (const n of notes) console.log(`  ok  ${n}`);
 if (problems.length) {
   for (const p of problems) console.error(`  FAIL  ${p}`);

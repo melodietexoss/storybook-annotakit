@@ -39,11 +39,21 @@ function cloneThread(t: Thread): Thread {
 function later(a: Thread, b: Thread): Thread {
   const at = Date.parse(a.updatedAt ?? '');
   const bt = Date.parse(b.updatedAt ?? '');
-  return Number.isFinite(at) && Number.isFinite(bt) ? (at >= bt ? a : b) : a;
+  // H-H-10: a missing/garbage timestamp on ONE side must not silently win —
+  // prefer the side that actually parses; both broken → keep local (a).
+  const aOk = Number.isFinite(at);
+  const bOk = Number.isFinite(bt);
+  if (aOk && bOk) return at >= bt ? a : b;
+  if (aOk) return a;
+  if (bOk) return b;
+  return a;
 }
-
 /** Union comments by id; on same id the body of the later thread's copy wins
- *  (identical to the PATCH union-merge semantics the server already trusts). */
+ *  (identical to the PATCH union-merge semantics the server already trusts).
+ *  Hardening C03 (H-A-03): the winning copy used to drop the loser's ghId/
+ *  source — a merge with a stale unstamped copy then re-posted the comment to
+ *  GitHub (duplicate issue comment) which pulled back as a duplicate reply.
+ *  Metadata now FILLS gaps on the winner, exactly like routes' PATCH union. */
 function unionComments(a: Thread, b: Thread): Comment[] {
   const out: Comment[] = a.comments.map((c) => ({ ...c }));
   const byId = new Map(out.map((c) => [c.id, c]));
@@ -52,8 +62,10 @@ function unionComments(a: Thread, b: Thread): Comment[] {
     if (!existing) {
       out.push({ ...rc });
       byId.set(rc.id, rc);
-    } else if (!existing.body && rc.body) {
-      existing.body = rc.body; // fill husks, never overwrite content
+    } else {
+      if (!existing.body && rc.body) existing.body = rc.body; // fill husks, never overwrite content
+      if (!existing.ghId && rc.ghId) existing.ghId = rc.ghId; // C03: dedupe stamps survive merges
+      if (!existing.source && rc.source) existing.source = rc.source;
     }
   }
   out.sort((x, y) => String(x.createdAt ?? '').localeCompare(String(y.createdAt ?? '')));

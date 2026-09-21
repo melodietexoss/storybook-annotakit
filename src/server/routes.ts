@@ -34,7 +34,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.4';
+const VERSION = '0.6.5';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -119,6 +119,10 @@ function bootstrap(configDir: string, port?: number): Runtime {
   const envRepo = ghRepoEnv();
   const repo = configRepo ?? envRepo ?? detected.repo;
   const ghLabels = resolveGhLabels(config);
+  // C14: the sync shutdown flush awaits these BEFORE its final git cycle —
+  // ghsync.stop() settles any in-flight engine op so stamped rows reach the
+  // last pushed snapshot (registered below, after ghsync exists).
+  const shutdownHooks: Array<() => Promise<void> | void> = [];
   const sync = createAutoSync({
     configDir,
     dataDir: loc.dir,
@@ -130,6 +134,7 @@ function bootstrap(configDir: string, port?: number): Runtime {
     repo,
     // A7: restored/merged rows must reach every live surface immediately
     onRestored: (reason) => broadcast({ reason }),
+    onShutdownHooks: shutdownHooks,
   });
   const repoSource = configRepo ? `${CONFIG_FILE} ghRepo` : envRepo ? 'ANNOTAKIT_GH_REPO env' : detected.source;
   const configToken = typeof config.ghToken === 'string' ? config.ghToken : undefined;
@@ -183,6 +188,9 @@ function bootstrap(configDir: string, port?: number): Runtime {
       sync.notify();
     },
   });
+  // C14: drain the GH engine (settle in-flight creates/replies) during the
+  // shutdown flush, BEFORE the final git cycle pushes its snapshot.
+  shutdownHooks.push(() => ghsync.stop());
   runtime = { store, sync, ghsync, config, root, configPath: `${configDir}/${CONFIG_FILE}`, repo, repoSource, ghLabels, origin: port ? `http://localhost:${port}` : 'http://localhost:6006', started: true, bootWarnings };
   if (repo) {
     console.warn(`[storybook-annotakit] GitHub mirror target: ${repo} (${repoSource})`);
@@ -263,9 +271,13 @@ let warnedNonLoopback = false;
 
 /** Gate: loopback peers always pass (no config); non-loopback peers need
  *  ANNOTAKIT_API_KEY set AND a matching x-annotakit-key header. Returns an
- *  error RESPONSE already sent, or null when the request may proceed. */
+ *  error RESPONSE already sent, or null when the request may proceed.
+ *  Hardening C36 (H-G-01): loopback is checked FIRST — the documented
+ *  contract ("loopback always free") used to be violated whenever a key was
+ *  set, 401-ing every headerless localhost curl (SKILL §3's own loop). */
 function enforceApiAccess(req: IncomingMessage, res: ServerResponse): boolean {
   const key = process.env.ANNOTAKIT_API_KEY;
+  if (isLoopbackPeer(req)) return true;
   if (key) {
     const provided = req.headers['x-annotakit-key'];
     const ok = provided === key || (Array.isArray(provided) && provided.includes(key));
@@ -275,7 +287,6 @@ function enforceApiAccess(req: IncomingMessage, res: ServerResponse): boolean {
     }
     return true;
   }
-  if (isLoopbackPeer(req)) return true;
   if (!warnedNonLoopback) {
     warnedNonLoopback = true;
     console.warn(
@@ -353,9 +364,16 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
       if (oversize) return; // already rejected
       if (!chunks.length) return resolve({});
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch {
-        reject(Object.assign(new Error('invalid JSON body'), { status: 400 }));
+        const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        // Hardening C11 (H-A-04): `null`/arrays/scalars used to resolve
+        // through and TypeError two handlers later (500). A body must be a
+        // JSON OBJECT — {} stays valid (partial PATCH).
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('body must be a JSON object');
+        }
+        resolve(parsed as Record<string, unknown>);
+      } catch (err) {
+        reject(Object.assign(new Error(`invalid JSON body (${err instanceof Error ? err.message : String(err)})`), { status: 400 }));
       }
     });
     req.on('error', reject);
@@ -438,6 +456,38 @@ function normalizeComment(c: Comment): Comment {
   return c;
 }
 
+/** Deep target validation shared by POST and PATCH (Hardening C02 / H-A-02):
+ *  the dogfood-#2 incident added this to POST only — a full-document PATCH
+ *  could still store a malformed target that 500s every later digest/export
+ *  and permanently stalls the GH mirror (same crash, different door). */
+function validateTargetShape(target: unknown, label = 'target'): void {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) {
+    throw Object.assign(new Error(`${label} is required — ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  const t = target as ThreadInput['target'];
+  if (t.kind !== 'pin' && t.kind !== 'region') {
+    throw Object.assign(new Error(`${label}.kind must be "pin" or "region" (got ${JSON.stringify(t.kind)}) — ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  const selector = t.selector;
+  if (!selector || typeof selector !== 'object' || Array.isArray(selector)) {
+    throw Object.assign(new Error(`${label}.selector must be an object {cssSelector?, textQuote?, fragment?} (got ${typeof selector}) — ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  const bbox = t.bbox;
+  const isBBox = (b: unknown): b is { x: number; y: number; w: number; h: number } =>
+    !!b && typeof b === 'object' &&
+    ['x', 'y', 'w', 'h'].every((k) => typeof (b as Record<string, unknown>)[k] === 'number');
+  if (!isBBox(bbox)) {
+    throw Object.assign(new Error(`${label}.bbox must be {x,y,w,h} numbers (got ${JSON.stringify(bbox)?.slice(0, 80)}) — ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  const context = t.context;
+  if (!context || typeof context !== 'object' || Array.isArray(context) || typeof (context as unknown as Record<string, unknown>).tag !== 'string') {
+    throw Object.assign(new Error(`${label}.context must be an object with a string "tag" (got ${typeof context}) — ${TARGET_SHAPE_HINT}`), { status: 400 });
+  }
+  if (t.captureViewportWidth != null && typeof t.captureViewportWidth !== 'number') {
+    throw Object.assign(new Error(`${label}.captureViewportWidth must be a number when provided`), { status: 400 });
+  }
+}
+
 /** Validate a ThreadInput enough to store it — DEEP target validation
  *  (dogfood #2: a flat/legacy target passed 201, then the GH mirror crashed
  *  5 retries later three layers away; 400 at the door instead). */
@@ -446,35 +496,13 @@ function validateThreadInput(body: Record<string, unknown>): ThreadInput {
   const target = body.target as ThreadInput['target'] | undefined;
   const comments = Array.isArray(body.comments) ? (body.comments as Comment[]) : [];
   if (!storyId) throw Object.assign(new Error('storyId is required'), { status: 400 });
-  if (!target || typeof target !== 'object' || Array.isArray(target)) {
-    throw Object.assign(new Error(`target is required — ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  if (target.kind !== 'pin' && target.kind !== 'region') {
-    throw Object.assign(new Error(`target.kind must be "pin" or "region" (got ${JSON.stringify(target.kind)}) — ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  const selector = target.selector;
-  if (!selector || typeof selector !== 'object' || Array.isArray(selector)) {
-    throw Object.assign(new Error(`target.selector must be an object {cssSelector?, textQuote?, fragment?} (got ${typeof selector}) — ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  const bbox = target.bbox;
-  const isBBox = (b: unknown): b is { x: number; y: number; w: number; h: number } =>
-    !!b && typeof b === 'object' &&
-    ['x', 'y', 'w', 'h'].every((k) => typeof (b as Record<string, unknown>)[k] === 'number');
-  if (!isBBox(bbox)) {
-    throw Object.assign(new Error(`target.bbox must be {x,y,w,h} numbers (got ${JSON.stringify(bbox)?.slice(0, 80)}) — ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  const context = target.context;
-  if (!context || typeof context !== 'object' || Array.isArray(context) || typeof (context as unknown as Record<string, unknown>).tag !== 'string') {
-    throw Object.assign(new Error(`target.context must be an object with a string "tag" (got ${typeof context}) — ${TARGET_SHAPE_HINT}`), { status: 400 });
-  }
-  if (target.captureViewportWidth != null && typeof target.captureViewportWidth !== 'number') {
-    throw Object.assign(new Error('target.captureViewportWidth must be a number when provided'), { status: 400 });
-  }
+  validateTargetShape(target);
   if (comments.length === 0) {
     throw Object.assign(new Error('at least one comment is required'), { status: 400 });
   }
   for (const c of comments) {
     if (!c.body?.trim()) throw Object.assign(new Error('comment body is required'), { status: 400 });
+    if (typeof c.body !== 'string') throw Object.assign(new Error('comment body must be a string'), { status: 400 });
     if (c.body.length > MAX_BODY_CHARS) {
       throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars — the full body stays in the store/json export; keep evidence links instead of pasting whole logs)`), { status: 413 });
     }
@@ -648,7 +676,9 @@ async function handleApi(
     if (method === 'GET') {
       const threads = await store.listThreads({
         storyId: url.searchParams.get('storyId') ?? undefined,
-        status: url.searchParams.get('status') ?? undefined,
+        // H-A-12: the filter is case-exact in sqlite — normalize so
+        // ?status=Open (an easy agent typo) matches like the PATCH normalizer
+        status: url.searchParams.get('status')?.toLowerCase() || undefined,
       });
       // sibling (not inside Thread payloads): which threads carry plan-b
       // snapshots — panels link to the viewable evidence without bloating lists
@@ -689,7 +719,15 @@ async function handleApi(
 
   const threadMatch = p.match(new RegExp(`^${API_BASE}/threads/([^/]+)(/comments)?$`));
   if (threadMatch) {
-    const id = decodeURIComponent(threadMatch[1] ?? '');
+    // Hardening C11 (H-A-04): a %-malformed id (`%`, `%zz`) used to throw
+    // URIError past the handler → 500. Malformed encoding is a client bug:
+    // 400 with the raw segment quoted.
+    let id: string;
+    try {
+      id = decodeURIComponent(threadMatch[1] ?? '');
+    } catch {
+      throw Object.assign(new Error(`thread id is not valid percent-encoding (${JSON.stringify(threadMatch[1] ?? '')})`), { status: 400 });
+    }
     const isComments = Boolean(threadMatch[2]);
 
     if (method === 'DELETE' && !isComments) {
@@ -712,12 +750,40 @@ async function handleApi(
     }
     if (method === 'PATCH' && !isComments) {
       const body = await readBody(req);
-      if (typeof (body as Record<string, unknown>).id === 'string' && (body as Record<string, unknown>).id !== id) {
+      const bodyId = (body as Record<string, unknown>).id;
+      // C11 (H-A-04): array/object ids passed the old typeof-string-only
+      // mismatch check and TypeError'd in sqlite's bind → 500.
+      if (bodyId !== undefined && typeof bodyId !== 'string') {
+        throw Object.assign(new Error('body.id must be a string when provided'), { status: 400 });
+      }
+      if (typeof bodyId === 'string' && bodyId !== id) {
         throw Object.assign(new Error('id mismatch between URL and body'), { status: 400 });
       }
       const prev = await store.getThread(id);
       if (!prev) return notFound(res, THREAD_404_HINT), true;
       const full = buildPatchCandidate(prev, body);
+      // Hardening C02 (H-A-02): the deep target validation POST has had since
+      // dogfood #2 — a full-doc PATCH could store a malformed target that
+      // 500s every later digest/export and stalls the GH mirror forever.
+      if ('target' in body) validateTargetShape(full.target);
+      // C11 (H-A-05): a full-doc PATCH without a status field used to bind
+      // undefined into sqlite (TypeError → 500). The server copy's status is
+      // the honest default — partial-PATCH semantics for the missing field.
+      if (full.status === undefined) full.status = prev.status;
+      // C12 (H-A-06): POST re-hashes comment ids (A8 — client ids like "c1"
+      // collide across machines under union-merge); PATCH used to trust them
+      // verbatim, reopening the exact collision the re-hash exists to stop.
+      // Only comments NEW to this thread are re-keyed; stored ids stay (they
+      // are union keys for merges and ghId stamps live beside them).
+      const prevIds = new Set(prev.comments.map((c) => c.id));
+      for (const c of full.comments) {
+        // C11 (H-A-04): `comments: [null]` used to TypeError wherever the
+        // first property access happened (500). Non-object entries are a 400.
+        if (!c || typeof c !== 'object' || Array.isArray(c)) {
+          throw Object.assign(new Error('comments entries must be objects'), { status: 400 });
+        }
+        if (!prevIds.has(c.id)) normalizeComment(c);
+      }
       // status enum (Track B P1): "closed"/"RESOLVED" used to be stored
       // verbatim — resolvedAt never stamped, digest counted the thread OPEN,
       // nothing told the agent. Case-normalize; only validate when the client
@@ -752,8 +818,12 @@ async function handleApi(
       }
       // SERVER-OWNED mirror fields: a client PATCHing a stale snapshot would
       // otherwise wipe thread.gh → the next sync would create a DUPLICATE issue,
-      // and pulled comments would lose their dedupe ids. Always keep ours.
+      // and pulled comments would lose their dedupe ids. Always keep ours —
+      // and when the server has NO mapping, a client-supplied gh block is
+      // dropped entirely (C31/H-E-03: mirror fields are engine-owned; a
+      // crafted PATCH must not mint t.gh.url links the panel renders).
       if (prev.gh) full.gh = prev.gh;
+      else delete full.gh;
       // UNION comments by id: a stale snapshot must not DROP newer comments
       // (pull-imported replies, concurrent user replies). Body wins for ids it
       // knows; anything only the server has is preserved.
@@ -830,7 +900,13 @@ async function handleApi(
    * it, zero deps) + optionally a human-viewable render via ?format=html) ---- */
   const snapMatch = p.match(new RegExp(`^${API_BASE}/threads/([^/]+)/snapshot$`));
   if (snapMatch) {
-    const id = decodeURIComponent(snapMatch[1] ?? '');
+    let snapId: string;
+    try {
+      snapId = decodeURIComponent(snapMatch[1] ?? '');
+    } catch {
+      throw Object.assign(new Error(`thread id is not valid percent-encoding (${JSON.stringify(snapMatch[1] ?? '')})`), { status: 400 });
+    }
+    const id = snapId;
 
     if (method === 'PUT' || method === 'POST') {
       const thread = await store.getThread(id);
@@ -883,7 +959,7 @@ async function handleApi(
   /* export ------------------------------------------------------------------ */
   if (p === `${API_BASE}/export` && method === 'GET') {
     const storyId = url.searchParams.get('storyId') ?? undefined;
-    const status = url.searchParams.get('status') ?? undefined;
+    const status = url.searchParams.get('status')?.toLowerCase() || undefined;
     const threads = await store.listThreads({ storyId, status });
     const stories = groupByStory(threads, origin);
     const snapshotIds = await store.listSnapshotIds();
@@ -1070,5 +1146,8 @@ export function devServerHook(app: ServerAppLike, options?: { configDir?: string
 
 /** v0.6.4: expose the digest renderer for scripts/heal-mirrors.mjs (the
  *  backfill twin of the engine's pull-path mirror self-heal) so tooling
- *  rebuilds EXACTLY the body the engine would push — never a drifted format. */
+ *  rebuilds EXACTLY the body the engine would push — never a drifted format.
+ *  v0.6.5: the legacy reconstructions too (exact-match heal contract) — the
+ *  regression suites build byte-exact pre-v0.6.3 mirrors through these. */
 export { renderDigest } from './digest';
+export { decideMirrorHeal, legacyMirrorTitle, legacyServerBodyCandidates } from '../shared/legacyMirror';

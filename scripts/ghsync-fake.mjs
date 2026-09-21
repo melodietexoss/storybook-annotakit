@@ -34,11 +34,13 @@
 
 import http from 'node:http';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 const DIST = new URL('../dist/server.cjs', import.meta.url).pathname;
+const serverExports = createRequire(import.meta.url)(DIST); // renderDigest + v0.6.5 legacy heal builders
 const GH_PORT = 48171;
 const API_PORT = 48172;
 
@@ -57,7 +59,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, ms, label) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
-    if (fn()) return true;
+    // await the predicate: an ASYNC fn returns a Promise (always truthy) —
+    // the old `if (fn())` returned instantly and never actually waited
+    if (await fn()) return true;
     await sleep(60);
   }
   return false;
@@ -462,34 +466,20 @@ async function main() {
   const healThread = (await j('GET', '/annotakit/api/threads')).body.threads.find((t) => t.storyId.includes('case-21'));
   const healIssue = gh.issues.find((i) => i.title.includes('Case 21'));
   check('mirror created verbatim by the current engine', healIssue.body.includes('(verbatim):**') && healIssue.body.includes('- spacing rhythm feels off at 360px'), healIssue.body.slice(0, 80));
-  // simulate a pre-v0.6.3 engine having written this mirror: 60-char title,
-  // lean single-line clipped body, NO verbatim marker (issue #16's report)
+  // simulate a pre-v0.6.3 engine having written this mirror — v0.6.5 style:
+  // the body is the BYTE-EXACT legacy render (the heal contract is exact
+  // reconstruction, not heuristics), built with the engine's own frozen
+  // builders so the test can never drift from the format it validates.
+  const origin = A; // the engine learns the origin from the Host header (127.0.0.1 here)
+  const legacyBodies = serverExports.legacyServerBodyCandidates(healThread, { origin, relPath: (p) => p });
+  // candidates: [open-A (≤v0.6.0), open-B (v0.6.1–0.6.2), resolved-A, resolved-B]
+  const oldBody = legacyBodies[1];
+  const oldTitle = serverExports.legacyMirrorTitle(healThread);
+  check('setup: legacy builder produced a stamped, marker-free body', oldBody.includes(`- thread id: ${healThread.id}`) && !oldBody.includes('(verbatim):**') && oldTitle.length <= 100, oldTitle);
   const headline = (s) => s.replace(/\s+/g, ' ').trim();
   const wantTitle = `[review] Case 21 — #${healThread.number} ${headline(longBody).slice(0, 100)}`.slice(0, 160);
-  const oldTitle = `[review] Case 21 — #${healThread.number} ${headline(longBody).slice(0, 60)}`.slice(0, 160);
   healIssue.title = oldTitle;
-  healIssue.body = [
-    '# UI review — Test/Comp21',
-    '',
-    'storybook: http://localhost:4000',
-    '',
-    `### #${healThread.number} OPEN — ${headline(longBody).slice(0, 80)}…`,
-    '',
-    '- story: Test/Comp21 / Case 21 (src/Comp21.stories.tsx)',
-    `- thread id: ${healThread.id}`,
-    '- component: Comp21',
-    '- jsx: src/Comp21.tsx:12',
-    '- element: <button "Click">',
-    '- selector: button',
-    '',
-    `  - reviewer 09-21 13:00: ${headline(longBody).slice(0, 200)}…`,
-    '',
-    '---',
-    '',
-    'Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread — close this issue (the review thread mirrors it automatically).',
-    '',
-    '<!-- annotakit -->',
-  ].join('\n');
+  healIssue.body = oldBody;
   const verbatimSync = await j('POST', '/annotakit/api/sync');
   check('sync reports exactly ONE healed mirror', (verbatimSync.body.healed ?? 0) === 1, JSON.stringify(verbatimSync.body));
   check('title healed to the 100-char headline budget', healIssue.title === wantTitle, healIssue.title);
@@ -503,6 +493,57 @@ async function main() {
   healIssue.body = 'rewritten by a human — no annotakit stamps at all';
   const verbatimSync3 = await j('POST', '/annotakit/api/sync');
   check('human-edited mirror NEVER touched', (verbatimSync3.body.healed ?? 0) === 0 && healIssue.title === 'renamed by a human' && healIssue.body === 'rewritten by a human — no annotakit stamps at all', `healed=${verbatimSync3.body.healed}`);
+  // v0.6.5 negative controls (H-B-01/H-B-08 — the heuristics these replace
+  // used to destroy exactly these): a human edit of a REAL old mirror (one
+  // appended line) and a human-truncated title (still a strict prefix of the
+  // wanted title — passed the old prefix test!) must BOTH stay untouched.
+  healIssue.title = oldTitle;
+  healIssue.body = oldBody + '\nhuman: I appended a note to this mirror';
+  const verbatimSync4 = await j('POST', '/annotakit/api/sync');
+  // the TITLE is still byte-exact legacy → it heals (nothing human there);
+  // the BODY carries the human append → NEVER overwritten.
+  check('human APPEND to a legacy mirror body NEVER overwritten', healIssue.body.includes('human: I appended a note') && !healIssue.body.includes('(verbatim):**'), `healed=${verbatimSync4.body.healed} body=${healIssue.body.slice(-60)}`);
+  // isolate the TITLE: body keeps a human append (non-matching), title is a
+  // strict prefix of the wanted title (the exact input the v0.6.4 heuristic
+  // destroyed) — NEITHER field may heal.
+  healIssue.body = oldBody + '\nhuman: still edited';
+  healIssue.title = oldTitle.slice(0, 40); // strict prefix — the v0.6.4 trap
+  const verbatimSync5 = await j('POST', '/annotakit/api/sync');
+  check('human-truncated (strict-prefix) title NEVER overwritten', (verbatimSync5.body.healed ?? 0) === 0 && healIssue.title === oldTitle.slice(0, 40), `healed=${verbatimSync5.body.healed} title=${healIssue.title}`);
+
+  // == 17. v0.6.5 hardening C14 (H-H-06): create-crash orphan adoption ==
+  // A labeled issue EXISTS whose body stamp names a thread id that is about
+  // to be created locally (the create push "failed" but actually landed, or
+  // the process died between createIssue and the mapping stamp). The very
+  // FIRST push for that thread must ADOPT the orphan instead of minting a
+  // duplicate — including via the QUEUE path (drainQueue → syncThread).
+  console.log('== 17. C14 orphan adoption: stamped orphan adopted, no duplicate ==');
+  const c14Id = 'c14crash';
+  const c14Number = 9099;
+  const c14Input = threadInput(22);
+  c14Input.id = c14Id; // client-chosen id — the stamp is knowable in advance
+  // pre-craft the orphan on the remote (what GitHub holds after the crash)
+  const c14OrphanBody = `# UI review — Test/Comp22
+
+- thread id: ${c14Id}
+- element: <button "Click">`;
+  gh.issues.push({ number: c14Number, state: 'open', title: `[review] Case 22 orphan`, body: c14OrphanBody, labels: ['annotakit'], comments: [], updated_at: new Date().toISOString(), closed_at: null, closed_by: null, edits: 0 });
+  const c14Create = await j('POST', '/annotakit/api/threads', c14Input);
+  check('C14: thread created → 201', c14Create.status === 201);
+  // the queue tick (~700ms) pushes the new thread — it must ADOPT the orphan
+  await waitFor(async () => {
+    const all = (await j('GET', '/annotakit/api/threads')).body.threads;
+    const t = all.find((x) => x.id === c14Id);
+    return Boolean(t?.gh && t.gh.issue === c14Number);
+  }, 25000, 'orphan adopted (mapping points at the stamped issue)');
+  const c14Thread = (await j('GET', '/annotakit/api/threads')).body.threads.find((t) => t.id === c14Id);
+  const c14Stamped = gh.issues.filter((i) => (i.body ?? '').includes(`- thread id: ${c14Id}`));
+  const c14Status = await j('GET', '/annotakit/api/sync');
+  check('C14: orphan ADOPTED (thread mapped to the stamped issue)', c14Thread?.gh?.issue === c14Number, JSON.stringify(c14Thread?.gh));
+  check('C14: NO duplicate issue minted', c14Stamped.length === 1, `stamped=${c14Stamped.length} numbers=${JSON.stringify(c14Stamped.map((i) => i.number))}`);
+
+  api.close();
+  console.log(`\n${passed} passed, ${failed} failed (in-process)`);
 
   api.close();
   console.log(`\n${passed} passed, ${failed} failed (in-process)`);

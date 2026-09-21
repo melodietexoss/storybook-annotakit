@@ -226,8 +226,18 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
   }, []);
   useEffect(() => () => { if (hintTimer.current) window.clearTimeout(hintTimer.current); }, []);
   /** v0.6.1: localStorage write failures (quota/privacy) must surface in the
-   *  canvas — a pin that will not survive reload is a lie without this. */
+   *  canvas — a pin that will not survive reload is a lie without this.
+   *  Hardening C28 (H-D-04): the ✕ records WHICH error was acknowledged —
+   *  the 2s status poll used to resurrect a dismissed toast forever; a NEW
+   *  (different) error still shows. */
   const [storageError, setStorageError] = useState<string | null>(null);
+  const dismissedStorageError = useRef<string | null>(null);
+  /** C27 (H-D-03): the two-stage Esc draft guard used to live ONLY in the
+   *  composer textarea's React handler — one canvas click (blur) + Esc
+   *  discarded a non-empty draft in one shot via the document branch. The
+   *  draft text is mirrored here so the DOCUMENT Esc path can guard too. */
+  const draftBodyRef = useRef('');
+  const discardArmedDocRef = useRef(false);
   const [tick, setTick] = useState(0);
   const [hoverBox, setHoverBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [dragRect, setDragRect] = useState<{ x: number; y: number; h: number; w: number } | null>(null);
@@ -258,8 +268,23 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
     return () => {
       mountedRef.current = false;
       if (retryTimer.current) clearTimeout(retryTimer.current);
+      // Hardening C10 (H-D-01): SB keys the story subtree by storyContext.id —
+      // every story switch REMOUNTS this layer with fresh state while
+      // document.body persists. A layer that unmounted while armed left the
+      // crosshair class on the body for every subsequent story (the sticker
+      // bug class, third life — a body CLASS, which is why the DOM sweeps
+      // missed it). The class dies with the layer, unconditionally.
+      document.body.classList.remove('annota-cursor');
     };
   }, []);
+
+  // C27: reset the mirrored draft state whenever the composer closes.
+  useEffect(() => {
+    if (!composer) {
+      draftBodyRef.current = '';
+      discardArmedDocRef.current = false;
+    }
+  }, [composer]);
 
   /* ---- mode-aware data ops: dev REST client, or the static localStorage
    *  store when the build is served without a dev server. dataRef (not state)
@@ -438,7 +463,12 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
     if (apiOk === false) return;
     const root = storyRoot();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const obs = new MutationObserver(() => {
+    const obs = new MutationObserver((records) => {
+      // H-D-14: the addon's own overlay subtree (tooltips, hover boxes,
+      // popups) lives INSIDE the observed root — its churn used to trigger a
+      // pointless re-resolve pass on every hover. Skip mutations that are
+      // entirely overlay-internal.
+      if (records.length && records.every((r) => (r.target as Element).closest?.('[data-annota-overlay]'))) return;
       clearTimeout(timer);
       timer = setTimeout(resolveAll, 350);
     });
@@ -458,49 +488,6 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
       window.removeEventListener('resize', onReflow);
     };
   }, [apiOk, resolveAll]);
-
-  /* ---- channel: manager commands (toolbar buttons — v0.5.0 the ONLY entry
-   *  point besides hotkeys; the in-canvas launcher is GONE) ---- */
-  useEffect(() => {
-    const ch = sbChannel();
-    const onFocus = (threadId: string) => {
-      focusThread(threadId);
-    };
-    const onToggle = (state: unknown) => {
-      const next = typeof state === 'boolean' ? state : !visible;
-      setVisible(next);
-    };
-    const onCommand = (cmd: UiCommand | undefined) => {
-      if (!cmd?.command) return;
-      if (cmd.command === 'pin' || cmd.command === 'region') {
-        // v0.6.1 (Track C P1-4): a thread popup used to BLOCK the pin command
-        // silently — the reviewer clicked Pin, the button/hint looked armed,
-        // then every canvas click did NOTHING. enterMode already closes the
-        // popup (setActiveThread(null)) — no reason to refuse the intent.
-        // A COMPOSER with a draft still guards (never silently eat text).
-        if (!composer) {
-          const m = cmd.command;
-          enterMode(mode === m ? 'idle' : m);
-        } else {
-          showHint('Submit or cancel the open comment first (Esc)');
-        }
-      } else if (cmd.command === 'drawer') {
-        setDrawerOpen((d) => !d);
-      } else if (cmd.command === 'layer') {
-        setVisible((v) => !v);
-      } else if (cmd.command === 'help') {
-        setHelpOpen((h) => !h);
-      }
-    };
-    ch.on(FOCUS_THREAD, onFocus);
-    ch.on(TOGGLE_LAYER, onToggle);
-    ch.on(UI_COMMAND, onCommand);
-    return () => {
-      ch.removeListener(FOCUS_THREAD, onFocus);
-      ch.removeListener(TOGGLE_LAYER, onToggle);
-      ch.removeListener(UI_COMMAND, onCommand);
-    };
-  });
 
   const emitLayerState = useCallback((v: boolean) => {
     try {
@@ -568,6 +555,63 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
     dragStart.current = null;
     document.body.classList.remove('annota-cursor');
   }, []);
+
+  /* ---- channel: manager commands (toolbar buttons — v0.5.0 the ONLY entry
+   *  point besides hotkeys; the in-canvas launcher is GONE).
+   *  NOTE: this effect sits AFTER focusThread/enterMode are declared — the
+   *  H-D-07 deps array evaluates at render time (the old no-deps version
+   *  deferred everything to the effect body, hiding the ordering). ---- */
+  const channelEffect = () => {
+    const ch = sbChannel();
+    const onFocus = (threadId: string) => {
+      focusThread(threadId);
+    };
+    const onToggle = (state: unknown) => {
+      const next = typeof state === 'boolean' ? state : !visible;
+      setVisible(next);
+    };
+    const onCommand = (cmd: UiCommand | undefined) => {
+      if (!cmd?.command) return;
+      if (cmd.command === 'pin' || cmd.command === 'region') {
+        // C26 (H-D-02): with the API down the composer can never render — the
+        // manager already disables its buttons, but channel commands must not
+        // arm an invisible capture mode that swallows story clicks.
+        if (apiOk === false) {
+          showHint('AnnotaKit is offline — pinning is unavailable (see the badge)');
+          return;
+        }
+        // v0.6.1 (Track C P1-4): a thread popup used to BLOCK the pin command
+        // silently — the reviewer clicked Pin, the button/hint looked armed,
+        // then every canvas click did NOTHING. enterMode already closes the
+        // popup (setActiveThread(null)) — no reason to refuse the intent.
+        // A COMPOSER with a draft still guards (never silently eat text).
+        if (!composer) {
+          const m = cmd.command;
+          enterMode(mode === m ? 'idle' : m);
+        } else {
+          showHint('Submit or cancel the open comment first (Esc)');
+        }
+      } else if (cmd.command === 'drawer') {
+        setDrawerOpen((d) => !d);
+      } else if (cmd.command === 'layer') {
+        setVisible((v) => !v);
+      } else if (cmd.command === 'help') {
+        setHelpOpen((h) => !h);
+      }
+    };
+    ch.on(FOCUS_THREAD, onFocus);
+    ch.on(TOGGLE_LAYER, onToggle);
+    ch.on(UI_COMMAND, onCommand);
+    return () => {
+      ch.removeListener(FOCUS_THREAD, onFocus);
+      ch.removeListener(TOGGLE_LAYER, onToggle);
+      ch.removeListener(UI_COMMAND, onCommand);
+    };
+    // H-D-07 (deps live on the useEffect below): the 3 listeners used to be
+    // re-added on EVERY render (every scroll tick re-renders via setTick).
+  };
+  useEffect(channelEffect, [focusThread, visible, composer, mode, enterMode, apiOk]);
+
 
   useEffect(() => {
     if (mode === 'idle') return undefined;
@@ -677,17 +721,29 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
       }
       if (e.key.toLowerCase() === 'escape') {
         if (mode !== 'idle') exitMode();
-        else if (composer) setComposer(null);
+        else if (composer) {
+          // C27 (H-D-03): the document branch used to one-shot a non-empty
+          // draft whenever the textarea was unfocused — same two-stage guard
+          // as the composer's own handler, now on THIS path too.
+          if (draftBodyRef.current.trim() && !discardArmedDocRef.current) {
+            discardArmedDocRef.current = true;
+            showHint('Press Esc again to discard the draft');
+            return;
+          }
+          setComposer(null);
+        }
         else if (activeThread) setActiveThread(null);
         else if (drawerOpen) setDrawerOpen(false);
         else if (helpOpen) setHelpOpen(false);
         return;
       }
       if (altOf(hkPin)) {
-        if (!composer) enterMode(mode === 'pin' ? 'idle' : 'pin');
+        if (apiOk === false) showHint('AnnotaKit is offline — pinning is unavailable (see the badge)');
+        else if (!composer) enterMode(mode === 'pin' ? 'idle' : 'pin');
         else showHint('Submit or cancel the open comment first (Esc)');
       } else if (altOf(hkRegion)) {
-        if (!composer) enterMode(mode === 'region' ? 'idle' : 'region');
+        if (apiOk === false) showHint('AnnotaKit is offline — pinning is unavailable (see the badge)');
+        else if (!composer) enterMode(mode === 'region' ? 'idle' : 'region');
         else showHint('Submit or cancel the open comment first (Esc)');
       } else if (altOf(hkLayer)) {
         setVisible((v) => !v);
@@ -697,7 +753,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [mode, composer, activeThread, drawerOpen, helpOpen, enterMode, exitMode, hkPin, hkRegion, hkLayer, hkDrawer, hkHelp, hotkeys]);
+  }, [mode, composer, activeThread, drawerOpen, helpOpen, enterMode, exitMode, hkPin, hkRegion, hkLayer, hkDrawer, hkHelp, hotkeys, apiOk, showHint]);
 
   /* ---- mutations ---- */
   /** F2 fix: component source lines come from the esbuild-transformed module;
@@ -896,11 +952,18 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
       )}
 
       {/* localStorage write failure (quota/privacy) — feedback is NOT
-          persisting; say so in the canvas, not in a console (v0.6.1) */}
-      {staticMode && storageError && (
+          persisting; say so in the canvas, not in a console (v0.6.1).
+          C28: ✕ = acknowledged THIS error; a new/different error re-shows. */}
+      {staticMode && storageError && storageError !== dismissedStorageError.current && (
         <div className="annota-toast is-error" role="alert">
           ⚠ {storageError}
-          <button className="annota-btn is-small" onClick={() => setStorageError(null)}>
+          <button
+            className="annota-btn is-small"
+            onClick={() => {
+              dismissedStorageError.current = storageError;
+              setStorageError(null);
+            }}
+          >
             ✕
           </button>
         </div>
@@ -933,6 +996,10 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
           context={composer.target.context}
           onSubmit={submitThread}
           onCancel={() => setComposer(null)}
+          onDraftChange={(b) => {
+            draftBodyRef.current = b;
+            if (b.trim()) discardArmedDocRef.current = false;
+          }}
         />
       )}
 
@@ -1027,6 +1094,9 @@ function ComposerCard(props: {
   context: TargetContext;
   onSubmit: (body: string) => void;
   onCancel: () => void;
+  /** C27 (H-D-03): mirrors the draft into the layer so the DOCUMENT Esc
+   *  branch can run the same two-stage discard guard as this card's handler. */
+  onDraftChange?: (body: string) => void;
 }): React.ReactElement {
   const [body, setBody] = React.useState('');
   // v0.6.1 (Track C P2-8): Esc on a NON-EMPTY draft used to discard it
@@ -1076,6 +1146,7 @@ function ComposerCard(props: {
           onChange={(e) => {
             setDiscardArmed(false);
             setBody(e.target.value);
+            props.onDraftChange?.(e.target.value);
           }}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && body.trim()) {

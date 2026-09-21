@@ -20,6 +20,7 @@
  */
 
 import assert from 'node:assert';
+import { createRequire } from 'node:module';
 
 /* ------------------------------ browser shims ------------------------------ */
 
@@ -36,7 +37,13 @@ function makeLocalStorage() {
   };
 }
 
+const serverExports = createRequire(import.meta.url)('../dist/server.cjs'); // legacy heal builders (fixture tests)
+
 const storageShim = makeLocalStorage();
+/** Per-TAB storage (v0.6.5 leadership lease): survives reload(), cleared by
+ *  fresh() — a new scenario is a new tab. */
+const sessionShim = makeLocalStorage();
+globalThis.sessionStorage = sessionShim;
 let pageUrl = 'https://site.test/stories/index.html';
 let parentOverride = undefined; // undefined → self-parent (leader doc)
 
@@ -85,7 +92,11 @@ function makeFakeGH() {
     const method = (init.method ?? 'GET').toUpperCase();
     if (gh.failNext && (!gh.failNext.match || gh.failNext.match.test(path))) {
       const f = gh.failNext;
-      gh.failNext = null;
+      // count>1 = multi-shot (the create-crash adoption check adds a listing
+      // call before every create — tests that want the CREATE to fail must
+      // fail the listing too, or the one-shot gets eaten by the listing)
+      if (typeof f.count === 'number' && f.count > 1) f.count--;
+      else gh.failNext = null;
       return { ok: false, status: f.status, text: async () => f.body ?? '', json: async () => ({}), headers };
     }
     gh.calls.push({ method, path, query: u.search, body: init.body ? JSON.parse(init.body) : null }); if (process.env.GHDBG) console.error('[gh-transport]', method, path, init.body ? String(init.body).slice(0,80) : '');
@@ -93,10 +104,12 @@ function makeFakeGH() {
     if (!auth || !auth.includes('tok_')) {
       return { ok: false, status: 401, text: async () => 'bad token', json: async () => ({}), headers };
     }
-    // POST /repos/:repo/issues — create
+    // POST /repos/:repo/issues/:n/comments — reply (404 when the issue was
+    // deleted, matching real GitHub — the C07 unstick path depends on it)
     let m = path.match(/^\/repos\/(.+)\/issues\/(\d+)\/comments$/);
     if (m && method === 'POST') {
       const issue = gh.issues.get(Number(m[2]));
+      if (!issue) return { ok: false, status: 404, text: async () => 'Not Found', json: async () => ({}), headers };
       const body = JSON.parse(init.body);
       const comment = { id: gh.nextCommentId++, body: body.body, created_at: new Date().toISOString(), user: { login: 'storybook-annotakit' }, html_url: `https://github.com/fake/c/${gh.nextCommentId}` };
       issue.comments.push(comment);
@@ -196,14 +209,19 @@ async function fresh(baked) {
   ghc.__ghSetTransportForTests(gh.transport);
   bakedConfig = baked;
   storageShim.clear();
+  sessionShim.clear(); // a fresh scenario is a NEW TAB — new leadership identity
   gh.calls.length = 0;
   return ghc;
 }
 
 /** Simulate a full page RELOAD: module caches dropped, localStorage contents
- *  survive exactly as a browser would keep them. */
+ *  survive exactly as a browser would keep them — and sessionStorage (the
+ *  per-tab id behind the C08 leadership lease) survives too, so the reloaded
+ *  document re-claims its own predecessor's lease instead of waiting for the
+ *  TTL (the regression the reload-durability test caught). */
 async function reload(baked, { zeroBackoff = false } = {}) {
   const dump = storageShim._dump();
+  const sessionDump = sessionShim._dump();
   if (zeroBackoff) {
     const qk = 'annotakit:ghq:https://site.test/stories/';
     if (dump[qk]) {
@@ -216,6 +234,7 @@ async function reload(baked, { zeroBackoff = false } = {}) {
   }
   const ghc = await fresh(baked);
   for (const [k, v] of Object.entries(dump)) storageShim.setItem(k, v);
+  for (const [k, v] of Object.entries(sessionDump)) sessionShim.setItem(k, v);
   return ghc;
 }
 
@@ -305,7 +324,7 @@ let createdThread;
 /* 6 — durability: failed flush keeps the op; full reload lands it ONCE */
 {
   const ghc6 = await fresh(null); // no baked config → unconfigured… use explicit settings
-  gh.failNext = { match: /issues$/, status: 503, body: 'boom' };
+  gh.failNext = { match: /issues$/, status: 503, body: 'boom', count: 2 }; // listing (orphan check) + create
   // configure via settings (localStorage override), then create with failing transport
   const store = await ghc6.getGhLinkedStaticStore();
   store.gh?.saveSettings({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'] });
@@ -569,12 +588,14 @@ let createdThread;
   const store = await ghc15.getGhLinkedStaticStore();
   await store.create(threadInput('th_rec'));
   await sleep(120);
-  ok('401 attempt #1 made', calls401 === 1);
+  // v0.6.5: the create path runs the orphan-adoption LISTING first — a failed
+  // flush for an unmapped thread = listing (401, swallowed) + create (401)
+  ok('401 attempt #1 made (listing + create)', calls401 === 2, `calls=${calls401}`);
   const opBefore = queueOps(ghc15)[0];
   ok('op is backed off after 401', (opBefore?.notBefore ?? 0) > Date.now() && (opBefore?.attempts ?? 0) >= 1);
   store.gh?.saveSettings({ token: 'tok_AAA' }); // the user's recovery action: Save
   await sleep(150);
-  ok('save re-attempts exactly once (backoff cleared)', calls401 === 2);
+  ok('save re-attempts exactly once (backoff cleared)', calls401 === 4, `calls=${calls401}`);
   const opsAfter = queueOps(ghc15);
   ok('op still queued on continued 401 (keep semantics)', opsAfter.some((o) => o.threadId === 'th_rec' && !o.parked));
 }
@@ -595,10 +616,10 @@ let createdThread;
   const ops = queueOps(ghc16);
   ok('parked op kept in the outbox doc', ops.length === 1 && ops[0].parked === true);
   await sleep(200);
-  ok('no retry after parking (no spin)', calls422 === 1);
+  ok('no retry after parking (no spin)', calls422 === 2, `calls=${calls422}`); // listing + create, then parked
   store.gh?.saveSettings({ token: 'tok_AAA' });
   await sleep(150);
-  ok('config write does not resurrect parked op', calls422 === 1 && store.gh?.status()?.parked === 1);
+  ok('config write does not resurrect parked op', calls422 === 2 && store.gh?.status()?.parked === 1, `calls=${calls422}`);
 }
 
 /* 17 — outbox quota: a queue that CANNOT persist is a silent mirror gap —
@@ -667,30 +688,22 @@ let createdThread;
   const own = store.list().find((x) => x.id === 'th_heal');
   const issue = gh.issues.get(own?.gh?.issue ?? 0);
   ok('setup: current engine wrote the verbatim mirror', Boolean(issue?.body.includes('(verbatim):**') && issue?.body.includes('- the label hierarchy competes with the value')));
-  // simulate the pre-v0.6.3 client having written this mirror (issue #16)
+  // simulate the pre-v0.6.3 client having written this mirror — v0.6.5: the
+  // body is the BYTE-EXACT legacy render built by the engine's own frozen
+  // builders (the exact-match heal contract — heuristics are gone).
+  const legacyBodies = ghc19.legacyClientBodyCandidates(own, {
+    origin: 'https://site.test/stories/',
+    repo: 'acme/web',
+    labels: ['annotakit'],
+    sentinel: '<!-- annotakit -->',
+  });
+  const oldBody = legacyBodies[1]; // [open-A, open-B, resolved-A, resolved-B]
+  const oldTitle = ghc19.legacyMirrorTitle(own);
+  ok('setup: legacy builder produced a stamped, marker-free body', oldBody.includes('- thread id: th_heal') && !oldBody.includes('(verbatim):**') && oldTitle.length <= 100, oldTitle);
   const headline = (s) => s.replace(/\s+/g, ' ').trim();
   const wantTitle = `[review] primary — #${own.number} ${headline(fullBody).slice(0, 100)}`.slice(0, 160);
-  const oldTitle = `[review] primary — #${own.number} ${headline(fullBody).slice(0, 60)}`.slice(0, 160);
   issue.title = oldTitle;
-  issue.body = [
-    '# UI review — Button',
-    '',
-    'storybook (static deployment): https://site.test/stories/',
-    'mirror: acme/web · labels: annotakit · client-side publish',
-    '',
-    'open: https://site.test/stories/?path=/story/s1',
-    '',
-    `### #${own.number} OPEN — ${headline(fullBody).slice(0, 80)}…`,
-    '',
-    '- story: Button/primary',
-    '- thread id: th_heal',
-    '',
-    `  - reviewer 09-21 13:00: ${headline(fullBody).slice(0, 200)}…`,
-    '',
-    '---',
-    '',
-    '<!-- annotakit -->',
-  ].join('\n');
+  issue.body = oldBody;
   await store.gh?.syncNow(); // flush (empty) + pull → heal
   ok('title healed to the 100-char headline budget', issue.title === wantTitle, issue.title);
   ok('body healed verbatim (paragraphs + marker)', Boolean(issue.body.includes('(verbatim):**') && issue.body.includes('Second paragraph with structure:') && issue.body.includes('- spacing rhythm feels off at 360px')), issue.body.slice(0, 100));
@@ -702,6 +715,116 @@ let createdThread;
   issue.body = 'rewritten by a human — no annotakit stamps at all';
   await store.gh?.syncNow();
   ok('human-edited mirror NEVER touched', issue.title === 'renamed by a human' && issue.body === 'rewritten by a human — no annotakit stamps at all');
+  // v0.6.5 negative controls (H-B-01/H-B-08): a human APPEND to a real legacy
+  // mirror and a human-truncated strict-prefix title must both stay untouched
+  // (the v0.6.4 heuristics destroyed exactly these).
+  issue.title = oldTitle;
+  issue.body = oldBody + '\nhuman: I appended a note to this mirror';
+  await store.gh?.syncNow();
+  ok('human APPEND to a legacy mirror NEVER overwritten', issue.body.includes('human: I appended a note'), issue.body.slice(-60));
+  issue.body = oldBody;
+  issue.title = oldTitle.slice(0, 40); // strict prefix — the v0.6.4 trap
+  await store.gh?.syncNow();
+  ok('human-truncated (strict-prefix) title NEVER overwritten', issue.title === oldTitle.slice(0, 40), issue.title);
+}
+
+/* 20 — v0.6.5 hardening C06 (H-C-02): a 422-parked op is no longer a dead
+ * end — a NEW mutation on that thread unparks and retries once (a fresh 422
+ * re-parks with the new error; the periodic sweep never unparks). */
+{
+  const ghc20 = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'], pollMs: 600_000 });
+  const store = await ghc20.getGhLinkedStaticStore();
+  await store.create(threadInput('th_park', 'parked body'));
+  await until(() => queueOps(ghc20).length === 0, 'mirror created');
+  const own = store.list().find((x) => x.id === 'th_park');
+  const issue = gh.issues.get(own?.gh?.issue ?? 0);
+  // force a 422 on the next comment push (body rejection)
+  gh.failNext = { match: /\/comments$/, status: 422, body: 'body is invalid' };
+  await store.addComment('th_park', 'a reply GitHub will reject once', 'reviewer');
+  await until(() => queueOps(ghc20).some((o) => o.parked), 'op parked after 422');
+  const st1 = store.gh?.status();
+  ok('C06: op parked with a named error', (st1?.parked ?? 0) === 1 && Boolean(st1?.lastError?.includes('parked')), st1?.lastError?.slice(0, 60));
+  // the remedy: NEW content on the thread → enqueue unparks (content changed,
+  // the rejection may not recur) → the retry succeeds
+  await store.addComment('th_park', 'the corrected reply', 'reviewer');
+  await until(() => queueOps(ghc20).length === 0, 'unparked ops flushed');
+  const issue2 = gh.issues.get(issue.number);
+  ok('C06: unparked retry landed on GitHub', issue2.comments.some((c) => c.body.includes('a reply GitHub will reject once')) && issue2.comments.some((c) => c.body.includes('the corrected reply')));
+  ok('C06: no parked ops remain', (store.gh?.status().parked ?? 1) === 0);
+}
+
+/* 21 — v0.6.5 hardening C07 (H-C-03): the mirrored issue deleted on GitHub
+ * while a reply is queued → the op 404s → verify-with-get → mapping reset via
+ * the engine door + system note → a FRESH issue is created exactly once (no
+ * permanent stall; parity with the server engine's pull-side 404 heal). */
+{
+  const ghc21 = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'], pollMs: 600_000 });
+  const store = await ghc21.getGhLinkedStaticStore();
+  await store.create(threadInput('th_unstick', 'will lose its issue'));
+  await until(() => queueOps(ghc21).length === 0, 'mirror created');
+  const own = store.list().find((x) => x.id === 'th_unstick');
+  const n1 = own?.gh?.issue ?? 0;
+  console.error(`[dbg] n1=${n1} own=${JSON.stringify({ title: own?.story?.title, c0: own?.comments?.[0]?.body })}`);
+  gh.issues.delete(n1); // deleted remotely — pushes will 404, gets 404
+  await store.addComment('th_unstick', 'a reply with nowhere to land', 'reviewer');
+  await until(() => {
+    const t = store.list().find((x) => x.id === 'th_unstick');
+    return t && t.gh && t.gh.issue !== n1 && queueOps(ghc21).length === 0;
+  }, 'mapping reset + fresh issue created');
+  const after = store.list().find((x) => x.id === 'th_unstick');
+  ok('C07: mapping reset to a FRESH issue', after?.gh?.issue !== n1 && after?.gh?.issue !== undefined, JSON.stringify(after?.gh));
+  ok('C07: system note explains the re-create', after?.comments.some((c) => c.body.includes('deleted remotely')), after?.comments.map((c) => c.body).join(' | ').slice(0, 120));
+  const freshIssue = gh.issues.get(after?.gh?.issue ?? 0);
+  ok('C07: reply landed in the fresh issue body (no permanent stall)', Boolean(freshIssue?.body.includes('a reply with nowhere to land')), (freshIssue?.body ?? '').slice(0, 100));
+  // NOTE: an earlier test (remote-404 mapping reset) already used the id
+  // 'th_unstick' with a leftover issue in this SHARED fake — this scenario uses
+  // its own id so the count below is meaningful.
+  const stampedIssues = [...gh.issues.values()].filter((i) => (i.body ?? '').includes('- thread id: th_unstick'));
+  ok('C07: exactly one live issue for the thread', stampedIssues.length === 1);
+}
+
+/* 22 — v0.6.5 wave-5 (C34, NEW-1/NEW-2): HISTORY-PINNED fixture tests. The
+ * heal tests above build the "remote" with the SAME builder they validate —
+ * self-referential, they passed while the real formats were wrong (the date
+ * regex matched MM-DD instead of YYYY-MM-DD, and the client footer carried a
+ * "Storybook" the historical client never wrote). These fixtures are LITERALS
+ * derived from the actual v0.5.3–v0.6.2 renders (verified against git history
+ * v0.6.2: ghClient.ts:435-457 + staticStore.ts:318-343 + digest.ts:106/148):
+ * if ANY frozen-format line drifts, these fail even when the builders and the
+ * engine still agree with each other. */
+{
+  const ghc22 = await fresh(null);
+  const dateNorm = (b) => b.replace(/· \d{4}-\d{2}-\d{2} \d{2}:\d{2}/, '· <date>');
+  const fixtureThread = {
+    id: 'th_fixture', number: 3, storyId: 's1', status: 'open',
+    createdAt: '2026-08-01T10:00:00.000Z', updatedAt: '2026-08-01T10:00:00.000Z', author: 'reviewer',
+    story: { storyId: 's1', title: 'Button', name: 'primary' },
+    component: { name: 'KpiCard', chain: ['Dashboard', 'KpiCard'], source: { file: 'src/KpiCard.tsx', line: 12 } },
+    target: { kind: 'pin', selector: { cssSelector: 'span.value' }, context: { tag: 'span', text: 'Revenue' }, bbox: { x: 1, y: 1, w: 2, h: 2 } },
+    comments: [
+      { id: 'c_1', author: 'reviewer', body: 'first note line one and a second line that is quite long indeed yes', createdAt: '2026-08-01T10:00:00.000Z', ghId: 'issue-body' },
+      { id: 'c_2', author: 'agent', body: 'fixed in abc123', createdAt: '2026-08-02T10:00:00.000Z', ghId: '12345' },
+    ],
+  };
+  // (a) CLIENT variant-B body: footer says "the review thread" — NO "Storybook"
+  //     (NEW-2), static header, storage line, issue-body comment subset only.
+  const clientCands = ghc22.legacyClientBodyCandidates(fixtureThread, { origin: 'https://site.test/stories/', repo: 'acme/web', labels: ['annotakit'], sentinel: '<!-- annotakit -->' });
+  const clientWantB = "# UI review — Button\n\nstorybook (static deployment): https://site.test/stories/\nmirror: acme/web · labels: annotakit · client-side publish\n\nopen: https://site.test/stories/?path=/story/s1\n\n### #3 OPEN — first note line one and a second line that is quite long indeed yes\n\n- thread id: th_fixture\n- storage: mirrored from a static build (https://site.test/stories/) — local copy in the reviewer's browser\n- component: KpiCard\n- jsx: src/KpiCard.tsx:12\n- chain: Dashboard > KpiCard\n- element: <span \"Revenue\">\n- selector: span.value\n\n---\n\nAgent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread — close this issue (the review thread mirrors it automatically). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.\n\n<!-- annotakit -->";
+  ok('FIXTURE: client variant-B body byte-exact (footer WITHOUT "Storybook")', clientCands[1] === clientWantB, JSON.stringify(clientCands[1]?.slice(0, 160)));
+  ok('FIXTURE: client title = 60-char headline, 100 total', ghc22.legacyMirrorTitle(fixtureThread) === '[review] primary — #3 first note line one and a second line that is quite long ind', ghc22.legacyMirrorTitle(fixtureThread));
+  // (b) variant A vs B must DIVERGE on >200-char bodies (A = hard slice, no
+  //     ellipsis; B = clip200 with ellipsis) — the wave-4 masked-drift guard.
+  const longThread = { ...fixtureThread, id: 'th_long', comments: [{ ...fixtureThread.comments[0], body: 'x'.repeat(260) }] };
+  const longCands = ghc22.legacyClientBodyCandidates(longThread, { origin: 'https://site.test/stories/', repo: 'acme/web', labels: ['annotakit'], sentinel: '<!-- annotakit -->' });
+  ok('FIXTURE: variant A (≤v0.6.0) hard-slices with NO ellipsis', longCands[0].includes('x'.repeat(200) + '\n'), longCands[0]?.slice(150, 260));
+  ok('FIXTURE: variant B (v0.6.1+) clips with the honest ellipsis', longCands[1].includes('x'.repeat(200) + '…'), longCands[1]?.slice(150, 260));
+  // (c) SERVER variant-B body: status line `· YYYY-MM-DD HH:mm` (NEW-1 — the
+  //     first dateNorm matched MM-DD and the server heal never fired),
+  //     `## Button / primary` header, story-file line, "Storybook" footer.
+  const serverFixtureThread = { ...fixtureThread, story: { ...fixtureThread.story, importPath: 'src/Button.stories.tsx' } };
+  const serverCands = serverExports.legacyServerBodyCandidates(serverFixtureThread, { origin: 'http://localhost:6006', relPath: (p) => p });
+  const serverWantB = "# UI review — Button\n\n1 open / 0 resolved · 2026-09-21 20:57\nstorybook: http://localhost:6006\n\n## Button / primary\n\nstory id: `s1`\nstory file: src/Button.stories.tsx\nopen: http://localhost:6006/?path=/story/s1\n\n### #3 OPEN — first note line one and a second line that is quite long indeed yes\n\n- story: Button/primary (src/Button.stories.tsx)\n- thread id: th_fixture\n- component: KpiCard\n- jsx: src/KpiCard.tsx:12\n- chain: Dashboard > KpiCard\n- element: <span \"Revenue\">\n- selector: span.value\n\n---\n\nAgent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread — close this issue (the Storybook review thread mirrors it automatically). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.\n";
+  ok('FIXTURE: server variant-B body byte-exact after dateNorm (YYYY-MM-DD status line + "Storybook" footer)', dateNorm(serverCands[1]) === dateNorm(serverWantB), JSON.stringify(dateNorm(serverCands[1])?.slice(0, 160)));
 }
 
 /* cleanup + summary */

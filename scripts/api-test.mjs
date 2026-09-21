@@ -428,6 +428,58 @@ async function main() {
     check('2.6MB request → HTTP 413 (never a connection reset)', bigRes !== null && bigRes.status === 413, transportError ? `transport error: ${String(transportError).slice(0, 80)}` : `status=${bigRes?.status}`);
   }
 
+  /* ---- v0.6.5 hardening (C02/C11/C12/C31): the PATCH door matches POST ---- */
+  {
+    const hIn = {
+      id: 'hard-patch-' + Math.random().toString(36).slice(2, 6),
+      storyId,
+      story: { title: entries[storyId]?.title, name: entries[storyId]?.name, importPath: entries[storyId]?.importPath },
+      component: { name: 'StatusBadge', chain: ['StatusBadge'], source: { file: 'src/components/nimbus/StatusBadge.tsx', line: 12 } },
+      target: { kind: 'pin', selector: { cssSelector: 'span' }, context: { tag: 'span', text: 'Pending' }, bbox: { x: 1, y: 1, w: 10, h: 10 }, captureViewportWidth: 1000 },
+      comments: [{ id: 'c_hard', author: 'alice', body: 'hardening probe', createdAt: new Date().toISOString() }],
+    };
+    const hCreate = await j('POST', `${API}/threads`, hIn);
+    check('hardening: thread created → 201', hCreate.status === 201, JSON.stringify(hCreate.json).slice(0, 100));
+    ownIds.push(hIn.id);
+    const hid = encodeURIComponent(hIn.id);
+
+    // C11: null/scalar bodies are 400s, never 500s
+    const nullBody = await fetch(`${API}/threads/${hid}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: 'null' });
+    check('C11: null body → 400 (not 500)', nullBody.status === 400, `status=${nullBody.status}`);
+    const arrBody = await fetch(`${API}/threads/${hid}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '[1,2]' });
+    check('C11: array body → 400 (not 500)', arrBody.status === 400, `status=${arrBody.status}`);
+
+    // C11: malformed percent-encoded id → 400, never a URIError 500
+    const badId = await fetch(`${API}/threads/%zz`, { method: 'GET' });
+    check('C11: %-malformed id → 400 (not 500)', badId.status === 400, `status=${badId.status}`);
+
+    // C02: full-doc PATCH with a MALFORMED target → 400 (the POST door's deep validation, shared now)
+    const doc = (await j('GET', `${API}/threads/${hid}`)).json;
+    const badTarget = await j('PATCH', `${API}/threads/${hid}`, { ...doc, target: { kind: 'pin' } });
+    check('C02: PATCH with malformed target → 400', badTarget.status === 400, `status=${badTarget.status} body=${JSON.stringify(badTarget.json).slice(0, 80)}`);
+
+    // C11: full-doc PATCH WITHOUT status → 200 + server status default (was a sqlite bind 500)
+    const doc2 = (await j('GET', `${API}/threads/${hid}`)).json;
+    const noStatus = { ...doc2 };
+    delete noStatus.status;
+    const silent = await j('PATCH', `${API}/threads/${hid}`, noStatus);
+    check('C11: full-doc PATCH without status → 200, status kept', silent.status === 200 && silent.json?.status === 'open', `status=${silent.status} thread=${JSON.stringify(silent.json?.status)}`);
+
+    // C12: comments INTRODUCED by a PATCH are re-hashed (the A8 contract — client ids like "c1" collide across machines)
+    const doc3 = (await j('GET', `${API}/threads/${hid}`)).json;
+    const rehash = await j('PATCH', `${API}/threads/${hid}`, {
+      ...doc3,
+      comments: [...doc3.comments, { id: 'c1', author: 'client', body: 'a patch-introduced reply', createdAt: new Date().toISOString() }],
+    });
+    const rehashedIds = (rehash.json?.comments ?? []).map((c) => c.id);
+    check('C12: PATCH-introduced comment id re-hashed', rehash.status === 200 && !rehashedIds.includes('c1') && rehashedIds.length === doc3.comments.length + 1, `ids=${JSON.stringify(rehashedIds)}`);
+
+    // C31: a client-supplied gh block on an unmirrored thread is DROPPED
+    const doc4 = (await j('GET', `${API}/threads/${hid}`)).json;
+    const ghInject = await j('PATCH', `${API}/threads/${hid}`, { ...doc4, gh: { issue: 1, url: 'javascript:alert(1)', state: 'open', syncedAt: new Date().toISOString() } });
+    check('C31: client-supplied gh on unmirrored thread dropped', ghInject.status === 200 && !ghInject.json?.gh, JSON.stringify(ghInject.json?.gh));
+  }
+
   /* cleanup: remove ONLY threads this test created (live sessions may own others) */
   for (const tid of ownIds.filter(Boolean)) {
     await fetch(`${API}/threads?id=${tid}`, { method: 'DELETE' });

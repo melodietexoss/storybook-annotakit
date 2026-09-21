@@ -106,6 +106,37 @@ const SHA_RE = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 const BRANCH_PRIMARY = 'annotakit';
 const BRANCH_FALLBACK = 'annotakit-store';
 const REMOTE_CACHE_REF = 'refs/annotakit/remote';
+/** Hardening C01: the PAT used to ride in git's argv (`-c http.<url>.extraheader=`)
+ *  — /proc/<pid>/cmdline is world-readable on stock Linux, so every fetch/push
+ *  leaked the base64 credential to any local user. git ≥ 2.31 (Mar 2021) accepts
+ *  config via GIT_CONFIG_COUNT/KEY_n/VALUE_n ENVIRONMENT vars, which are
+ *  0400-rooted to the process owner. Older gits fall back to argv (with a
+ *  logged warning) — they predate the fix window we can support. */
+let gitEnvConfigCapable: boolean | null = null;
+function gitSupportsEnvConfig(): boolean {
+  if (gitEnvConfigCapable !== null) return gitEnvConfigCapable;
+  // probe once per process: `git version` is cheap and always available
+  const v = require('node:child_process').spawnSync('git', ['--version'], { encoding: 'utf8', timeout: 5000 }).stdout ?? '';
+  const m = v.match(/git version (\d+)\.(\d+)/);
+  gitEnvConfigCapable = Boolean(m && (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 31)));
+  return gitEnvConfigCapable;
+}
+/** Auth env for fetch/push: NEVER the URL, and (C01) never argv when avoidable. */
+function gitAuthEnv(token: string | undefined): { env?: Record<string, string>; args: string[] } {
+  if (!token) return { args: [] };
+  const header = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`;
+  if (gitSupportsEnvConfig()) {
+    return {
+      args: [],
+      env: {
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+        GIT_CONFIG_VALUE_0: header,
+      },
+    };
+  }
+  return { args: ['-c', `http.https://github.com/.extraheader=${header}`] };
+}
 const COMMIT_ENV = {
   GIT_AUTHOR_NAME: 'storybook-annotakit',
   GIT_AUTHOR_EMAIL: 'annotakit@users.noreply.github.com',
@@ -208,6 +239,9 @@ export function createAutoSync(opts: {
   repo: string | null;
   /** A7: broadcast THREADS_CHANGED after restore/merge imports. */
   onRestored?: (reason: ThreadsChangedPayload['reason']) => void;
+  /** C14: awaited during the shutdown flush BEFORE the final git cycle —
+   *  routes registers the GH engine drain so engine rows reach the snapshot. */
+  onShutdownHooks?: Array<() => Promise<void> | void>;
 }): AutoSync {
   const root = projectRoot(opts.configDir);
   const commonDir = gitCommonDir(root);
@@ -341,15 +375,14 @@ export function createAutoSync(opts: {
    *  remote head sha — the FETCHED one, or the cached/tracking one when the
    *  fetch itself fails (offline: parent on what we know, push fails later,
    *  never an unrelated root commit). Null when no head is known at all. */
-  const fetchRemote = async (timeoutMs: number): Promise<string | null> => {
+  const fetchRemote = async (timeoutMs: number, targetBranch?: string): Promise<string | null> => {
     if (!repo) return null;
+    const b = targetBranch ?? branch;
     const token = ghToken();
     const url = `https://github.com/${repo}.git`;
-    const args = token
-      ? ['-c', `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`,
-         'fetch', url, `+refs/heads/${branch}:${REMOTE_CACHE_REF}`]
-      : ['fetch', url, `+refs/heads/${branch}:${REMOTE_CACHE_REF}`];
-    const f = await gitAsync(root, args, timeoutMs);
+    const auth = gitAuthEnv(token);
+    const args = [...auth.args, 'fetch', url, `+refs/heads/${b}:${REMOTE_CACHE_REF}`];
+    const f = await gitAsync(root, args, timeoutMs, auth.env ? { env: auth.env } : undefined);
     const head = await gitAsync(root, ['rev-parse', '--verify', '--quiet', REMOTE_CACHE_REF], 5000);
     if (head.ok && SHA_RE.test(head.out.trim())) return head.out.trim();
     if (!f.ok) {
@@ -407,14 +440,12 @@ export function createAutoSync(opts: {
       return { ok: false, out: 'empty-sha guard' };
     }
     if (!repo) return { ok: false, out: 'no remote' };
+    maybeWarnArgvAuth();
     const token = ghToken();
     const url = `https://github.com/${repo}.git`;
     const refspec = `${sha}:refs/heads/${branch}`;
-    const args = token
-      ? ['-c', `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`,
-         'push', '--no-verify', url, refspec]
-      : ['push', '--no-verify', url, refspec];
-    return gitAsync(root, args, timeoutMs);
+    const auth = gitAuthEnv(token);
+    return gitAsync(root, [...auth.args, 'push', '--no-verify', url, refspec], timeoutMs, auth.env ? { env: auth.env } : undefined);
   };
 
   /** Read the remote db blob at a commit → validated StoreFileDoc (A13:
@@ -487,15 +518,33 @@ export function createAutoSync(opts: {
         // v0.6.1: no-readme and foreign log DISTINCTLY (issue #16 — the
         // single old message made a README miss and a genuinely foreign
         // branch indistinguishable in forensics).
-        const kind = await refReadmeKind(remote.ref);
+        let kind = await refReadmeKind(remote.ref);
         if (kind === 'no-readme' || kind === 'foreign') {
-          logOnce(
-            kind === 'no-readme'
-              ? `remote refs/heads/${branch} tip has NO README — pre-annotakit or empty branch, not adopting it (A14)`
-              : `remote refs/heads/${branch} is not an annotakit store branch (README mismatch — genuinely foreign), not adopting it (A14)`,
-          );
-          state = `remote ${branch} is foreign; local store unaffected`;
-          return;
+          // Hardening C17 (H-A-11): resolveBranch only inspects LOCAL refs —
+          // when the LOCAL primary is absent but the REMOTE primary is
+          // foreign, the old code kept pushing at it forever (root commit →
+          // non-FF rejection loop, the fallback branch unreachable). Try the
+          // documented fallback branch before giving up on the remote.
+          if (branch === BRANCH_PRIMARY) {
+            const fb = await fetchRemote(10_000, BRANCH_FALLBACK);
+            if (fb && (await refHasOurReadme(REMOTE_CACHE_REF))) {
+              logOnce(
+                `remote refs/heads/${BRANCH_PRIMARY} is ${kind === 'foreign' ? 'foreign' : 'README-less'} but ${BRANCH_FALLBACK} is ours — switching the store branch to ${BRANCH_FALLBACK} (A14/C17)`,
+              );
+              branch = BRANCH_FALLBACK;
+              remote = { sha: fb, ref: REMOTE_CACHE_REF };
+              kind = await refReadmeKind(REMOTE_CACHE_REF);
+            }
+          }
+          if (kind === 'no-readme' || kind === 'foreign') {
+            logOnce(
+              kind === 'no-readme'
+                ? `remote refs/heads/${branch} tip has NO README — pre-annotakit or empty branch, not adopting it (A14)`
+                : `remote refs/heads/${branch} is not an annotakit store branch (README mismatch — genuinely foreign), not adopting it (A14)`,
+            );
+            state = `remote ${branch} is foreign; local store unaffected`;
+            return;
+          }
         }
         const remoteDoc = await readRemoteDoc(remote.sha);
         const localCount = await opts.countThreads();
@@ -704,18 +753,60 @@ export function createAutoSync(opts: {
     inflight = p;
     // free the slot once settled so the next cycle can start. A caller
     // arriving in the settle-to-clear microtask window joins this cycle's
-    // RESULT instead of starting a new one (harmless: the next mutation
-    // re-arms its own debounce cycle).
+    // RESULT instead of starting a new one — harmless when the cycle saw every
+    // mutation, but a mutation that landed mid-cycle (C15) re-arms its own
+    // debounced follow-up right here so the missed snapshot still lands.
     p.then(
-      () => { if (inflight === p) inflight = null; },
-      () => { if (inflight === p) inflight = null; },
+      () => {
+        if (inflight === p) inflight = null;
+        if (dirtyDuringCycle && !stopped && !signalHandled) {
+          dirtyDuringCycle = false;
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(() => {
+            timer = null;
+            void syncOnce(9000, 'mutation-after-join');
+          }, DEBOUNCE_MS);
+          timer.unref?.();
+        }
+      },
+      () => {
+        if (inflight === p) inflight = null;
+        // failed cycles keep the dirty flag — failTask/the sweep own retries,
+        // but a mutation that arrived mid-cycle must still get its own cycle
+        dirtyDuringCycle = false;
+      },
     );
     return p;
   };
 
   let signalHandled = false;
+  /** C15: set when a mutation lands while a cycle runs; the settle handler
+   *  re-arms a debounced follow-up cycle so the missed snapshot still lands. */
+  let dirtyDuringCycle = false;
+  /** C14: hooks awaited during the shutdown flush BEFORE the final cycle —
+   *  routes registers the GH engine drain here so engine-written rows (gh
+   *  mappings, pulled replies) make it into the final pushed snapshot. */
+  const shutdownHooks: Array<() => Promise<void> | void> = opts.onShutdownHooks ?? [];
+  /** Hardening C01 (H-A-01): one-time notice when the old git forces the
+   *  credential back into argv (git < 2.31) — visible, not silent. */
+  let warnedArgvAuth = false;
+  const maybeWarnArgvAuth = (): void => {
+    if (warnedArgvAuth || !ghToken() || gitSupportsEnvConfig()) return;
+    warnedArgvAuth = true;
+    console.warn('[storybook-annotakit] ⚠ this git (< 2.31) cannot take auth via environment config — the GitHub token is passed on the git command line, where other local users can read it via /proc. Upgrade git to ≥ 2.31.');
+  };
+
   const notify = (): void => {
     if (!enabled || stopped || signalHandled) return;
+    if (inflight) {
+      // Hardening C15 (H-A-09): a mutation arriving while a cycle is running
+      // used to be silently folded into THAT cycle's result — but the cycle
+      // may have already read the store, so the mutation could miss the
+      // pushed snapshot and wait for the NEXT mutation (or never, before a
+      // crash). Mark dirty; the cycle's settle handler re-arms a fresh cycle.
+      dirtyDuringCycle = true;
+      return;
+    }
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
@@ -749,6 +840,16 @@ export function createAutoSync(opts: {
           await inflight;
         } catch {
           /* cycle errors are logged inside the cycle */
+        }
+      }
+      // C14: drain registered engines (the GH mirror writes store rows — gh
+      // mappings, pulled replies) BEFORE the final git cycle, so their writes
+      // make it into the last pushed snapshot instead of dying with the proc.
+      for (const hook of shutdownHooks) {
+        try {
+          await hook();
+        } catch {
+          /* a failing hook must not block the git flush */
         }
       }
       await syncOnce(timeoutMs, 'shutdown');

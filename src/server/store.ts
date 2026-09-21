@@ -397,10 +397,41 @@ function jsonStore(storePath: string): Store {
   let doc: Doc = { threads: [], counters: {}, tombstones: [], snapshots: {}, deleted: [] };
   let queue: Promise<unknown> = Promise.resolve();
   let loaded = false;
+  /** Hardening C13 (H-A-07): a read failure used to reset the in-memory doc
+   *  to EMPTY, and the next mutation persisted that empty doc — a transient
+   *  EBUSY/ENOSPC read quietly WIPED the whole store. Now: unreadable content
+   *  refuses mutations (loud 500, in-memory doc untouched) instead of wiping;
+   *  only a missing/empty file starts a legitimate empty doc. */
+  let lastReadError: string | null = null;
 
   const load = async (): Promise<void> => {
+    let raw: string;
     try {
-      const parsed = JSON.parse(await fs.readFile(storePath, 'utf8')) as Partial<Doc>;
+      raw = await fs.readFile(storePath, 'utf8');
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        doc = { threads: [], counters: {}, tombstones: [], snapshots: {}, deleted: [] };
+        lastReadError = null;
+        loaded = true;
+        return;
+      }
+      lastReadError = `store read failed (${code ?? 'unknown'}): ${err instanceof Error ? err.message : String(err)}`;
+      loaded = true;
+      return;
+    }
+    if (!raw.trim()) {
+      // empty file: crashed-before-first-write artifact — a legitimate empty store
+      doc = { threads: [], counters: {}, tombstones: [], snapshots: {}, deleted: [] };
+      lastReadError = null;
+      loaded = true;
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as Partial<Doc>;
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('not a store document');
+      }
       doc = {
         threads: parsed.threads ?? [],
         counters: parsed.counters ?? {},
@@ -408,8 +439,9 @@ function jsonStore(storePath: string): Store {
         snapshots: parsed.snapshots ?? {},
         deleted: parsed.deleted ?? [],
       };
-    } catch {
-      doc = { threads: [], counters: {}, tombstones: [], snapshots: {}, deleted: [] };
+      lastReadError = null;
+    } catch (err) {
+      lastReadError = `store file unparsable (${raw.length} bytes): ${err instanceof Error ? err.message : String(err)}`;
     }
     loaded = true;
   };
@@ -430,6 +462,13 @@ function jsonStore(storePath: string): Store {
     // the real promise; keep the serialization chain alive through failures.
     const p = queue.then(async () => {
       await load();
+      if (lastReadError) {
+        // C13: never write over a file we could not read — surface loudly.
+        throw Object.assign(
+          new Error(`store file not safely readable — mutation refused (in-memory data intact): ${lastReadError}`),
+          { status: 500 },
+        );
+      }
       const out = await fn();
       await persist();
       return out;

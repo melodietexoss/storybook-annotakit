@@ -4,24 +4,26 @@ import {
   __ghSetTransportForTests,
   getGhLinkedStaticStore,
   ghClientStatus,
+  legacyClientBodyCandidates,
+  legacyMirrorTitle,
   mirrorIssueBody,
   mirrorIssueTitle,
   probeBakedGhConfig,
   probeGhConfig,
   resolveGhConfig
-} from "./chunk-R7L24GTE.mjs";
+} from "./chunk-Y3KBXHJT.mjs";
 import {
-  ISSUE_BODY_LIMIT,
-  MIRROR_VERBATIM_MARKER
-} from "./chunk-UO3SMM6I.mjs";
+  ISSUE_BODY_LIMIT
+} from "./chunk-LNF6XYUQ.mjs";
 export {
   GH_CLIENT_SENTINEL,
   ISSUE_BODY_LIMIT,
-  MIRROR_VERBATIM_MARKER,
   __ghResetForTests,
   __ghSetTransportForTests,
   getGhLinkedStaticStore,
   ghClientStatus,
+  legacyClientBodyCandidates,
+  legacyMirrorTitle,
   mirrorIssueBody,
   mirrorIssueTitle,
   probeBakedGhConfig,

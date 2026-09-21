@@ -5,7 +5,12 @@ function cloneThread(t) {
 function later(a, b) {
   const at = Date.parse(a.updatedAt ?? "");
   const bt = Date.parse(b.updatedAt ?? "");
-  return Number.isFinite(at) && Number.isFinite(bt) ? at >= bt ? a : b : a;
+  const aOk = Number.isFinite(at);
+  const bOk = Number.isFinite(bt);
+  if (aOk && bOk) return at >= bt ? a : b;
+  if (aOk) return a;
+  if (bOk) return b;
+  return a;
 }
 function unionComments(a, b) {
   const out = a.comments.map((c) => ({ ...c }));
@@ -15,8 +20,10 @@ function unionComments(a, b) {
     if (!existing) {
       out.push({ ...rc });
       byId.set(rc.id, rc);
-    } else if (!existing.body && rc.body) {
-      existing.body = rc.body;
+    } else {
+      if (!existing.body && rc.body) existing.body = rc.body;
+      if (!existing.ghId && rc.ghId) existing.ghId = rc.ghId;
+      if (!existing.source && rc.source) existing.source = rc.source;
     }
   }
   out.sort((x, y) => String(x.createdAt ?? "").localeCompare(String(y.createdAt ?? "")));
@@ -65,6 +72,7 @@ var mirrorStateOf = (status) => status === "resolved" ? "closed" : "open";
 var MAX_BODY_CHARS = 64e3;
 var DIGEST_CLIP_CHARS = 200;
 var ISSUE_BODY_LIMIT = 6e4;
+var MIRROR_VERBATIM_MARKER = "(verbatim):**";
 
 // src/shared/describe.ts
 function clip(s, n) {
@@ -243,7 +251,8 @@ function getStaticStore() {
           target: input.target,
           comments: input.comments
         };
-        if (find(thread.id)) return Promise.resolve(thread);
+        const existing = find(thread.id);
+        if (existing) return Promise.resolve(existing);
         threads = [thread, ...threads];
         persist();
         for (const cb of listeners) cb();
@@ -267,6 +276,26 @@ function getStaticStore() {
           if (prev.status === "resolved" && norm !== "resolved") delete patched.resolvedAt;
         }
         const merged = { ...prev, ...patched, updatedAt: nowIso() };
+        const prevById = new Map(prev.comments.map((c) => [c.id, c]));
+        const unioned = patched.comments.map((c) => {
+          const pc = prevById.get(c.id);
+          if (!pc) return c;
+          return {
+            ...pc,
+            ...c,
+            ghId: c.ghId ?? pc.ghId,
+            source: c.source ?? pc.source
+          };
+        });
+        const newIds = new Set(unioned.map((c) => c.id));
+        for (const pc of prev.comments) {
+          if (!newIds.has(pc.id)) unioned.push(pc);
+        }
+        merged.comments = unioned;
+        if (!merged.gh && prev.gh) merged.gh = prev.gh;
+        if (prev.status === "resolved" && merged.status !== "resolved") {
+          delete merged.resolvedAt;
+        }
         threads[idx] = merged;
         persist();
         for (const cb of listeners) cb();
@@ -291,6 +320,18 @@ function getStaticStore() {
       },
       reloadFromPersisted() {
         reload();
+      },
+      unlinkGh(threadId, note) {
+        const idx = threads.findIndex((t) => t.id === threadId);
+        if (idx === -1) throw new Error(`annotakit(static): no thread ${threadId}`);
+        const prev = threads[idx];
+        const next = { ...prev, updatedAt: nowIso() };
+        delete next.gh;
+        if (note) next.comments = [...prev.comments, note];
+        threads[idx] = next;
+        persist();
+        for (const cb of listeners) cb();
+        return Promise.resolve(next);
       },
       subscribe(cb) {
         listeners.add(cb);
@@ -327,7 +368,7 @@ function clip2(body) {
 function threadBlock(t, storageNote, full) {
   const first = t.comments[0];
   const headline = first ? full ? firstLine(first.body) || "(no text)" : clip2(first.body) : "(no text)";
-  const status = t.status === "open" ? "OPEN" : t.status === "fixed" ? "FIXED" : "RESOLVED";
+  const status = t.status === "fixed" ? "FIXED" : t.status === "resolved" ? "RESOLVED" : "OPEN";
   const out = [];
   out.push(`### #${t.number} ${status} \u2014 ${headline}`);
   out.push("");
@@ -409,7 +450,7 @@ function renderStaticDigest(threads, opts) {
       out.push("");
       continue;
     }
-    for (const t of s.threads.filter((x) => x.status === "open")) out.push(...threadBlock(t, opts?.storageNote));
+    for (const t of s.threads.filter((x) => x.status !== "fixed" && x.status !== "resolved")) out.push(...threadBlock(t, opts?.storageNote));
     for (const t of s.threads.filter((x) => x.status === "fixed")) out.push(...threadBlock(t, opts?.storageNote));
     for (const t of s.threads.filter((x) => x.status === "resolved")) out.push(...threadBlock(t, opts?.storageNote));
   }
@@ -420,6 +461,7 @@ export {
   mirrorStateOf,
   MAX_BODY_CHARS,
   ISSUE_BODY_LIMIT,
+  MIRROR_VERBATIM_MARKER,
   elementSummary,
   newThreadId,
   staticScope,

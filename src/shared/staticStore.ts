@@ -159,6 +159,11 @@ export interface StaticStore {
    *  (ghClient) so a write is ALWAYS built from the freshest doc, never a
    *  stale in-memory copy (the v0.3 clobber lesson, client edition). */
   reloadFromPersisted(): void;
+  /** v0.6.5 (C07/C09): the ENGINE'S mapping reset — patch() now preserves a
+   *  prev gh against stale UI copies, so deleting the mapping (issue deleted
+   *  remotely → re-create on next push) goes through THIS explicit door,
+   * optionally appending a system note atomically. */
+  unlinkGh(threadId: string, note?: Thread['comments'][number]): Promise<Thread>;
   subscribe(cb: () => void): () => void;
   /** v0.6.1: lastStorageError is set when localStorage writes FAIL (quota /
    *  privacy mode) — the thread is in-memory only and vanishes on reload;
@@ -260,7 +265,11 @@ export function getStaticStore(): Promise<StaticStore> {
           target: input.target,
           comments: input.comments,
         };
-        if (find(thread.id)) return Promise.resolve(thread); // idempotent upsert, server parity
+        // H-H-08 (server parity): an idempotent replay must return the STORED
+        // row, not the freshly-built object — callers diffing the response
+        // against a later GET used to see phantom drift.
+        const existing = find(thread.id);
+        if (existing) return Promise.resolve(existing);
         threads = [thread, ...threads];
         persist();
         for (const cb of listeners) cb();
@@ -287,6 +296,33 @@ export function getStaticStore(): Promise<StaticStore> {
           if (prev.status === 'resolved' && norm !== 'resolved') delete patched.resolvedAt;
         }
         const merged: Thread = { ...prev, ...patched, updatedAt: nowIso() };
+        // Hardening C09 (H-H-02/H-E-04): the server's PATCH door unions
+        // comments by id — a stale full-doc patch must never DROP comments
+        // that landed concurrently (a preview-iframe reply not yet in this
+        // tab's copy, a just-imported GitHub reply). Wholesale replacement
+        // here permanently lost exactly those replies. Same contract as
+        // routes.ts: body's copies win for ids it knows; prev-only comments
+        // survive; ghId/source fill gaps on the winner.
+        const prevById = new Map(prev.comments.map((c) => [c.id, c] as const));
+        const unioned = patched.comments.map((c) => {
+          const pc = prevById.get(c.id);
+          if (!pc) return c;
+          return {
+            ...pc,
+            ...c,
+            ghId: c.ghId ?? pc.ghId,
+            source: c.source ?? pc.source,
+          };
+        });
+        const newIds = new Set(unioned.map((c) => c.id));
+        for (const pc of prev.comments) {
+          if (!newIds.has(pc.id)) unioned.push(pc);
+        }
+        merged.comments = unioned;
+        // mirror mapping: engine writes (ghClient stamps) flow through patch;
+        // a UI patch built from a stale copy must never WIPE the mapping
+        // (mapping loss = duplicate issue on the next create).
+        if (!merged.gh && prev.gh) merged.gh = prev.gh;
         // demotion out of resolved must CLEAR resolvedAt — the spread above
         // would otherwise resurrect prev's stamp (patched's deleted key does
         // not mask it)
@@ -317,6 +353,18 @@ export function getStaticStore(): Promise<StaticStore> {
       },
       reloadFromPersisted(): void {
         reload();
+      },
+      unlinkGh(threadId: string, note?: Thread['comments'][number]): Promise<Thread> {
+        const idx = threads.findIndex((t) => t.id === threadId);
+        if (idx === -1) throw new Error(`annotakit(static): no thread ${threadId}`);
+        const prev = threads[idx];
+        const next: Thread = { ...prev, updatedAt: nowIso() };
+        delete next.gh;
+        if (note) next.comments = [...prev.comments, note];
+        threads[idx] = next;
+        persist();
+        for (const cb of listeners) cb();
+        return Promise.resolve(next);
       },
       subscribe(cb: () => void): () => void {
         listeners.add(cb);
@@ -369,7 +417,9 @@ function clip(body: string): string {
 function threadBlock(t: Thread, storageNote?: string, full?: boolean): string[] {
   const first = t.comments[0];
   const headline = first ? (full ? firstLine(first.body) || '(no text)' : clip(first.body)) : '(no text)';
-  const status = t.status === 'open' ? 'OPEN' : t.status === 'fixed' ? 'FIXED' : 'RESOLVED';
+  // unknown/legacy status → OPEN (never vanish from the digest; parity with
+  // the server digest's v0.6.5 default)
+  const status = t.status === 'fixed' ? 'FIXED' : t.status === 'resolved' ? 'RESOLVED' : 'OPEN';
   const out: string[] = [];
   out.push(`### #${t.number} ${status} — ${headline}`);
   out.push('');
@@ -462,7 +512,7 @@ export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: str
       out.push('');
       continue;
     }
-    for (const t of s.threads.filter((x) => x.status === 'open')) out.push(...threadBlock(t, opts?.storageNote));
+    for (const t of s.threads.filter((x) => x.status !== 'fixed' && x.status !== 'resolved')) out.push(...threadBlock(t, opts?.storageNote));
     for (const t of s.threads.filter((x) => x.status === 'fixed')) out.push(...threadBlock(t, opts?.storageNote));
     for (const t of s.threads.filter((x) => x.status === 'resolved')) out.push(...threadBlock(t, opts?.storageNote));
   }

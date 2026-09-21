@@ -48,10 +48,13 @@ import {
   missingRepoMessage,
   missingTokenMessage,
   setIssueState,
+  type GhIssue,
 } from './gh';
 import { renderDigest } from './digest';
+import { repoRelPath } from './env';
+import { decideMirrorHeal, legacyMirrorTitle, legacyServerBodyCandidates } from '../shared/legacyMirror';
 import type { Comment, GhSyncStatus, GhSyncSummary, Thread } from '../shared/types';
-import { ISSUE_BODY_LIMIT, MIRROR_VERBATIM_MARKER, mirrorStateOf } from '../shared/types';
+import { ISSUE_BODY_LIMIT, mirrorStateOf } from '../shared/types';
 
 export type EngineReason = 'updated' | 'commented' | 'resolved' | 'reopened' | 'fixed';
 
@@ -67,7 +70,11 @@ export interface GhSync {
   status(): Promise<GhSyncStatus>;
   /** Kick the initial backfill + first pull (call once at server boot). */
   start(): void;
-  stop(): void;
+  /** Stop timers AND settle any in-flight engine operation. v0.6.5 (C14):
+   *  the shutdown flush awaits this so a create/reply that is mid-flight when
+   *  SIGTERM lands finishes (and stamps its mapping) instead of dying with the
+   *  process and re-creating a duplicate issue on the next boot. */
+  stop(): Promise<void>;
 }
 
 export interface GhSyncOptions {
@@ -105,6 +112,10 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
   const queue: string[] = [];
   const queued = new Set<string>();
   const inflight = new Set<string>();
+  /** Hardening C05 (H-B-05): threads re-touched (new reply / status change)
+   *  while THEIR push was in flight — enqueue() parks them here instead of
+   *  dropping the delta; drainQueue re-queues the moment the flight lands. */
+  const touchedDuringFlight = new Set<string>();
   const retries = new Map<string, number>();
   /** Per-thread retry backoff (notBefore timestamp) — spaces failed pushes. */
   const notBefore = new Map<string, number>();
@@ -197,46 +208,57 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     return m ? (m[1] as string) : null;
   };
 
-  /** v0.6.4 mirror self-heal (issue #16): detect a mirror written by a
-   *  pre-v0.6.3 engine and return the fields to re-push. Runs on PULL — the
-   *  remote body is already in hand, so the check costs zero extra requests
-   *  and heals every existing deployment on its first sync after upgrade.
+  /** v0.6.4→v0.6.5 mirror self-heal (issue #16): detect a mirror written by
+   *  a pre-v0.6.3 engine and return the fields to re-push. Runs on PULL — the
+   *  remote body is already in hand, zero extra requests, heals existing
+   *  deployments on their first sync after upgrade.
    *
-   *  Safety contract (mirrored exactly in the static client engine):
-   *  - TITLE: heal only when the remote title is a STRICT PREFIX of the
-   *    wanted one (the 60→100 headline budget makes old titles exact
-   *    prefixes). A human-edited title is not a prefix → untouched.
-   *  - BODY: heal only when the remote body still carries our thread-id
-   *    stamp (it is this thread's mirror, not a human rewrite), LACKS the
-   *    verbatim marker (predates full-text bodies), and the rebuild is not
-   *    shorter (never shorten — human appends survive).
-   *  - Idempotent: after one heal both conditions are false forever. */
+   *  v0.6.5 SAFETY REWRITE (hardening C04/C18 — H-B-01/02/08): the v0.6.4
+   *  heuristic guards (stamp + no-verbatim + never-shorten) could destroy a
+   *  HUMAN edit of an old mirror. The decision now lives in ONE shared
+   *  implementation (shared/legacyMirror.ts, used by both engines) and fires
+   *  ONLY on byte-equality with the exact legacy render — a human-touched
+   *  body never matches, so it is never overwritten; a miss is safe (the
+   *  mirror just stays old-format). */
   function mirrorHealFields(t: Thread, remote: { title?: unknown; body?: unknown }): { title?: string; body?: string } | null {
-    const fields: { title?: string; body?: string } = {};
-    if (typeof remote.title === 'string' && remote.title) {
-      const want = issueTitle(t);
-      if (want !== remote.title && want.startsWith(remote.title)) fields.title = want;
+    return decideMirrorHeal({
+      threadId: t.id,
+      remote,
+      wantedTitle: issueTitle(t),
+      wantedBody: issueBody(t),
+      legacyTitle: legacyMirrorTitle(t),
+      legacyBodies: legacyServerBodyCandidates(t, { origin: opts.origin(), relPath: (p) => repoRelPath(p) ?? p }),
+    });
+  }
+
+  /** C14 (H-H-06, create-crash recovery): index of ORPHAN mirrors — labeled
+   *  issues whose body stamp names a local thread that has NO mapping. A
+   *  create push that died before stamping (SIGKILL mid-create) used to leave
+   *  the issue unmapped forever and mint a DUPLICATE on the next backfill;
+   *  the push path now consults this index BEFORE creating. */
+  function orphanIndexOf(issues: GhIssue[], threads: Thread[]): Map<string, GhIssue> {
+    const mapped = new Set(threads.filter((t) => t.gh).map((t) => t.gh?.issue as number));
+    const unmappedById = new Map(threads.filter((t) => !t.gh).map((t) => [t.id, t] as const));
+    const out = new Map<string, GhIssue>();
+    for (const issue of issues) {
+      if (mapped.has(issue.number)) continue;
+      if (typeof issue.body !== 'string' || !issue.body) continue;
+      const stamp = issue.body.match(/^- thread id: (.+)$/m);
+      if (!stamp) continue;
+      const victim = unmappedById.get((stamp[1] as string).trim());
+      if (victim && !out.has(victim.id)) out.set(victim.id, issue);
     }
-    if (typeof remote.body === 'string' && remote.body) {
-      const oldFormat =
-        t.comments.length > 0 &&
-        remote.body.includes(`- thread id: ${t.id}`) &&
-        !remote.body.includes(MIRROR_VERBATIM_MARKER);
-      if (oldFormat) {
-        const want = issueBody(t);
-        if (want.length >= remote.body.length) fields.body = want;
-      }
-    }
-    return Object.keys(fields).length ? fields : null;
+    return out;
   }
 
   /**
    * Reconcile ONE thread against its GitHub mirror. Idempotent: no mapping →
-   * create the issue (once, ever); mapping → only push actual deltas
-   * (un-mirrored replies, status vs issue state). NEVER a second issue.
+   * create the issue (once, ever) — or ADOPT a stamped orphan when the index
+   * has one (C14); mapping → only push actual deltas (un-mirrored replies,
+   * status vs issue state). NEVER a second issue.
    * All persistence goes through store.mutateThread (merge, never clobber).
    */
-  async function syncThread(id: string): Promise<'noop' | 'created' | 'pushed'> {
+  async function syncThread(id: string, orphanIndex?: Map<string, GhIssue>): Promise<'noop' | 'created' | 'pushed'> {
     const cfg = configured();
     if (cfg.error) throw Object.assign(new Error(cfg.error), { status: 400 });
     const t = await store.getThread(id);
@@ -244,6 +266,32 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     const { token: tk, repo: rp } = cfg as { token: string; repo: string };
 
     if (!t.gh) {
+      // C14: a stamped orphan for THIS thread means the create already
+      // happened once (the push died before stamping — crash, or a "failed"
+      // create that actually landed) — adopt it instead of minting a
+      // duplicate. The push loop passes a prebuilt index; the QUEUE path
+      // (drainQueue → here) fetches one lazily: one listing per CREATE, zero
+      // for steady-state deltas.
+      let orphan = orphanIndex?.get(id);
+      if (!orphan && orphanIndex === undefined) {
+        try {
+          orphan = orphanIndexOf(await listLabeledIssues(tk, rp, labelsOf()), [t]).get(id);
+        } catch {
+          /* listing failed — proceed to a normal create (best effort) */
+        }
+      }
+      if (orphan) {
+        const adopted = await store.mutateThread(id, (cur) => {
+          if (cur.gh) return; // raced — keep the existing mapping
+          cur.gh = { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: nowIso() };
+        });
+        if (adopted) {
+          opts.onEngineMutation(adopted, 'updated');
+          lastPushAt = nowIso();
+          console.warn(`[storybook-annotakit] gh-sync: adopted orphaned mirror issue #${orphan.number} for thread ${id.slice(0, 12)}… (create-crash recovery)`);
+          return 'pushed';
+        }
+      }
       const created = await createIssue(tk, rp, { title: issueTitle(t), body: issueBody(t), labels: labelsOf() });
       // ORPHAN GUARD: the thread may have been deleted while createIssue was
       // in flight (1–3s). Persist the mapping atomically; if the thread is
@@ -345,9 +393,16 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
         await syncThread(id);
         retries.delete(id);
         notBefore.delete(id);
+        // C05: a mutation that landed while this thread was in flight gets a
+        // fresh queue entry — its delta may not have been in the pushed set.
+        if (touchedDuringFlight.delete(id)) {
+          queued.add(id);
+          queue.push(id);
+        }
       } catch (err) {
         hadFailure = true;
         failTask(id, err);
+        touchedDuringFlight.delete(id); // failTask re-queued the whole thread
       } finally {
         inflight.delete(id);
       }
@@ -555,6 +610,36 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       }
     }
 
+    // Hardening C14 (H-H-06, create-crash recovery): an issue created by a
+    // push that died before stamping the local mapping (SIGKILL mid-create)
+    // used to stay unmapped forever and mint a DUPLICATE on the next backfill.
+    // The listing we already fetched carries the body stamp — remap instead.
+    // NOTE: comments are deliberately NOT stamped 'issue-body' here (we cannot
+    // know which were in the body) — the normal delta flow pushes them as
+    // issue comments; a little duplication beats a lost reply.
+    const mappedIssues = new Set(threads.filter((t) => t.gh).map((t) => t.gh?.issue as number));
+    const unmappedById = new Map(threads.filter((t) => !t.gh).map((t) => [t.id, t]));
+    for (const issue of remote.values()) {
+      if (mappedIssues.has(issue.number)) continue;
+      if (typeof issue.body !== 'string' || !issue.body) continue;
+      const stamp = issue.body.match(/^- thread id: (.+)$/m);
+      if (!stamp) continue;
+      const victim = unmappedById.get((stamp[1] as string).trim());
+      if (!victim || queued.has(victim.id) || inflight.has(victim.id)) continue;
+      const after = await store.mutateThread(victim.id, (cur) => {
+        if (cur.gh) return; // raced — a mapping landed meanwhile; never steal
+        cur.gh = { issue: issue.number, url: issue.html_url, state: issue.state, syncedAt: pullStartedAt };
+      });
+      if (after) {
+        opts.onEngineMutation(after, 'updated');
+        healed++;
+        enqueue(after.id); // push any un-mirrored deltas as comments
+        console.warn(
+          `[storybook-annotakit] gh-sync: remapped orphaned mirror issue #${issue.number} to thread ${victim.id.slice(0, 12)}… (create-crash recovery)`,
+        );
+      }
+    }
+
     // tombstones: locally deleted threads → close their issues once
     for (const issueNumber of await store.listOpenTombstones()) {
       try {
@@ -591,7 +676,15 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
   const enqueue = (threadId: string): void => {
     if (!opts.enabled) return; // manual/off mode: only POST /sync reconciles
     if (!token() || !repo) return; // unconfigured: silent — boot log explains
-    if (queued.has(threadId) || inflight.has(threadId)) return;
+    if (inflight.has(threadId)) {
+      // Hardening C05 (H-B-05): a mutation landing while THIS thread's push
+      // is in flight used to be dropped (the in-flight sync already read the
+      // thread) — the reply waited for the 10-min stalled sweep. Re-arm it as
+      // soon as the flight lands instead.
+      touchedDuringFlight.add(threadId);
+      return;
+    }
+    if (queued.has(threadId)) return;
     queued.add(threadId);
     queue.push(threadId);
   };
@@ -610,12 +703,27 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
   const syncAllRaw = async (): Promise<GhSyncSummary> => {
     await drainQueue(); // pending mutation pushes land before the pull
     const threadsNow = await store.listThreads();
+    // C14: build the orphan index BEFORE the push loop — but ONLY when there
+    // is something to adopt (unmapped threads). Steady-state syncs (all
+    // mapped) skip the extra listing entirely.
+    let orphanIndex: Map<string, GhIssue> | undefined;
+    if (threadsNow.some((t) => !t.gh)) {
+      try {
+        const cfg0 = configured();
+        if (!cfg0.error) {
+          const { token: tk0, repo: rp0 } = cfg0 as { token: string; repo: string };
+          orphanIndex = orphanIndexOf(await listLabeledIssues(tk0, rp0, labelsOf()), threadsNow);
+        }
+      } catch {
+        /* listing is best-effort — creates fall back to a per-thread fetch */
+      }
+    }
     let created = 0;
     let pushed = 0;
     let pushError: string | null = null;
     for (const t of threadsNow) {
       try {
-        const r = await syncThread(t.id);
+        const r = await syncThread(t.id, orphanIndex);
         if (r === 'created') created++;
         if (r === 'pushed') pushed++;
       } catch (err) {
@@ -724,12 +832,21 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     });
   };
 
-  const stop = (): void => {
+  const stop = async (): Promise<void> => {
     if (workerTimer) clearInterval(workerTimer);
     if (pollTimer) clearInterval(pollTimer);
     workerTimer = null;
     pollTimer = null;
     started = false;
+    // C14: settle the serialization chain — when this resolves, no engine
+    // operation (create/reply/state-flip/heal) is still writing. The sync
+    // shutdown flush awaits this BEFORE its final git cycle, so engine-stamped
+    // rows (gh mappings, pulled replies) reach the final pushed snapshot.
+    try {
+      await chain;
+    } catch {
+      /* chain failures are logged where they happen */
+    }
   };
 
   return { enqueue, enqueueDelete, syncAll, pullOnce: () => run(pullOnceRaw), status, start, stop };

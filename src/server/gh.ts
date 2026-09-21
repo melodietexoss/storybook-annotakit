@@ -81,7 +81,12 @@ function invalidTokenMessage(detail: string): string {
   ].join('\n');
 }
 
-/** Extract the wait time GitHub asks for on rate-limit / 5xx responses. */
+/** Extract the wait time GitHub asks for on rate-limit / 5xx responses.
+ *  Hardening C20 (H-B-04): a past x-ratelimit-reset (clock skew between this
+ *  host and GitHub) used to yield a NEGATIVE retryMs — backoffUntil was never
+ *  advanced, so the engine kept hammering through an active rate limit. A
+ *  non-positive computed wait is treated as "unknown" → callers apply their
+ *  own default backoff. */
 function retryAfterMs(res: Response): number | undefined {
   const ra = res.headers.get('retry-after');
   if (ra) {
@@ -91,7 +96,10 @@ function retryAfterMs(res: Response): number | undefined {
   const reset = res.headers.get('x-ratelimit-reset');
   if (reset) {
     const n = Number.parseInt(reset, 10);
-    if (Number.isFinite(n) && n > 0) return Math.min((n - Math.floor(Date.now() / 1000)) * 1000, 900_000);
+    if (Number.isFinite(n) && n > 0) {
+      const waitMs = (n - Math.floor(Date.now() / 1000)) * 1000;
+      if (waitMs > 0) return Math.min(waitMs, 900_000);
+    }
   }
   return undefined;
 }
@@ -164,16 +172,24 @@ async function ghJson<T>(
 }
 
 /** Follow GitHub's Link rel="next" headers up to maxPages — the silent >100
- *  data-miss (issues listing, long comment threads) must never happen. */
+ *  data-miss (issues listing, long comment threads) must never happen.
+ *  Hardening C19 (H-B-03): hitting the cap used to truncate SILENTLY — past
+ *  500 issues every pull degraded into one getIssue per stale thread (rate
+ *  spiral). Caps are now generous (10 pages) AND truncation is loud. */
 async function ghJsonPaged<T>(
   token: string,
   pathname: string,
-  maxPages = 5,
+  maxPages = 10,
 ): Promise<T[]> {
   const out: T[] = [];
   let url: string | null = `${ghApiBase()}${pathname}`;
   let res: Response | null = null;
+  let truncated = false;
   for (let page = 0; page < maxPages && url; page++) {
+    if (page === maxPages - 1) {
+      // about to consume the last allowed page — note whether more remain
+      truncated = true; // provisional; cleared if no next link after the fetch
+    }
     try {
       res = await fetch(url, {
         headers: {
@@ -200,13 +216,19 @@ async function ghJsonPaged<T>(
     // stop paging on mismatch or on an unparseable URL.
     if (!next) {
       url = null;
+      truncated = false;
     } else {
       try {
         url = new URL(next[1]).origin === new URL(ghApiBase()).origin ? (next[1] as string) : null;
+        if (!url) truncated = false;
       } catch {
         url = null; // unparseable next-link — treat as end of pagination
+        truncated = false;
       }
     }
+  }
+  if (truncated && url) {
+    console.warn(`[storybook-annotakit] ⚠ GitHub pagination cap hit (${maxPages} pages) on ${pathname} — results truncated; raise the cap if this repo really has more data`);
   }
   return out;
 }
@@ -269,7 +291,7 @@ export function listLabeledIssues(token: string, repo: string, label: string | s
   return ghJsonPaged<GhIssue>(
     token,
     `/repos/${repo}/issues?labels=${encodeURIComponent(labels)}&state=all&per_page=100&sort=updated&direction=desc`,
-    5,
+    10,
   );
 }
 
@@ -282,5 +304,5 @@ export function listIssueComments(
   since?: string,
 ): Promise<GhComment[]> {
   const q = since ? `?per_page=100&since=${encodeURIComponent(since)}` : '?per_page=100';
-  return ghJsonPaged<GhComment>(token, `/repos/${repo}/issues/${issue}/comments${q}`, 3);
+  return ghJsonPaged<GhComment>(token, `/repos/${repo}/issues/${issue}/comments${q}`, 10);
 }

@@ -6,14 +6,15 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-GQOT3JEX.mjs";
+} from "./chunk-XM4L6WNP.mjs";
 import {
   getGhLinkedStaticStore,
   ghClientStatus
-} from "./chunk-R7L24GTE.mjs";
+} from "./chunk-Y3KBXHJT.mjs";
 import {
+  MAX_BODY_CHARS,
   renderStaticDigest
-} from "./chunk-UO3SMM6I.mjs";
+} from "./chunk-LNF6XYUQ.mjs";
 
 // src/manager/index.tsx
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -63,7 +64,9 @@ function stableSort(threads) {
   });
 }
 function ago(iso) {
-  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1e3));
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return "";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1e3));
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   return `${Math.round(s / 3600)}h ago`;
@@ -103,12 +106,21 @@ function ReviewPanel() {
     } catch {
     }
   }, []);
+  const [modeResolved, setModeResolved] = useState(false);
   useEffect(() => {
     let alive = true;
     void probeMode().then((m) => {
-      if (!alive || m !== "static") return;
-      setStaticMode(true);
+      if (!alive) return;
+      if (m === "static") setStaticMode(true);
+      setModeResolved(true);
     });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!modeResolved || staticMode) return;
+    let alive = true;
     void getHealth().then((h) => {
       if (!alive || !h) return;
       setHealth(h);
@@ -119,7 +131,7 @@ function ReviewPanel() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [modeResolved, staticMode]);
   useEffect(() => {
     if (!staticMode) return;
     let alive = true;
@@ -164,8 +176,9 @@ function ReviewPanel() {
     });
   }, [scope, storyId, staticMode]);
   useEffect(() => {
+    if (!modeResolved) return;
     void refresh();
-  }, [refresh]);
+  }, [refresh, modeResolved]);
   useEffect(() => {
     const ch = addons.getChannel();
     const onChange = (payload) => {
@@ -309,7 +322,7 @@ function ReviewPanel() {
         const s = store.gh.status();
         setGhStat(s);
         setNotice(
-          s.configured ? `client sync: queue ${s.queue}${s.lastError ? ` \xB7 error: ${s.lastError.slice(0, 200)}` : ""}${s.lastPullCount !== void 0 ? ` \xB7 pulled ${s.lastPullCount} from GitHub` : ""}` : "client GitHub publishing not configured \u2014 open GitHub settings below"
+          s.configured ? `client sync: queue ${s.queue}${s.lastError ? ` \xB7 error: ${s.lastError.slice(0, 200)}` : ""}${s.lastPullCount !== void 0 ? ` \xB7 pulled ${s.lastPullCount} from GitHub` : ""}${s.lastHealedCount ? ` \xB7 ${s.lastHealedCount} mirror${s.lastHealedCount === 1 ? "" : "s"} healed (re-pushed verbatim)` : ""}` : "client GitHub publishing not configured \u2014 open GitHub settings below"
         );
         window.setTimeout(() => setNotice(null), 6e3);
         await refresh();
@@ -320,7 +333,7 @@ function ReviewPanel() {
         setNotice(`GitHub mirror not configured \u2014 local mode. ${summary.reason ?? ""}`.slice(0, 400));
       } else {
         setNotice(
-          `synced: ${summary.created} issue${summary.created === 1 ? "" : "s"} created \xB7 ${summary.pushed} pushed \xB7 ${summary.pulled} pulled from GitHub${summary.stalled ? ` \xB7 ${summary.stalled} stalled (will retry)` : ""}`
+          `synced: ${summary.created} issue${summary.created === 1 ? "" : "s"} created \xB7 ${summary.pushed} pushed \xB7 ${summary.pulled} pulled from GitHub${summary.healed ? ` \xB7 ${summary.healed} mirror${summary.healed === 1 ? "" : "s"} healed (re-pushed verbatim)` : ""}${summary.stalled ? ` \xB7 ${summary.stalled} stalled (will retry)` : ""}`
         );
       }
       window.setTimeout(() => setNotice(null), 6e3);
@@ -356,10 +369,14 @@ function ReviewPanel() {
       if (ghForm.pollMs !== void 0) patch.pollMs = ghForm.pollMs;
       patch.disabled = ghForm.disabled ? true : void 0;
       store.gh.saveSettings(patch);
-      setNotice(`saved \u2014 publishing${patch.disabled ? " disabled" : ` \u2192 ${patch.repo ?? ghStat?.repo ?? "(baked repo)"}`}${labels.length ? ` \xB7 labels: ${labels.join(", ")}` : ""}`);
-      window.setTimeout(() => setNotice(null), 5e3);
       const s = await ghClientStatus();
       setGhStat(s);
+      if (!s.configured && !patch.disabled) {
+        setNotice("saved \u2014 but NOT publishing yet: repo must be owner/name and a token must be present (check GitHub settings below)");
+      } else {
+        setNotice(`saved \u2014 publishing${patch.disabled ? " disabled" : ` \u2192 ${patch.repo ?? ghStat?.repo ?? "(baked repo)"}`}${labels.length ? ` \xB7 labels: ${labels.join(", ")}` : ""}`);
+      }
+      window.setTimeout(() => setNotice(null), 5e3);
       await store.gh.syncNow();
       setGhStat(store.gh.status());
       await refresh();
@@ -541,7 +558,7 @@ function ReviewPanel() {
         t.number,
         " ",
         t.status === "open" ? "open" : t.status === "fixed" ? "fixed" : "resolved"
-      ), t.gh?.url && /* @__PURE__ */ React.createElement(
+      ), t.gh?.url && /^(https?:)?\/\//i.test(t.gh.url) && /* @__PURE__ */ React.createElement(
         "a",
         {
           href: t.gh.url,
@@ -595,9 +612,10 @@ function ThreadActions(props) {
       style: { flex: 1, padding: "3px 8px", fontSize: 12, borderRadius: 6, border: `1px solid ${theme.appBorderColor}`, background: "transparent", color: theme.textColor },
       placeholder: "reply\u2026",
       value: body,
+      maxLength: MAX_BODY_CHARS,
       onChange: (e) => setBody(e.target.value),
       onKeyDown: (e) => {
-        if (e.key === "Enter" && body.trim() && !props.busy) {
+        if (e.key === "Enter" && body.trim() && body.length <= MAX_BODY_CHARS && !props.busy) {
           void props.onReply(props.thread, body).then((ok) => {
             if (ok) setBody("");
           });

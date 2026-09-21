@@ -276,4 +276,36 @@ resetStaticStoreForTests(); // scope switched in test 7 — drop the cached stor
   }
 }
 
+/* 12 — v0.6.5 hardening (C09/H-H-02/H-E-04): patch is a COMMENT-UNION door,
+ * not a wholesale replacement. A status flip built from a STALE full-doc copy
+ * must not drop a comment that landed concurrently (preview-iframe reply,
+ * just-imported GitHub reply) — the server's PATCH has unioned since v0.6.1;
+ * the static store finally matches. Also: gh mapping survives UI patches
+ * (mapping loss = duplicate issue), create() replay returns the STORED row
+ * (H-H-08), and the engine's unlinkGh door actually unlinks (C07). */
+{
+  const s = await getStaticStore();
+  const t0 = await s.create({ id: 'th_union', storyId: 's1', target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null }, comments: [{ id: 'c_u1', author: 'r', body: 'stale copy knows this one', createdAt: new Date().toISOString() }] });
+  ok('setup: thread created', Boolean(t0));
+  // the "stale UI copy" — snapshot BEFORE the concurrent reply lands
+  const stale = JSON.parse(JSON.stringify(t0));
+  // the concurrent reply lands on the LIVE store (iframe/other tab)
+  await s.addComment('th_union', 'landed after the stale copy was built', 'reviewer-2');
+  // ...and an engine gh mapping too (issue created meanwhile)
+  await s.patch({ ...s.list().find((x) => x.id === 'th_union'), gh: { issue: 42, url: 'https://github.com/x/y/issues/42', state: 'open', syncedAt: new Date().toISOString() } });
+  // the stale copy PATCHes a status flip (the classic panel race)
+  const patched = await s.patch({ ...stale, status: 'fixed' });
+  ok('C09: concurrent comment SURVIVES the stale patch', patched.comments.some((c) => c.body === 'landed after the stale copy was built'), JSON.stringify(patched.comments.map((c) => c.body)));
+  ok('C09: status flip applied', patched.status === 'fixed');
+  ok('C09: gh mapping survives a patch that lacks it', patched.gh?.issue === 42, JSON.stringify(patched.gh));
+  // H-H-08: create replay returns the STORED row (with the reply), not a fresh object
+  const replay = await s.create({ id: 'th_union', storyId: 's1', target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null }, comments: [{ id: 'c_u1', author: 'r', body: 'stale copy knows this one', createdAt: new Date().toISOString() }] });
+  ok('H-H-08: create replay returns the STORED row', replay.comments.length === patched.comments.length && replay.gh?.issue === 42, `comments=${replay.comments.length}`);
+  // C07: the engine's explicit unlink door (patch preserves gh; unlinkGh removes)
+  const unlinked = await s.unlinkGh('th_union');
+  ok('C07: unlinkGh removes the mapping', unlinked.gh === undefined && unlockedCheck(unlinked));
+  function unlockedCheck(th) { return th.comments.length > 0; } // history intact
+  ok('C07: unlinkGh keeps the comment history', unlinked.comments.some((c) => c.body === 'landed after the stale copy was built'));
+}
+
 console.log(`\n${passed} passed, 0 failed (static-store suite)`);

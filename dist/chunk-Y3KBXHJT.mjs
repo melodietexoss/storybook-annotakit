@@ -1,10 +1,127 @@
 import {
   ISSUE_BODY_LIMIT,
+  MIRROR_VERBATIM_MARKER,
+  elementSummary,
   getStaticStore,
   mirrorStateOf,
   renderThreadBlock,
   staticScope
-} from "./chunk-MLHFKDNW.mjs";
+} from "./chunk-LNF6XYUQ.mjs";
+
+// src/shared/legacyMirror.ts
+function fmtDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toISOString().replace("T", " ").slice(5, 16);
+}
+function oneLine(body) {
+  return body.replace(/\s+/g, " ").trim();
+}
+function clip200(body) {
+  const line = oneLine(body);
+  return line.length > 200 ? line.slice(0, 200) + "\u2026" : line;
+}
+function mirrorBodyCommentsOf(t) {
+  const stamped = t.comments.filter((c) => c.ghId === "issue-body");
+  if (stamped.length) return stamped;
+  return t.comments.filter((c) => !c.ghId && c.source !== "github");
+}
+function dateNorm(body) {
+  return body.replace(/· \d{4}-\d{2}-\d{2} \d{2}:\d{2}/, "\xB7 <date>");
+}
+function legacyMirrorTitle(t) {
+  const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
+  const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 60);
+  return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 100);
+}
+function legacyThreadBlock(t, comments, o) {
+  const rel = o.relPath ?? ((p) => p);
+  const first = comments[0];
+  const headline = first ? (o.variant === "B" ? clip200(first.body) : oneLine(first.body)) || "(no text)" : "(no text)";
+  const status = o.status === "open" ? "OPEN" : "resolved";
+  const out = [];
+  out.push(`### #${t.number} ${status} \u2014 ${headline}`);
+  out.push("");
+  if (t.story) {
+    if (t.story.importPath) out.push(`- story: ${t.story.title ?? ""}/${t.story.name ?? ""} (${rel(t.story.importPath)})`);
+  }
+  out.push(`- thread id: ${t.id}`);
+  if (o.storageNote) out.push(`- storage: ${o.storageNote}`);
+  const comp = t.component;
+  if (comp) {
+    if (comp.name) out.push(`- component: ${comp.name}${comp.key ? ` (key="${comp.key}")` : ""}`);
+    if (comp.source) out.push(`- jsx: ${rel(comp.source.file)}:${comp.source.line ?? "?"}`);
+    if (comp.chain?.length > 1) out.push(`- chain: ${comp.chain.slice(0, 5).join(" > ")}`);
+    const props = comp.props ? Object.entries(comp.props).slice(0, 6) : [];
+    if (props.length) out.push(`- props: ${props.map(([k, v]) => `${k}=${v}`).join(" ")}`);
+  }
+  const ctx = t.target?.context;
+  out.push(`- element: ${ctx ? elementSummary(ctx) : "?"}`);
+  if (t.target?.selector?.cssSelector) out.push(`- selector: ${t.target.selector.cssSelector}`);
+  for (const r of comments.slice(1)) {
+    const via = o.variant === "B" && r.source === "github" ? " (via github)" : "";
+    const body = o.variant === "B" ? clip200(r.body) : oneLine(r.body).slice(0, 200);
+    out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${body}`);
+  }
+  if (o.status === "resolved" && t.resolvedAt) out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
+  out.push("");
+  return out;
+}
+var LEGACY_CLIENT_FOOTER = "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread \u2014 close this issue (the review thread mirrors it automatically). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.";
+function legacyClientBodyCandidates(t, opts) {
+  const comments = mirrorBodyCommentsOf(t);
+  if (!comments.length) return [];
+  const storyUrl = t.story?.url ?? `${opts.origin}?path=/story/${t.storyId}`;
+  const storageNote = `mirrored from a static build (${opts.origin}) \u2014 local copy in the reviewer's browser`;
+  const candidates = [];
+  for (const status of ["open", "resolved"]) {
+    for (const variant of ["A", "B"]) {
+      const out = [];
+      out.push(`# UI review \u2014 ${t.story?.title ?? t.storyId}`);
+      out.push("");
+      out.push(`storybook (static deployment): ${opts.origin}`);
+      out.push(`mirror: ${opts.repo} \xB7 labels: ${opts.labels.join(", ")} \xB7 client-side publish`);
+      out.push("");
+      out.push(`open: ${storyUrl}`);
+      out.push("");
+      out.push(...legacyThreadBlock(t, comments, { variant, relPath: (p) => p, storageNote, status }));
+      out.push("---");
+      out.push("");
+      out.push(LEGACY_CLIENT_FOOTER);
+      out.push("");
+      out.push(opts.sentinel);
+      candidates.push(out.join("\n"));
+    }
+  }
+  return candidates;
+}
+function decideMirrorHeal(args) {
+  const fields = {};
+  if (typeof args.remote.title === "string" && args.remote.title) {
+    if (args.remote.title === args.legacyTitle && args.wantedTitle !== args.remote.title) {
+      fields.title = args.wantedTitle;
+    }
+  }
+  if (typeof args.remote.body === "string" && args.remote.body) {
+    const machineWritten = args.remote.body.includes(`- thread id: ${args.threadId}`) && !args.remote.body.includes(MIRROR_VERBATIM_MARKER) && !args.remote.body.includes("\u2026 (clipped at ");
+    if (machineWritten && args.wantedBody !== args.remote.body && args.legacyBodies.some((c) => dateNorm(c) === dateNorm(args.remote.body))) {
+      fields.body = args.wantedBody;
+    } else if (machineWritten && typeof process !== "undefined" && process.env?.ANNOTAKIT_HEAL_DEBUG) {
+      const remote = dateNorm(args.remote.body);
+      for (const c of args.legacyBodies) {
+        const want = dateNorm(c).split("\n");
+        const got = remote.split("\n");
+        let li = 0;
+        while (li < Math.max(want.length, got.length) && want[li] === got[li]) li++;
+        console.error(`[heal-debug] no match vs candidate: first diff line ${li}
+  want: ${JSON.stringify(want[li])}
+  got:  ${JSON.stringify(got[li])}`);
+      }
+    }
+  }
+  return Object.keys(fields).length ? fields : null;
+}
 
 // src/shared/ghClient.ts
 var GH_FILE = "annotakit-gh.json";
@@ -65,7 +182,10 @@ function retryAfterMs(res) {
   const reset = res.headers?.get?.("x-ratelimit-reset");
   if (reset) {
     const n = Number.parseInt(reset, 10);
-    if (Number.isFinite(n) && n > 0) return Math.min((n - Math.floor(Date.now() / 1e3)) * 1e3, 9e5);
+    if (Number.isFinite(n) && n > 0) {
+      const waitMs = (n - Math.floor(Date.now() / 1e3)) * 1e3;
+      if (waitMs > 0) return Math.min(waitMs, 9e5);
+    }
   }
   return void 0;
 }
@@ -96,10 +216,12 @@ async function ghJson(cfg, method, pathname, body) {
   if (res.status === 204 || method === "HEAD") return {};
   return await res.json();
 }
-async function ghJsonPaged(cfg, pathname, maxPages = 5) {
+async function ghJsonPaged(cfg, pathname, maxPages = 10) {
   const out = [];
   let url = `${cfg.apiBase}${pathname}`;
+  let truncated = false;
   for (let page = 0; page < maxPages && url; page++) {
+    if (page === maxPages - 1) truncated = true;
     let res;
     try {
       res = await tx()(url, {
@@ -120,13 +242,19 @@ async function ghJsonPaged(cfg, pathname, maxPages = 5) {
     const next = link.match(/<([^>]+)>;\s*rel="next"/);
     if (!next) {
       url = null;
+      truncated = false;
     } else {
       try {
         url = new URL(next[1]).origin === new URL(cfg.apiBase).origin ? next[1] : null;
+        if (!url) truncated = false;
       } catch {
         url = null;
+        truncated = false;
       }
     }
+  }
+  if (truncated && url && state) {
+    state.lastError = `GitHub pagination cap hit (${maxPages} pages) on ${pathname} \u2014 results truncated`;
   }
   return out;
 }
@@ -139,6 +267,9 @@ function addIssueCommentRemote(cfg, issue, body) {
 function setIssueStateRemote(cfg, issue, state2) {
   return ghJson(cfg, "PATCH", `/repos/${cfg.repo}/issues/${issue}`, { state: state2 });
 }
+function editIssueRemote(cfg, issue, fields) {
+  return ghJson(cfg, "PATCH", `/repos/${cfg.repo}/issues/${issue}`, fields);
+}
 function getIssueRemote(cfg, issue) {
   return ghJson(cfg, "GET", `/repos/${cfg.repo}/issues/${issue}`);
 }
@@ -147,12 +278,12 @@ function listLabeledIssuesRemote(cfg) {
   return ghJsonPaged(
     cfg,
     `/repos/${cfg.repo}/issues?labels=${labels}&state=all&per_page=100&sort=updated&direction=desc`,
-    5
+    10
   );
 }
 function listIssueCommentsRemote(cfg, issue, since) {
   const q = since ? `?per_page=100&since=${encodeURIComponent(since)}` : "?per_page=100";
-  return ghJsonPaged(cfg, `/repos/${cfg.repo}/issues/${issue}/comments${q}`, 3);
+  return ghJsonPaged(cfg, `/repos/${cfg.repo}/issues/${issue}/comments${q}`, 10);
 }
 var GH_CLIENT_SENTINEL = GH_SENTINEL;
 function ls() {
@@ -215,11 +346,13 @@ function readOverride() {
 }
 function writeOverride(patch) {
   const store = ls();
-  if (!store) return;
+  if (!store) return false;
   const next = { ...readOverride(), ...patch };
   try {
     store.setItem(cfgKey(), JSON.stringify(next));
+    return true;
   } catch {
+    return false;
   }
 }
 function resolveGhConfig(baked, override) {
@@ -237,12 +370,12 @@ async function probeGhConfig() {
   const baked = await probeBakedGhConfig();
   return resolveGhConfig(baked, readOverride());
 }
-function issueTitle(t) {
+function mirrorIssueTitle(t) {
   const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
   const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
   return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 160);
 }
-function issueBody(t, cfg) {
+function mirrorIssueBody(t, cfg) {
   const origin = staticScope();
   const storyUrl = t.story?.url ?? `${origin}?path=/story/${t.storyId}`;
   const out = [];
@@ -277,6 +410,21 @@ function parseSentinel(body) {
   const m = body.match(SENTINEL_RE);
   return m ? m[1] : null;
 }
+function mirrorHealFields(t, remote, cfg) {
+  return decideMirrorHeal({
+    threadId: t.id,
+    remote,
+    wantedTitle: mirrorIssueTitle(t),
+    wantedBody: mirrorIssueBody(t, cfg),
+    legacyTitle: legacyMirrorTitle(t),
+    legacyBodies: legacyClientBodyCandidates(t, {
+      origin: staticScope(),
+      repo: cfg.repo,
+      labels: cfg.labels,
+      sentinel: GH_SENTINEL
+    })
+  });
+}
 function resolutionNotice(t) {
   return `${GH_SENTINEL}
 resolved in Storybook \u2014 thread #${t.number}${t.resolvedAt ? `, ${t.resolvedAt.slice(0, 16).replace("T", " ")}` : ""}. Fix evidence is in the replies above.`;
@@ -309,11 +457,12 @@ function writeQueue(ops) {
 function opKeyOf(op) {
   return op.kind === "sync" ? `sync:${op.threadId}` : `close:${op.issue}`;
 }
-function enqueue(kind, ref) {
+function enqueue(kind, ref, opts) {
   const ops = readQueue();
   const key = kind === "sync" ? `sync:${ref}` : `close:${ref}`;
   const existing = ops.find((o) => opKeyOf(o) === key);
-  const op = existing ? { ...existing, enqueuedAt: (/* @__PURE__ */ new Date()).toISOString(), notBefore: 0, lastError: void 0 } : {
+  const unpark = Boolean(existing?.parked) && !opts?.fromSweep;
+  const op = existing ? { ...existing, enqueuedAt: (/* @__PURE__ */ new Date()).toISOString(), notBefore: 0, lastError: void 0, ...unpark ? { parked: false, attempts: 0 } : {} } : {
     id: `op_${Math.random().toString(36).slice(2, 10)}`,
     kind,
     ...kind === "sync" ? { threadId: String(ref) } : { issue: Number(ref) },
@@ -363,6 +512,52 @@ function isLeaderDoc() {
     return false;
   }
 }
+var docId = null;
+function tabId() {
+  if (docId) return docId;
+  let id = "";
+  try {
+    const ss = typeof sessionStorage !== "undefined" ? sessionStorage : null;
+    if (ss) {
+      id = ss.getItem("annotakit:tabid") ?? "";
+      if (!id) {
+        id = `tab_${Math.random().toString(36).slice(2, 10)}`;
+        ss.setItem("annotakit:tabid", id);
+      }
+    }
+  } catch {
+  }
+  docId = id || `tab_${Math.random().toString(36).slice(2, 10)}`;
+  return docId;
+}
+function leaderKey() {
+  return "annotakit:ghleader:" + staticScope();
+}
+var LEADER_TTL_MS = 45e3;
+var LEADER_RENEW_MS = 2e4;
+function claimLeadership() {
+  const store = ls();
+  if (!store) return isLeaderDoc();
+  try {
+    const raw = store.getItem(leaderKey());
+    if (raw) {
+      const cur = JSON.parse(raw);
+      if (cur && typeof cur === "object" && cur.id && cur.id !== tabId() && Number.isFinite(Number(cur.at)) && Date.now() - Number(cur.at) < LEADER_TTL_MS) {
+        return false;
+      }
+    }
+    store.setItem(leaderKey(), JSON.stringify({ id: tabId(), at: Date.now() }));
+    return true;
+  } catch {
+    return isLeaderDoc();
+  }
+}
+function renewLeadership(st) {
+  if (!st.leader) return;
+  if (st.lastLeadershipRenew && Date.now() - st.lastLeadershipRenew < LEADER_RENEW_MS) return;
+  st.lastLeadershipRenew = Date.now();
+  if (!claimLeadership()) st.leader = false;
+}
 function freshThread(base, id) {
   base.reloadFromPersisted();
   return base.list().find((t) => t.id === id);
@@ -374,7 +569,26 @@ async function processSyncOp(base, cfg, op) {
   const t = freshThread(base, String(op.threadId));
   if (!t) return;
   if (!t.gh) {
-    const created = await createIssueRemote(cfg, { title: issueTitle(t), body: issueBody(t, cfg) });
+    try {
+      const listed = await listLabeledIssuesRemote(cfg);
+      const mapped = new Set(base.list().filter((x) => x.gh).map((x) => x.gh?.issue));
+      const orphan = listed.find((i) => {
+        if (mapped.has(i.number) || typeof i.body !== "string" || !i.body) return false;
+        const m = i.body.match(/^- thread id: (.+)$/m);
+        return m?.[1]?.trim() === t.id;
+      });
+      if (orphan) {
+        const stampedOrphan = {
+          ...t,
+          gh: { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: (/* @__PURE__ */ new Date()).toISOString() }
+        };
+        await base.patch(stampedOrphan);
+        if (state) state.lastPushAt = (/* @__PURE__ */ new Date()).toISOString();
+        return;
+      }
+    } catch {
+    }
+    const created = await createIssueRemote(cfg, { title: mirrorIssueTitle(t), body: mirrorIssueBody(t, cfg) });
     const cur = freshThread(base, t.id);
     if (!cur) {
       await addIssueCommentRemote(cfg, created.number, `${GH_SENTINEL}
@@ -433,7 +647,7 @@ thread deleted in Storybook (static) \u2014 closing.`);
   await setIssueStateRemote(cfg, op.issue, "closed");
 }
 async function flushOnce(base) {
-  if (!state || state.flushing) return;
+  if (!state || state.flushing || !state.leader) return;
   state.flushing = true;
   let ranWork = false;
   try {
@@ -450,6 +664,27 @@ async function flushOnce(base) {
         removeOp(op.id);
         if (state) state.lastError = void 0;
       } catch (err) {
+        if (op.kind === "sync" && err?.status === 404) {
+          const mapped = freshThread(base, String(op.threadId));
+          const issueNum = mapped?.gh?.issue;
+          if (issueNum !== void 0) {
+            let definitelyGone = false;
+            try {
+              await getIssueRemote(cfg, issueNum);
+            } catch (e2) {
+              definitelyGone = e2?.status === 404;
+            }
+            if (definitelyGone && mapped) {
+              await base.unlinkGh(
+                String(op.threadId),
+                systemComment(`gh-deleted-${issueNum}`, "annotakit", "GitHub issue deleted remotely \u2014 the mirror will be re-created on the next sync.")
+              );
+              removeOp(op.id);
+              enqueue("sync", String(op.threadId));
+              continue;
+            }
+          }
+        }
         const { transient } = bumpOp(op.id, err);
         if (state) state.lastError = err instanceof Error ? err.message : String(err);
         if (!transient) return;
@@ -474,11 +709,12 @@ function systemComment(ghId, author, body) {
   };
 }
 async function pullOnce(base) {
-  if (!state) return 0;
+  if (!state) return { pulled: 0, healed: 0 };
   const cfg = await probeGhConfig();
-  if (!cfg) return 0;
+  if (!cfg) return { pulled: 0, healed: 0 };
   const pullStartedAt = (/* @__PURE__ */ new Date()).toISOString();
   let pulled = 0;
+  let healed = 0;
   const remote = new Map((await listLabeledIssuesRemote(cfg)).map((i) => [i.number, i]));
   for (const t of base.list()) {
     if (!t.gh) continue;
@@ -492,17 +728,28 @@ async function pullOnce(base) {
         if (err?.status === 404) {
           const fresh2 = freshThread(base, t.id);
           if (fresh2) {
-            await base.patch({
-              ...fresh2,
-              gh: void 0,
-              comments: [...fresh2.comments, systemComment(`gh-deleted-${mir.issue}`, "annotakit", "GitHub issue deleted remotely \u2014 the mirror will be re-created on the next sync.")]
-            });
+            await base.unlinkGh(
+              t.id,
+              systemComment(`gh-deleted-${mir.issue}`, "annotakit", "GitHub issue deleted remotely \u2014 the mirror will be re-created on the next sync.")
+            );
             enqueue("sync", t.id);
             pulled++;
           }
           continue;
         }
         throw err;
+      }
+    }
+    try {
+      const heal = mirrorHealFields(t, issue, cfg);
+      if (heal) {
+        await editIssueRemote(cfg, mir.issue, heal);
+        healed++;
+        if (state) state.lastMirrorError = void 0;
+      }
+    } catch (err) {
+      if (state) {
+        state.lastMirrorError = `mirror heal failed (issue #${mir.issue}): ${err instanceof Error ? err.message : String(err)}`;
       }
     }
     let statusChange = null;
@@ -528,6 +775,7 @@ async function pullOnce(base) {
       fresh.sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
     }
     if (statusChange || fresh.length > 0 || mir.state !== issue.state || issueActive) {
+      if (threadPending(t.id)) continue;
       const cur = freshThread(base, t.id);
       if (!cur?.gh) continue;
       const next = { ...cur, gh: { ...cur.gh } };
@@ -573,7 +821,8 @@ async function pullOnce(base) {
       if (statusChange || imported.length) pulled++;
     }
   }
-  return pulled;
+  if (state) state.lastHealedCount = healed;
+  return { pulled, healed };
 }
 function startRuntime(base) {
   if (state) return;
@@ -592,30 +841,61 @@ function startRuntime(base) {
   setWake(() => {
     void flushOnce(base);
   });
-  void flushOnce(base);
-  state.sweepTimer = setInterval(() => void flushOnce(base), 3e4);
-  state.sweepTimer?.unref?.();
-  state.lastPullTick = Date.now();
+  state.leader = claimLeadership();
+  state.lastLeadershipRenew = Date.now();
   state.tickTimer = setInterval(() => {
     const st = state;
-    if (!st?.leader) return;
+    if (!st) return;
+    if (!st.leader) {
+      if (!st.lastLeadershipRenew || Date.now() - st.lastLeadershipRenew >= LEADER_RENEW_MS) {
+        st.lastLeadershipRenew = Date.now();
+        if (claimLeadership()) {
+          st.leader = true;
+          void flushOnce(base);
+        }
+      }
+      return;
+    }
+    renewLeadership(st);
     void (async () => {
       const cfg = await probeGhConfig();
       if (!cfg || cfg.pollMs <= 0) return;
+      if (st.pullBackoffUntil && Date.now() < st.pullBackoffUntil) return;
       const last = st.lastPullTick ?? 0;
       if (Date.now() - last < cfg.pollMs) return;
       st.lastPullTick = Date.now();
       try {
         const pulled = await pullOnce(base);
         st.lastPullAt = (/* @__PURE__ */ new Date()).toISOString();
-        st.lastPullCount = pulled;
+        st.lastPullCount = pulled.pulled;
         st.lastError = void 0;
+        st.pullBackoffUntil = 0;
       } catch (err) {
         st.lastError = err instanceof Error ? err.message : String(err);
+        const retryMs = Number(err?.retryMs);
+        if (retryMs > 0) st.pullBackoffUntil = Date.now() + retryMs;
       }
     })();
   }, 5e3);
   state.tickTimer?.unref?.();
+  state.sweepTimer = setInterval(() => {
+    const st = state;
+    if (!st?.leader) return;
+    void (async () => {
+      const cfg = await probeGhConfig();
+      if (cfg) {
+        for (const t of base.list()) {
+          if (threadPending(t.id)) continue;
+          const stalled = !t.gh || t.comments.some((c) => !c.ghId && c.source !== "github") || (t.gh ? t.gh.state !== mirrorStateOf(t.status) : false);
+          if (stalled) enqueue("sync", t.id, { fromSweep: true });
+        }
+      }
+      void flushOnce(base);
+    })();
+  }, 3e4);
+  state.sweepTimer?.unref?.();
+  if (!state.leader) return;
+  void flushOnce(base);
 }
 var LINKED = /* @__PURE__ */ Symbol("annotakit-gh-linked");
 function buildStatus() {
@@ -632,12 +912,13 @@ function buildStatus() {
     queue: ops.filter((o) => !o.parked).length,
     parked: ops.filter((o) => Boolean(o.parked)).length,
     flushing: state?.flushing ?? false,
-    // parked errors FIRST: they are terminal + name the thread (actionable);
-    // the raw state error would otherwise shadow them with a generic message
-    lastError: ops.find((o) => o.parked && o.lastError)?.lastError || (state?.lastError ?? void 0) || ops.find((o) => o.lastError)?.lastError,
+    // parked errors FIRST (terminal + name the thread), then persistent
+    // mirror-heal failures (H-H-04), then the transient engine error.
+    lastError: ops.find((o) => o.parked && o.lastError)?.lastError || state?.lastMirrorError || state?.lastError || ops.find((o) => o.lastError)?.lastError,
     lastPushAt: state?.lastPushAt,
     lastPullAt: state?.lastPullAt,
     lastPullCount: state?.lastPullCount,
+    lastHealedCount: state?.lastHealedCount,
     pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS
   };
 }
@@ -680,7 +961,11 @@ async function getGhLinkedStaticStore() {
   linked.gh = {
     status: buildStatus,
     saveSettings(patch) {
-      writeOverride(patch);
+      const ok = writeOverride(patch);
+      if (!ok && state) {
+        state.lastError = "settings NOT saved \u2014 localStorage is full or blocked; the override lives in this tab only until reload. Free space or check browser storage settings.";
+        return;
+      }
       clearOpBackoff();
       if (state?.leader) void flushOnce(base);
     },
@@ -691,12 +976,14 @@ async function getGhLinkedStaticStore() {
       if (state?.leader) void flushOnce(base);
     },
     async syncNow() {
-      await flushOnce(base);
       if (state?.leader) {
-        const pulled = await pullOnce(base);
+        state.pullBackoffUntil = 0;
+        await flushOnce(base);
+        const r = await pullOnce(base);
         if (state) {
           state.lastPullAt = (/* @__PURE__ */ new Date()).toISOString();
-          state.lastPullCount = pulled;
+          state.lastPullCount = r.pulled;
+          state.lastHealedCount = r.healed;
         }
       }
     }
@@ -712,15 +999,20 @@ function __ghResetForTests() {
   state = null;
   bakedPromise = null;
   resolvedBaked = null;
+  docId = null;
   setWake(() => void 0);
 }
 
 export {
+  legacyMirrorTitle,
+  legacyClientBodyCandidates,
   __ghSetTransportForTests,
   GH_CLIENT_SENTINEL,
   probeBakedGhConfig,
   resolveGhConfig,
   probeGhConfig,
+  mirrorIssueTitle,
+  mirrorIssueBody,
   ghClientStatus,
   getGhLinkedStaticStore,
   __ghResetForTests

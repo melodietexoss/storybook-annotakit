@@ -88,9 +88,9 @@ if (!dbPath && !seedPath) {
 globalThis.window = { location: new URL(`${origin}index.html`) };
 
 const require = createRequire(import.meta.url);
-const { renderDigest } = require('../dist/server.cjs');
+const { renderDigest, decideMirrorHeal, legacyMirrorTitle, legacyServerBodyCandidates } = require('../dist/server.cjs');
 const ghc = await import('../dist/ghClient.mjs');
-const { ISSUE_BODY_LIMIT, MIRROR_VERBATIM_MARKER, mirrorIssueBody, mirrorIssueTitle } = ghc;
+const { ISSUE_BODY_LIMIT, legacyClientBodyCandidates, mirrorIssueBody, mirrorIssueTitle } = ghc;
 
 /* ------------------------------ thread sources ----------------------------- */
 
@@ -221,23 +221,26 @@ for (const issue of issues) {
     ? mirrorIssueBody(t, { repo, labels })
     : devIssueBody(t);
 
-  const fields = {};
-  if (typeof issue.title === 'string' && issue.title && wantTitle !== issue.title && wantTitle.startsWith(issue.title)) {
-    fields.title = wantTitle;
-  }
-  const oldFormat =
-    (t.comments ?? []).length > 0 && body.includes(`- thread id: ${t.id}`) && !body.includes(MIRROR_VERBATIM_MARKER);
-  if (oldFormat && wantBody.length >= body.length) {
-    fields.body = wantBody;
-  }
+  // v0.6.5 EXACT-MATCH contract (wave-4 catch NEW-4): the script used to
+  // carry the REMOVED v0.6.4 heuristics (strict-prefix title, never-shorten
+  // body) — with --apply it could still destroy a human-edited old mirror,
+  // and after the engine rewrite its MIRROR_VERBATIM_MARKER import was
+  // undefined (guards inert). The decision now delegates to the SAME shared
+  // implementation both engines use: heal only on byte-equality with the
+  // frozen legacy render. A miss is safe — the mirror just stays old-format.
+  const fields = decideMirrorHeal({
+    threadId: t.id,
+    remote: { title: issue.title, body },
+    wantedTitle,
+    wantedBody,
+    legacyTitle: legacyMirrorTitle(t),
+    legacyBodies: isStaticFormat
+      ? legacyClientBodyCandidates(t, { origin: origin.replace(/\/?$/, '/'), repo, labels, sentinel: '<!-- annotakit -->' })
+      : legacyServerBodyCandidates(t, { origin, relPath: (p) => p }),
+  }) ?? {};
   if (!fields.title && !fields.body) {
     skip.clean.push(issue.number);
     continue;
-  }
-  if (oldFormat && fields.body === undefined && fields.title) {
-    // body is old-format but the rebuild would SHORTEN it → title-only heal is
-    // still safe; note it so the operator can look at the thread.
-    skip.safe.push(`#${issue.number} (title-only: rebuild would shorten the body)`);
   }
   plan.push({ number: issue.number, fields, format: isStaticFormat ? 'static' : 'dev', title: issue.title });
 }

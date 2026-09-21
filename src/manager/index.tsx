@@ -22,6 +22,7 @@ import { probeMode } from '../shared/mode';
 import { getGhLinkedStaticStore, ghClientStatus, type GhClientSettings, type GhClientStatus } from '../shared/ghClient';
 import { renderStaticDigest } from '../shared/staticStore';
 import type { GhSyncStatus, GhSyncSummary, Thread } from '../shared/types';
+import { MAX_BODY_CHARS } from '../shared/types';
 
 const ADDON_ID = 'annotakit';
 const PANEL_ID = `${ADDON_ID}/panel`;
@@ -99,9 +100,13 @@ function stableSort(threads: Thread[]): Thread[] {
   });
 }
 
-/** "12s ago" / "3m ago" for the sync status line. */
+/** "12s ago" / "3m ago" for the sync status line. H-E-07: an unparseable
+ *  date used to render "NaNh ago" (Math.max(0, NaN) is NaN) — hostile/legacy
+ *  timestamps degrade to an empty string instead. */
 function ago(iso: string): string {
-  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '';
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   return `${Math.round(s / 3600)}h ago`;
@@ -164,14 +169,28 @@ function ReviewPanel(): React.ReactElement {
     }
   }, []);
 
-  /* one-shot: server health + sync status (dev mode) + runtime mode probe
-   *  (static builds get NO health JSON — the probe decides the world). */
+  /* one-shot: runtime mode probe FIRST (C29/H-E-01 — the preview layer gates
+   *  on modeResolved, the panel never got the same gate: on static builds the
+   *  parallel REST fetches 404'd and flashed a raw `HTTP 404: <!DOCTYPE…`
+ *  error plus dev chrome on every panel open). The REST fetches only start
+   *  once the mode is known; static mode links the store instead. */
+  const [modeResolved, setModeResolved] = useState(false);
   useEffect(() => {
     let alive = true;
     void probeMode().then((m) => {
-      if (!alive || m !== 'static') return;
-      setStaticMode(true);
+      if (!alive) return;
+      if (m === 'static') setStaticMode(true);
+      setModeResolved(true); // dev/down: the REST path runs (and may error honestly)
     });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  /* dev-mode health + sync status — only after the mode probe (C29). */
+  useEffect(() => {
+    if (!modeResolved || staticMode) return;
+    let alive = true;
     void getHealth().then((h) => {
       if (!alive || !h) return;
       setHealth(h);
@@ -182,7 +201,7 @@ function ReviewPanel(): React.ReactElement {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [modeResolved, staticMode]);
 
   /* static mode: link the store (starts the flusher — THIS document is the
    * leader), then poll the client-GH status (async full probe once, sync
@@ -234,8 +253,9 @@ function ReviewPanel(): React.ReactElement {
   }, [scope, storyId, staticMode]);
 
   useEffect(() => {
+    if (!modeResolved) return; // C29: never fetch REST before the mode probe lands
     void refresh();
-  }, [refresh]);
+  }, [refresh, modeResolved]);
 
   /* live updates — dev mode: server WS broadcast (THREADS_CHANGED). */
   useEffect(() => {
@@ -407,7 +427,7 @@ function ReviewPanel(): React.ReactElement {
         setGhStat(s);
         setNotice(
           s.configured
-            ? `client sync: queue ${s.queue}${s.lastError ? ` · error: ${s.lastError.slice(0, 200)}` : ''}${s.lastPullCount !== undefined ? ` · pulled ${s.lastPullCount} from GitHub` : ''}`
+            ? `client sync: queue ${s.queue}${s.lastError ? ` · error: ${s.lastError.slice(0, 200)}` : ''}${s.lastPullCount !== undefined ? ` · pulled ${s.lastPullCount} from GitHub` : ''}${s.lastHealedCount ? ` · ${s.lastHealedCount} mirror${s.lastHealedCount === 1 ? '' : 's'} healed (re-pushed verbatim)` : ''}`
             : 'client GitHub publishing not configured — open GitHub settings below',
         );
         window.setTimeout(() => setNotice(null), 6000);
@@ -419,8 +439,10 @@ function ReviewPanel(): React.ReactElement {
         // local mode: a state, not an error — show the a/b/c steps as a notice
         setNotice(`GitHub mirror not configured — local mode. ${summary.reason ?? ''}`.slice(0, 400));
       } else {
+        // C30/H-E-02: surface v0.6.4's heal work — the reporter of the
+        // truncation bug could not tell the heal ran from the UI at all.
         setNotice(
-          `synced: ${summary.created} issue${summary.created === 1 ? '' : 's'} created · ${summary.pushed} pushed · ${summary.pulled} pulled from GitHub${summary.stalled ? ` · ${summary.stalled} stalled (will retry)` : ''}`,
+          `synced: ${summary.created} issue${summary.created === 1 ? '' : 's'} created · ${summary.pushed} pushed · ${summary.pulled} pulled from GitHub${summary.healed ? ` · ${summary.healed} mirror${summary.healed === 1 ? '' : 's'} healed (re-pushed verbatim)` : ''}${summary.stalled ? ` · ${summary.stalled} stalled (will retry)` : ''}`,
         );
       }
       window.setTimeout(() => setNotice(null), 6000);
@@ -462,10 +484,17 @@ function ReviewPanel(): React.ReactElement {
       if (ghForm.pollMs !== undefined) patch.pollMs = ghForm.pollMs;
       patch.disabled = ghForm.disabled ? true : undefined;
       store.gh.saveSettings(patch);
-      setNotice(`saved — publishing${patch.disabled ? ' disabled' : ` → ${patch.repo ?? ghStat?.repo ?? '(baked repo)'}`}${labels.length ? ` · labels: ${labels.join(', ')}` : ''}`);
-      window.setTimeout(() => setNotice(null), 5000);
       const s = await ghClientStatus();
       setGhStat(s);
+      // H-E-09 (with H-H-05): "saved — publishing" used to be a lie when the
+      // repo/token was invalid (resolveGhConfig silently nulled it) or the
+      // localStorage write failed — the notice now reports the EFFECTIVE state.
+      if (!s.configured && !patch.disabled) {
+        setNotice('saved — but NOT publishing yet: repo must be owner/name and a token must be present (check GitHub settings below)');
+      } else {
+        setNotice(`saved — publishing${patch.disabled ? ' disabled' : ` → ${patch.repo ?? ghStat?.repo ?? '(baked repo)'}`}${labels.length ? ` · labels: ${labels.join(', ')}` : ''}`);
+      }
+      window.setTimeout(() => setNotice(null), 5000);
       await store.gh.syncNow();
       setGhStat(store.gh.status());
       await refresh();
@@ -805,7 +834,7 @@ function ReviewPanel(): React.ReactElement {
               >
                 #{t.number} {t.status === 'open' ? 'open' : t.status === 'fixed' ? 'fixed' : 'resolved'}
               </span>
-              {t.gh?.url && (
+              {t.gh?.url && /^(https?:)?\/\//i.test(t.gh.url) && (
                 <a
                   href={t.gh.url}
                   target="_blank"
@@ -885,9 +914,12 @@ function ThreadActions(props: {
         style={{ flex: 1, padding: '3px 8px', fontSize: 12, borderRadius: 6, border: `1px solid ${theme.appBorderColor}`, background: 'transparent', color: theme.textColor }}
         placeholder="reply…"
         value={body}
+        maxLength={MAX_BODY_CHARS}
         onChange={(e) => setBody(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && body.trim() && !props.busy) {
+          // C24/H-C-06: every OTHER capture door caps at MAX_BODY_CHARS — this
+          // input was the one uncapped path (guaranteed 422 → parked op).
+          if (e.key === 'Enter' && body.trim() && body.length <= MAX_BODY_CHARS && !props.busy) {
             // clear ONLY on success — a failed reply must not eat the draft
             void props.onReply(props.thread, body).then((ok) => {
               if (ok) setBody('');
