@@ -8,8 +8,21 @@
  * not the identity.
  */
 
-export type ThreadStatus = 'open' | 'resolved';
+/** v0.6.3 review-flow triage (design/2026-09-13): 'fixed' = addressed by the
+ *  agent, awaiting reviewer verification — the agent's Path B terminal state.
+ *  Workflow: open → fixed (agent) → resolved (reviewer confirms; the ONLY path
+ *  to resolved for agent-touched threads); direct open → resolved stays legal
+ *  (trivial fixes / reviewer's own threads); fixed → open = reviewer rejects.
+ *  On the GitHub mirror: resolved → closed, open|fixed → open. */
+export type ThreadStatus = 'open' | 'fixed' | 'resolved';
 export type ThreadKind = 'pin' | 'region';
+
+/** v0.6.3: the GitHub-mirror state a thread status maps to (resolved → closed;
+ *  open|fixed → open — a thread awaiting reviewer verification is OPEN on
+ *  GitHub, closing = reviewer-confirmed). ONE source shared by both engines
+ *  (server ghsync + browser ghClient): push `want`, pull drift detection and
+ *  the stalled sweep must all agree. */
+export const mirrorStateOf = (status: ThreadStatus): 'open' | 'closed' => (status === 'resolved' ? 'closed' : 'open');
 
 /** Hard cap on ONE comment body, enforced at every capture door (server
  *  routes 413, client composer submit-guard, static store) — sized under
@@ -20,6 +33,13 @@ export const MAX_BODY_CHARS = 64_000;
 
 /** Display clip for digest headline + reply lines (md only). */
 export const DIGEST_CLIP_CHARS = 200;
+
+/** Honest ceiling for a mirrored GitHub ISSUE body (issue #16). GitHub itself
+ *  caps issue bodies at 65,536 chars; a thread with several 64k comments can
+ *  exceed that, so the mirror clips at this budget WITH a pointer to the full
+ *  thread (API / panel export). Normal notes NEVER hit it — bodies are
+ *  mirrored VERBATIM (digest lean-clip is display-only, never on the mirror). */
+export const ISSUE_BODY_LIMIT = 60_000;
 
 /** Story metadata captured at pin time (from /index.json + CSF render context). */
 export interface StoryRef {
@@ -340,7 +360,9 @@ export interface ExportBundle {
 
 export interface ExportedStory {
   story: StoryRef;
-  counts: { open: number; resolved: number };
+  /** v0.6.3: three-way (additive — old consumers computing open+resolved as
+   *  the total under-count; fixed threads are NOT done, they await review). */
+  counts: { open: number; fixed: number; resolved: number };
   threads: Thread[];
 }
 

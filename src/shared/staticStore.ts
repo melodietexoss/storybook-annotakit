@@ -269,7 +269,30 @@ export function getStaticStore(): Promise<StaticStore> {
       patch(next: Thread): Promise<Thread> {
         const idx = threads.findIndex((t) => t.id === next.id);
         if (idx === -1) throw new Error(`annotakit(static): no thread ${next.id}`);
-        const merged: Thread = { ...threads[idx], ...next, updatedAt: nowIso() };
+        // v0.6.3 status normalization (design amendment 7 — parity with the
+        // server PATCH door): case-normalize, validate the enum, stamp/clear
+        // resolvedAt on transitions, never demote a confirmation to fixed
+        const prev = threads[idx];
+        const patched = { ...next } as Thread;
+        if (patched.status !== undefined) {
+          const norm = String(patched.status).toLowerCase() as Thread['status'];
+          if (norm !== 'open' && norm !== 'fixed' && norm !== 'resolved') {
+            throw new Error(`annotakit(static): status must be "open", "fixed" or "resolved" (got ${JSON.stringify(patched.status)})`);
+          }
+          if (prev.status === 'resolved' && norm === 'fixed') {
+            throw new Error('annotakit(static): thread is resolved (reviewer-confirmed) — reopen to "open" first');
+          }
+          patched.status = norm;
+          if (prev.status !== 'resolved' && norm === 'resolved' && !patched.resolvedAt) patched.resolvedAt = nowIso();
+          if (prev.status === 'resolved' && norm !== 'resolved') delete patched.resolvedAt;
+        }
+        const merged: Thread = { ...prev, ...patched, updatedAt: nowIso() };
+        // demotion out of resolved must CLEAR resolvedAt — the spread above
+        // would otherwise resurrect prev's stamp (patched's deleted key does
+        // not mask it)
+        if (prev.status === 'resolved' && merged.status !== 'resolved') {
+          delete merged.resolvedAt;
+        }
         threads[idx] = merged;
         persist();
         for (const cb of listeners) cb();
@@ -326,6 +349,12 @@ function oneLine(body: string): string {
   return body.replace(/\s+/g, ' ').trim();
 }
 
+/** First line of a body, heading-safe (full mode — server digest parity). */
+function firstLine(body: string, n = 80): string {
+  const line = oneLine(body.split('\n')[0] ?? '');
+  return line.length > n ? line.slice(0, n) + '…' : line;
+}
+
 /** Display clip, server-digest parity (the v0.6.0 static digest left the
  *  FIRST comment un-clipped — a huge first comment produced a huge digest). */
 function clip(body: string): string {
@@ -333,10 +362,14 @@ function clip(body: string): string {
   return line.length > DIGEST_CLIP_CHARS ? line.slice(0, DIGEST_CLIP_CHARS) + '…' : line;
 }
 
-function threadBlock(t: Thread, storageNote?: string): string[] {
+/** Lean (default): one line per comment (clip()) — token economy for the
+ *  digest/export display. Full mode (`full`, issue #16): VERBATIM bodies with
+ *  newlines preserved — used ONLY by ghClient's issue-body builder so a
+ *  reviewer's long note never arrives on GitHub shortened (server parity). */
+function threadBlock(t: Thread, storageNote?: string, full?: boolean): string[] {
   const first = t.comments[0];
-  const headline = first ? clip(first.body) : '(no text)';
-  const status = t.status === 'open' ? 'OPEN' : 'resolved';
+  const headline = first ? (full ? firstLine(first.body) || '(no text)' : clip(first.body)) : '(no text)';
+  const status = t.status === 'open' ? 'OPEN' : t.status === 'fixed' ? 'FIXED' : 'RESOLVED';
   const out: string[] = [];
   out.push(`### #${t.number} ${status} — ${headline}`);
   out.push('');
@@ -356,20 +389,33 @@ function threadBlock(t: Thread, storageNote?: string): string[] {
   const ctx = t.target?.context;
   out.push(`- element: ${ctx ? elementSummary(ctx) : '?'}`);
   if (t.target?.selector?.cssSelector) out.push(`- selector: ${t.target.selector.cssSelector}`);
-  for (const r of t.comments.slice(1)) {
-    const via = r.source === 'github' ? ' (via github)' : '';
-    out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip(r.body)}`);
+  if (full) {
+    for (const [i, c] of t.comments.entries()) {
+      const via = c.source === 'github' ? ' via github' : '';
+      const label = i === 0 ? 'note' : 'reply';
+      out.push(`**${label} — ${c.author}${via} ${fmtDate(c.createdAt)} (verbatim):**`);
+      out.push('');
+      out.push(c.body?.trim() || '(empty)');
+      out.push('');
+    }
+  } else {
+    for (const r of t.comments.slice(1)) {
+      const via = r.source === 'github' ? ' (via github)' : '';
+      out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip(r.body)}`);
+    }
   }
   if (t.status === 'resolved' && t.resolvedAt) out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
+  else if (t.status === 'fixed') out.push('  - fixed: addressed, awaiting reviewer verification');
   out.push('');
   return out;
 }
 
 /** One thread as a lean markdown block. Exported for ghClient's issue-body
  *  builder (client-side GH publishing) — `storageNote` lets callers swap the
- *  provenance line (e.g. "mirrored to GitHub issue #N from a static build"). */
-export function renderThreadBlock(t: Thread, storageNote?: string): string[] {
-  return threadBlock(t, storageNote);
+ *  provenance line (e.g. "mirrored to GitHub issue #N from a static build");
+ *  `full` switches to verbatim bodies (issue #16 — mirrors never shorten). */
+export function renderThreadBlock(t: Thread, storageNote?: string, full?: boolean): string[] {
+  return threadBlock(t, storageNote, full);
 }
 
 function groupStories(threads: Thread[]): ExportedStory[] {
@@ -378,11 +424,12 @@ function groupStories(threads: Thread[]): ExportedStory[] {
     const story = t.story ?? ({ storyId: t.storyId } as StoryRef);
     let entry = map.get(t.storyId);
     if (!entry) {
-      entry = { story, counts: { open: 0, resolved: 0 }, threads: [] };
+      entry = { story, counts: { open: 0, fixed: 0, resolved: 0 }, threads: [] };
       map.set(t.storyId, entry);
     }
     entry.threads.push(t);
     if (t.status === 'open') entry.counts.open += 1;
+    else if (t.status === 'fixed') entry.counts.fixed += 1;
     else entry.counts.resolved += 1;
   }
   return [...map.values()];
@@ -392,15 +439,16 @@ function groupStories(threads: Thread[]): ExportedStory[] {
  *  server-only bits (repo-relative paths, snapshot pointers). */
 export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: string }): string {
   const stories = groupStories(threads);
-  const open = stories.reduce((n, s) => n + s.counts.open, 0);
-  const resolved = stories.reduce((n, s) => n + s.counts.resolved, 0);
+  const open = stories.reduce((n, s) => n + (Number(s.counts.open) || 0), 0);
+  const fixed = stories.reduce((n, s) => n + (Number(s.counts.fixed) || 0), 0);
+  const resolved = stories.reduce((n, s) => n + (Number(s.counts.resolved) || 0), 0);
   const title = stories.length === 1
     ? `UI review — ${stories[0].story.title ?? stories[0].story.storyId}`
     : `UI review — ${stories.length} stories`;
   const out: string[] = [];
   out.push(`# ${title}`);
   out.push('');
-  out.push(`${open} open / ${resolved} resolved · ${nowIso().slice(0, 16).replace('T', ' ')} · static build (local storage)`);
+  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${resolved} resolved · ${nowIso().slice(0, 16).replace('T', ' ')} · static build (local storage)`);
   out.push('');
   for (const s of stories) {
     const st = s.story;
@@ -415,7 +463,8 @@ export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: str
       continue;
     }
     for (const t of s.threads.filter((x) => x.status === 'open')) out.push(...threadBlock(t, opts?.storageNote));
-    for (const t of s.threads.filter((x) => x.status !== 'open')) out.push(...threadBlock(t, opts?.storageNote));
+    for (const t of s.threads.filter((x) => x.status === 'fixed')) out.push(...threadBlock(t, opts?.storageNote));
+    for (const t of s.threads.filter((x) => x.status === 'resolved')) out.push(...threadBlock(t, opts?.storageNote));
   }
   return out.join('\n');
 }

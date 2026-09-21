@@ -285,6 +285,26 @@ async function main() {
   await waitFor(() => gh.issues[0].state === 'open', 5000, 'issue reopened');
   check('PATCH reopen → issue state open', gh.issues[0].state === 'open');
 
+  console.log('== 4b. v0.6.3 fixed: issue stays OPEN (review gate); remote close confirms from fixed ==');
+  const commentsBeforeFixed = (gh.comments[1] ?? []).length;
+  const fixedBody = { ...(await j('GET', `/annotakit/api/threads/${t1.id}`)).body, status: 'fixed' };
+  const patchFixed = await j('PATCH', `/annotakit/api/threads/${t1.id}`, fixedBody);
+  check('PATCH {status:fixed} → 200', patchFixed.status === 200 && patchFixed.body?.status === 'fixed', `status=${patchFixed.status}`);
+  await j('POST', '/annotakit/api/sync'); // settle pushes + pull — fixed is NOT drift
+  check('issue stays OPEN while fixed (awaiting review)', gh.issues[0].state === 'open', gh.issues[0].state);
+  check('no new lifecycle comment while fixed', (gh.comments[1] ?? []).length === commentsBeforeFixed, `comments=${gh.comments[1]?.length}`);
+  closeRemote(1); // reviewer confirms ON GitHub
+  const syncConfirm = await j('POST', '/annotakit/api/sync');
+  check('remote close confirms FROM FIXED (pulled)', syncConfirm.body.pulled >= 1, JSON.stringify(syncConfirm.body));
+  const t1f = (await j('GET', '/annotakit/api/threads')).body.threads[0];
+  check('thread resolved + resolvedAt after reviewer closed', t1f.status === 'resolved' && Boolean(t1f.resolvedAt), `${t1f.status} ${t1f.resolvedAt}`);
+  check('fixed→resolved confirmation trace comment', t1f.comments.some((c) => c.source === 'github' && c.body === 'closed on GitHub' && c.author === 'agent-smith'));
+  // restore the OPEN thread+issue state section 5 expects
+  const reopenAfterConfirm = { ...t1f, status: 'open' };
+  await j('PATCH', `/annotakit/api/threads/${t1.id}`, reopenAfterConfirm);
+  await waitFor(() => gh.issues[0].state === 'open', 5000, 'issue reopened after confirm-reject cycle');
+  check('issue reopened (state restored)', gh.issues[0].state === 'open');
+
   console.log('== 5. remote close (agent on GitHub) → local thread resolves ==');
   closeRemote(1);
   const sync1 = await j('POST', '/annotakit/api/sync');

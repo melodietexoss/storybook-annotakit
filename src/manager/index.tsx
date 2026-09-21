@@ -116,7 +116,11 @@ function ReviewPanel(): React.ReactElement {
   const storyId = state.storyId as string | undefined;
 
   const [scope, setScope] = useState<'story' | 'all'>('story');
-  const [filter, setFilter] = useState<'open' | 'all'>('all');
+  const [filter, setFilter] = useState<'open' | 'review' | 'all'>('all');
+  /** v0.6.3: list order — 'story' = stable (resolving never reorders);
+   * 'recent' = updatedAt DESC (every reply/status flip bumps it — the
+   * "what was addressed since my last visit" view; opt-in because it moves). */
+  const [sortMode, setSortMode] = useState<'story' | 'recent'>('story');
   const [threads, setThreads] = useState<Thread[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -309,13 +313,15 @@ function ReviewPanel(): React.ReactElement {
     }
   };
 
-  const toggleResolve = async (t: Thread): Promise<void> => {
+  /** v0.6.3 generalized status setter (was toggleResolve) — reviewer actions:
+   *  confirm (fixed→resolved), reject (fixed→open), direct resolve, reopen. */
+  const setStatus = async (t: Thread, status: Thread['status']): Promise<void> => {
     setBusy(true);
     try {
       const next: Thread = {
         ...t,
-        status: t.status === 'open' ? 'resolved' : 'open',
-        resolvedAt: t.status === 'open' ? new Date().toISOString() : undefined,
+        status,
+        resolvedAt: status === 'resolved' ? (t.resolvedAt ?? new Date().toISOString()) : undefined,
       };
       if (staticMode) {
         const store = await getGhLinkedStaticStore();
@@ -467,12 +473,18 @@ function ReviewPanel(): React.ReactElement {
     window.setTimeout(() => setNotice(null), 5000);
   };
 
-  const ordered = useMemo(() => stableSort(threads), [threads]);
+  const ordered = useMemo(
+    () => (sortMode === 'recent'
+      ? [...threads].sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
+      : stableSort(threads)),
+    [threads, sortMode],
+  );
   const shown = useMemo(
-    () => ordered.filter((t) => (filter === 'all' ? true : t.status === 'open')),
+    () => ordered.filter((t) => (filter === 'all' ? true : filter === 'open' ? t.status === 'open' : t.status === 'fixed')),
     [ordered, filter],
   );
   const openCount = ordered.filter((t) => t.status === 'open').length;
+  const fixedCount = ordered.filter((t) => t.status === 'fixed').length;
   const chip = (bg: string, color: string): React.CSSProperties => ({
     background: bg,
     color,
@@ -506,15 +518,28 @@ function ReviewPanel(): React.ReactElement {
           </button>
         </div>
         <div style={{ display: 'flex', gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: 'hidden' }}>
-          <button style={miniBtn(theme.colorSecondary, filter === 'all')} onClick={() => setFilter('all')} title="Show open + resolved">
+          <button style={miniBtn(theme.colorSecondary, filter === 'all')} onClick={() => setFilter('all')} title="Show everything">
             all
           </button>
-          <button style={miniBtn(theme.colorSecondary, filter === 'open')} onClick={() => setFilter('open')} title="Show only open">
+          <button style={miniBtn(theme.colorSecondary, filter === 'open')} onClick={() => setFilter('open')} title="Show only open (agent work queue)">
             open
+          </button>
+          <button style={miniBtn(theme.colorSecondary, filter === 'review')} onClick={() => setFilter('review')} title="Threads the agent marked fixed — awaiting your verification (the check-latest-batch view)">
+            to review
+          </button>
+        </div>
+        <div style={{ display: 'flex', gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: 'hidden' }}>
+          <button style={miniBtn(theme.colorSecondary, sortMode === 'story')} onClick={() => setSortMode('story')} title="Stable order: story title, then thread number — resolving never reorders the list">
+            by story
+          </button>
+          <button style={miniBtn(theme.colorSecondary, sortMode === 'recent')} onClick={() => setSortMode('recent')} title="Most recently touched first (replies, status flips) — the what-was-addressed-since-my-last-visit view">
+            recent
           </button>
         </div>
         <span style={{ fontSize: 11, color: theme.textMutedColor }}>
-          {threads.length ? `${openCount} open / ${threads.length} threads` : 'no threads'}
+          {threads.length
+            ? `${openCount} open${fixedCount > 0 ? ` · ${fixedCount} to review` : ''} / ${threads.length} threads`
+            : 'no threads'}
         </span>
         <span style={{ flex: 1 }} />
         <input
@@ -567,7 +592,7 @@ function ReviewPanel(): React.ReactElement {
               ),
               fontSize: 10,
             }}
-            title={`Client-side publishing${ghStat.suppressed ? ' — DISABLED by local settings (queued feedback holds until re-enabled)' : ` → ${ghStat.repo ?? '(not set)'} · labels: ${(ghStat.labels ?? []).join(', ') || 'annotakit'} · queue: ${ghStat.queue}${ghStat.flushing ? ' (flushing)' : ''}${ghStat.parked ? ` · parked: ${ghStat.parked}` : ''}`}${ghStat.lastError ? ` · error: ${ghStat.lastError}` : ''}${ghStat.lastPullAt && !ghStat.suppressed ? ` · pulled ${ago(ghStat.lastPullAt)}` : ''}`}
+            title={`Client-side publishing${ghStat.suppressed ? ' — DISABLED by local settings (queued feedback holds until re-enabled)' : ` → ${ghStat.repo ?? '(not set)'} · labels: ${(ghStat.labels ?? []).join(', ') || 'annotakit'} · queue: ${ghStat.queue}${ghStat.flushing ? ' (flushing)' : ''}${ghStat.parked ? ` · parked: ${ghStat.parked}` : ''}`}${ghStat.lastError ? ` · error: ${ghStat.lastError}` : ''}${ghStat.lastPushAt && !ghStat.suppressed ? ` · pushed ${ago(ghStat.lastPushAt)}` : ''}${ghStat.lastPullAt && !ghStat.suppressed ? ` · pulled ${ago(ghStat.lastPullAt)}` : ''}`}
           >
             {ghStat.suppressed
               ? `static · client GH off${ghStat.queue > 0 ? ` · ${ghStat.queue} queued` : ''}`
@@ -740,7 +765,11 @@ function ReviewPanel(): React.ReactElement {
             ? scope === 'story'
               ? <>No threads for this story. Press <b>⌥C</b> (Alt+C) in the canvas and click an element — or <b>⌥R</b> to drag a region. Everything saves automatically to the dev-server store.</>
               : <>No threads yet. Press <b>⌥C</b> (Alt+C) in the canvas and click an element.</>
-            : <>All threads resolved 🎉 — switch the filter to “all” to see them.</>}
+            : filter === 'open'
+              ? <>Nothing open — everything is fixed (awaiting review) or resolved. Switch the filter to “to review” or “all”.</>
+              : filter === 'review'
+                ? <>Nothing awaiting review — no agent fixes pending.</>
+                : <>All threads resolved 🎉.</>}
         </div>
       )}
       {shown.map((t) => {
@@ -755,13 +784,19 @@ function ReviewPanel(): React.ReactElement {
               border: `1px solid ${active ? theme.colorSecondary : theme.appBorderColor}`,
               background: active ? `${theme.colorSecondary}11` : 'transparent',
               cursor: 'pointer',
-              opacity: t.status === 'open' ? 1 : 0.75,
+              opacity: t.status === 'resolved' ? 0.75 : 1,
             }}
             onClick={() => focusThread(t)}
           >
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <span style={chip(t.status === 'open' ? '#f59e0b22' : '#16a34a22', t.status === 'open' ? '#b45309' : '#15803d')}>
-                #{t.number} {t.status === 'open' ? 'open' : 'resolved'}
+              <span
+                style={chip(
+                  t.status === 'open' ? '#f59e0b22' : t.status === 'fixed' ? '#2563eb22' : '#16a34a22',
+                  t.status === 'open' ? '#b45309' : t.status === 'fixed' ? '#1d4ed8' : '#15803d',
+                )}
+                title={t.status === 'fixed' ? 'addressed by the agent — awaiting your verification' : t.status}
+              >
+                #{t.number} {t.status === 'open' ? 'open' : t.status === 'fixed' ? 'fixed' : 'resolved'}
               </span>
               {t.gh?.url && (
                 <a
@@ -792,7 +827,7 @@ function ReviewPanel(): React.ReactElement {
               <span style={{ flex: 1 }} />
               <span style={{ fontSize: 10, color: theme.textMutedColor }}>{t.createdAt.slice(0, 10)}</span>
             </div>
-            <div style={{ fontSize: 12, marginTop: 3, color: theme.textColor, textDecoration: t.status === 'open' ? 'none' : 'line-through' }}>
+            <div style={{ fontSize: 12, marginTop: 3, color: theme.textColor, textDecoration: t.status === 'resolved' ? 'line-through' : 'none' }}>
               {t.comments[0]?.body?.split('\n')[0]?.slice(0, 140) ?? '(no text)'}
             </div>
             {t.component?.source && (
@@ -804,7 +839,7 @@ function ReviewPanel(): React.ReactElement {
             {t.comments.length > 1 && (
               <div style={{ fontSize: 10.5, color: theme.textMutedColor, marginTop: 2 }}>+{t.comments.length - 1} replies</div>
             )}
-            <ThreadActions thread={t} busy={busy} onReply={reply} onToggleResolve={toggleResolve} active={active} />
+            <ThreadActions thread={t} busy={busy} onReply={reply} onSetStatus={setStatus} active={active} />
           </div>
         );
       })}
@@ -832,7 +867,7 @@ function ThreadActions(props: {
   busy: boolean;
   active: boolean;
   onReply: (t: Thread, body: string) => Promise<boolean>;
-  onToggleResolve: (t: Thread) => void;
+  onSetStatus: (t: Thread, status: Thread['status']) => void;
 }): React.ReactElement {
   const [body, setBody] = useState('');
   const theme = useTheme();
@@ -853,14 +888,47 @@ function ThreadActions(props: {
           }
         }}
       />
-      <button
-        style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: `1px solid ${props.thread.status === 'open' ? '#86efac' : '#fecaca'}`, background: 'transparent', color: props.thread.status === 'open' ? '#15803d' : '#b91c1c', display: 'inline-flex', gap: 4, alignItems: 'center' }}
-        disabled={props.busy}
-        onClick={() => props.onToggleResolve(props.thread)}
-      >
-        <CheckIcon width={11} height={11} />
-        {props.thread.status === 'open' ? 'resolve' : 'reopen'}
-      </button>
+      {props.thread.status === 'open' && (
+        <button
+          style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: '1px solid #86efac', background: 'transparent', color: '#15803d', display: 'inline-flex', gap: 4, alignItems: 'center' }}
+          disabled={props.busy}
+          onClick={() => props.onSetStatus(props.thread, 'resolved')}
+          title="Resolve (reviewer-confirmed)"
+        >
+          <CheckIcon width={11} height={11} />
+          resolve
+        </button>
+      )}
+      {props.thread.status === 'fixed' && (
+        <>
+          <button
+            style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: '1px solid #86efac', background: 'transparent', color: '#15803d', display: 'inline-flex', gap: 4, alignItems: 'center' }}
+            disabled={props.busy}
+            onClick={() => props.onSetStatus(props.thread, 'resolved')}
+            title="Confirm the fix — the agent addressed this, you verified it"
+          >
+            <CheckIcon width={11} height={11} />
+            confirm
+          </button>
+          <button
+            style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: '1px solid #fecaca', background: 'transparent', color: '#b91c1c', display: 'inline-flex', gap: 4, alignItems: 'center' }}
+            disabled={props.busy}
+            onClick={() => props.onSetStatus(props.thread, 'open')}
+            title="Reject — back to open (reply with why)"
+          >
+            reject
+          </button>
+        </>
+      )}
+      {props.thread.status === 'resolved' && (
+        <button
+          style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: '1px solid #fecaca', background: 'transparent', color: '#b91c1c', display: 'inline-flex', gap: 4, alignItems: 'center' }}
+          disabled={props.busy}
+          onClick={() => props.onSetStatus(props.thread, 'open')}
+        >
+          reopen
+        </button>
+      )}
     </div>
   );
 }
@@ -931,6 +999,7 @@ function AnnotaKitTool(): React.ReactElement {
   );
 
   const open = ui?.open ?? 0;
+  const fixed = ui?.fixed ?? 0;
   const total = ui?.total ?? 0;
   const drawerOn = ui?.drawerOpen === true;
   return (
@@ -957,8 +1026,17 @@ function AnnotaKitTool(): React.ReactElement {
         <CommentsIcon width={14} height={14} />
         {total > 0 && (
           <span
+            title={
+              open > 0
+                ? `${open} open · ${fixed} fixed (awaiting review) · ${total} total`
+                : fixed > 0
+                  ? `${fixed} fixed — awaiting your review (${total} total)`
+                  : `${total} threads, all resolved`
+            }
             style={{
-              background: open > 0 ? '#d97706' : '#94a3b8',
+              // v0.6.3: amber = agent work queued, blue = fixes awaiting the
+              // reviewer's verification (0 open + N fixed is NOT "nothing to do")
+              background: open > 0 ? '#d97706' : fixed > 0 ? '#2563eb' : '#94a3b8',
               color: '#fff',
               borderRadius: 999,
               minWidth: 16,
@@ -970,7 +1048,7 @@ function AnnotaKitTool(): React.ReactElement {
               fontWeight: 700,
             }}
           >
-            {open > 0 ? open : total}
+            {open > 0 ? open : fixed > 0 ? fixed : total}
           </span>
         )}
       </button>

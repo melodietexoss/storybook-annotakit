@@ -37,7 +37,7 @@ import {
 } from '../shared/events';
 import { elementSummary } from '../shared/describe';
 import { probeMode } from '../shared/mode';
-import { getGhLinkedStaticStore, type GhClientStatus } from '../shared/ghClient';
+import { getGhLinkedStaticStore } from '../shared/ghClient';
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { DomSnapshot, ThreadInput } from '../shared/types';
 import type { Comment, ComponentRef, TargetContext, Thread, ThreadTarget } from '../shared/types';
@@ -182,9 +182,6 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
   /** v0.5.x static build (no dev server): threads live in localStorage,
    *  seeded from the baked annotakit-threads.json (see shared/staticStore). */
   const [staticMode, setStaticMode] = useState(false);
-  /** client-side GitHub publishing status (v0.5.3) — mirrors the chip in the
-   *  manager: green when the browser itself lands feedback on GitHub. */
-  const [ghStatus, setGhStatus] = useState<GhClientStatus | null>(null);
   /** no thread fetches before the world is known (dev REST vs static store). */
   const [modeResolved, setModeResolved] = useState(false);
   const [threads, setThreads] = useState<Thread[]>([]);
@@ -388,10 +385,10 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
         snapshot: async () => undefined,
       };
       unsubStore = store.subscribe(() => void refresh());
-      // chip status: initial read + light polling (queue depth / errors move)
+      // storage-failure surface: light polling (the canvas stays overlay-free
+      // — publishing status lives in the manager panel, v0.6.3).
       const readStatus = (): void => {
         if (!alive) return;
-        setGhStatus(store.gh?.status() ?? null);
         setStorageError(store.info().lastStorageError ?? null);
       };
       readStatus();
@@ -519,6 +516,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
 
   /* ---- UI_STATE → manager toolbar (active-state reflection + counts) ---- */
   const openCountMemo = threads.filter((t) => t.status === 'open').length;
+  const fixedCountMemo = threads.filter((t) => t.status === 'fixed').length;
   useEffect(() => {
     const state: UiState = {
       apiOk,
@@ -526,6 +524,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
       mode,
       drawerOpen,
       open: openCountMemo,
+      fixed: fixedCountMemo,
       total: threads.length,
     };
     try {
@@ -533,7 +532,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
     } catch {
       /* ignore */
     }
-  }, [apiOk, visible, mode, drawerOpen, openCountMemo, threads.length]);
+  }, [apiOk, visible, mode, drawerOpen, openCountMemo, fixedCountMemo, threads.length]);
 
   /* ---- focus / flash ---- */
   const focusThread = useCallback(
@@ -763,14 +762,18 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
     [refresh],
   );
 
-  const toggleResolve = useCallback(
-    async (thread: Thread) => {
+  /** v0.6.3 generalized status setter (was toggleResolve): the preview's
+   *  affordances are REVIEWER actions — confirm (fixed→resolved), reject
+   *  (fixed→open), direct resolve (open→resolved), reopen (resolved→open).
+   *  resolvedAt is stamped/cleared by the server / static-store doors. */
+  const setStatus = useCallback(
+    async (thread: Thread, status: Thread['status']) => {
       setBusy(true);
       try {
         const next: Thread = {
           ...thread,
-          status: thread.status === 'open' ? 'resolved' : 'open',
-          resolvedAt: thread.status === 'open' ? new Date().toISOString() : undefined,
+          status,
+          resolvedAt: status === 'resolved' ? (thread.resolvedAt ?? new Date().toISOString()) : undefined,
         };
         const updated = await dataRef.current.patch(next);
         setThreads((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
@@ -845,7 +848,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
           thread.target.kind === 'region' ? (
             <div
               key={thread.id}
-              className={`annota-region${thread.status === 'resolved' ? ' is-resolved' : ''}${thread.id === activeThread ? ' is-active' : ''}`}
+              className={`annota-region${thread.status === 'resolved' ? ' is-resolved' : ''}${thread.status === 'fixed' ? ' is-fixed' : ''}${thread.id === activeThread ? ' is-active' : ''}`}
               style={{ left: clamp(fixed.x, 0, Math.max(window.innerWidth - fixed.w, 0)), top: clamp(fixed.y, 0, Math.max(window.innerHeight - fixed.h, 0)), width: fixed.w, height: fixed.h }}
               onClick={() => setActiveThread(thread.id)}
               title={`#${thread.number}`}
@@ -858,6 +861,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
               className={[
                 'annota-pin',
                 thread.status === 'resolved' ? 'is-resolved' : '',
+                thread.status === 'fixed' ? 'is-fixed' : '',
                 status === 'orphan' ? 'is-orphan' : '',
                 thread.id === activeThread ? 'is-active' : '',
               ]
@@ -884,57 +888,6 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
           ),
         )}
 
-      {/* static build: honest provenance chip. GH-linked (v0.5.3) → the
-          browser itself lands feedback on GitHub (PAT baked/embedded or set
-          in the manager's static settings); queue counts + errors surface
-          here. Otherwise: local-only, export to hand-carry. */}
-      {staticMode && !ghStatus?.configured && !ghStatus?.suppressed && (
-        <div className="annota-static-chip" title="Static `storybook build` — no dev server. Threads live in this browser's localStorage for this deployment; export to hand-carry them back. Nothing syncs.">
-          📌 static · local-only
-        </div>
-      )}
-      {staticMode && ghStatus?.suppressed && (
-        <div
-          className="annota-static-chip"
-          style={{ background: '#92400e22', color: '#b45309', borderColor: '#92400e66' }}
-          title={[
-            'Static build + client-side GitHub publishing — DISABLED by local settings.',
-            ghStatus && ghStatus.queue > 0 ? `queued feedback holds until re-enabled: ${ghStatus.queue}` : null,
-            'Open the annotakit panel → GitHub (static) settings to re-enable.',
-          ]
-            .filter(Boolean)
-            .join('\n')}
-        >
-          📌 static · client GH off{ghStatus && ghStatus.queue > 0 ? ` · ${ghStatus.queue} queued` : ''}
-        </div>
-      )}
-      {staticMode && ghStatus?.configured && !ghStatus.suppressed && (
-        <div
-          className="annota-static-chip"
-          style={
-            ghStatus.lastError
-              ? { background: '#dc262622', color: '#b91c1c', borderColor: '#dc262666' }
-              : { background: '#16a34a22', color: '#15803d', borderColor: '#16a34a66' }
-          }
-          title={[
-            `Static build + client-side GitHub publishing → ${ghStatus.repo ?? '(not set)'}`,
-            `labels: ${ghStatus.labels.length ? ghStatus.labels.join(', ') : '(default)'}`,
-            `queue: ${ghStatus.queue}${ghStatus.flushing ? ' (flushing)' : ''}${ghStatus.parked ? ` · parked: ${ghStatus.parked} (rejected by GitHub — not retrying)` : ''}`,
-            ghStatus.lastPushAt ? `last push: ${ghStatus.lastPushAt.replace('T', ' ').slice(5, 16)}` : null,
-            ghStatus.lastPullAt ? `last pull: ${ghStatus.lastPullAt.replace('T', ' ').slice(5, 16)}` : null,
-            ghStatus.lastError ? `error: ${ghStatus.lastError}` : null,
-          ]
-            .filter(Boolean)
-            .join('\n')}
-        >
-          {ghStatus.lastError
-            ? `📌 static → github · error${ghStatus.queue > 0 ? ` · queued ${ghStatus.queue}` : ''}`
-            : ghStatus.queue > 0
-              ? `📌 static → github · queued ${ghStatus.queue}`
-              : '📌 static → github'}
-        </div>
-      )}
-
       {/* transient, non-error friction hints (v0.6.1) — dead clicks SPEAK */}
       {hint && mode === 'idle' && (
         <div className="annota-capture-hint" role="status">
@@ -953,12 +906,9 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
         </div>
       )}
 
-      {/* capture affordances */}
-      {mode !== 'idle' && (
-        <div className="annota-capture-hint">
-          {mode === 'pin' ? 'Click the element to pin · Esc cancels' : 'Drag to mark a region · Esc cancels'}
-        </div>
-      )}
+      {/* capture affordances — NO banner (user directive 2026-09-21: the
+          "Click the element to pin" hint sat on top of the UI being reviewed;
+          Esc-to-cancel stays functional and is documented in the help card) */}
       {hoverBox && <div className="annota-hover-box" style={{ left: hoverBox.x, top: hoverBox.y, width: hoverBox.w, height: hoverBox.h }} />}
       {dragRect && <div className="annota-drag-rect" style={{ left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h }} />}
 
@@ -994,7 +944,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
           busy={busy}
           error={error}
           onReply={reply}
-          onToggleResolve={toggleResolve}
+          onSetStatus={setStatus}
           onClose={() => setActiveThread(null)}
         />
       )}
@@ -1008,7 +958,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
           busy={busy}
           hotkeys={hk}
           onSelect={(id) => focusThread(id)}
-          onToggleResolve={toggleResolve}
+          onSetStatus={setStatus}
           onClose={() => setDrawerOpen(false)}
         />
       )}
@@ -1169,7 +1119,7 @@ function ThreadCard(props: {
   busy: boolean;
   error: string | null;
   onReply: (t: Thread, body: string) => Promise<boolean>;
-  onToggleResolve: (t: Thread) => void;
+  onSetStatus: (t: Thread, status: Thread['status']) => void;
   onClose: () => void;
 }): React.ReactElement {
   const [replyBody, setReplyBody] = React.useState('');
@@ -1181,7 +1131,7 @@ function ThreadCard(props: {
     <div ref={ref} className="annota-card" style={style}>
       <div className="annota-card-header">
         <span className="annota-grow">
-          #{t.number} {t.status === 'open' ? '' : '(resolved)'}
+          #{t.number} {t.status === 'open' ? '' : t.status === 'fixed' ? '(fixed — awaiting your review)' : '(resolved)'}
         </span>
         {t.gh?.url && (
           <a
@@ -1251,13 +1201,26 @@ function ThreadCard(props: {
             }
           }}
         />
-        <button
-          className={`annota-btn ${t.status === 'open' ? 'is-ok' : 'is-danger'}`}
-          disabled={props.busy}
-          onClick={() => props.onToggleResolve(t)}
-        >
-          {t.status === 'open' ? 'Resolve' : 'Reopen'}
-        </button>
+        {t.status === 'open' && (
+          <button className="annota-btn is-ok" disabled={props.busy} onClick={() => props.onSetStatus(t, 'resolved')} title="Resolve (reviewer-confirmed)">
+            Resolve
+          </button>
+        )}
+        {t.status === 'fixed' && (
+          <>
+            <button className="annota-btn is-ok" disabled={props.busy} onClick={() => props.onSetStatus(t, 'resolved')} title="Confirm the fix — the agent addressed this, you verified it">
+              ✓ Confirm
+            </button>
+            <button className="annota-btn is-danger" disabled={props.busy} onClick={() => props.onSetStatus(t, 'open')} title="Reject — back to open (reply with why)">
+              Reject
+            </button>
+          </>
+        )}
+        {t.status === 'resolved' && (
+          <button className="annota-btn is-danger" disabled={props.busy} onClick={() => props.onSetStatus(t, 'open')}>
+            Reopen
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1270,24 +1233,33 @@ function DrawerCard(props: {
   busy: boolean;
   hotkeys: Hotkeys;
   onSelect: (id: string) => void;
-  onToggleResolve: (t: Thread) => void;
+  onSetStatus: (t: Thread, status: Thread['status']) => void;
   onClose: () => void;
 }): React.ReactElement {
-  const [filter, setFilter] = useState<'open' | 'all'>('all');
-  const shown = props.threads.filter((t) => (filter === 'all' ? true : t.status === 'open'));
+  const [filter, setFilter] = useState<'open' | 'review' | 'all'>('all');
+  const shown = props.threads.filter((t) =>
+    filter === 'all' ? true : filter === 'open' ? t.status === 'open' : t.status === 'fixed',
+  );
+  const openCount = props.threads.filter((t) => t.status === 'open').length;
+  const fixedCount = props.threads.filter((t) => t.status === 'fixed').length;
+  const filterBtn = (key: 'open' | 'review' | 'all', label: string, title: string): React.ReactElement => (
+    <button
+      className={`annota-btn is-small${filter === key ? ' is-primary' : ''}`}
+      onClick={() => setFilter(key)}
+      title={title}
+    >
+      {label}
+    </button>
+  );
   return (
     <div className="annota-card annota-drawer">
       <div className="annota-card-header">
         <span className="annota-grow" title="Press ? for all keyboard shortcuts">
-          Threads — this story ({props.threads.filter((t) => t.status === 'open').length} open)
+          Threads — this story ({openCount} open{fixedCount > 0 ? ` · ${fixedCount} to review` : ''})
         </span>
-        <button
-          className={`annota-btn is-small${filter === 'open' ? ' is-primary' : ''}`}
-          onClick={() => setFilter((f) => (f === 'open' ? 'all' : 'open'))}
-          title={`Filter: ${filter === 'open' ? 'open only' : 'all'} — click to ${filter === 'open' ? 'show all threads' : 'show only open threads'}`}
-        >
-          {filter === 'open' ? 'open only' : 'all'}
-        </button>
+        {filterBtn('open', 'open', 'Show only open threads (agent work queue)')}
+        {filterBtn('review', 'to review', 'Show threads the agent marked fixed — awaiting your verification')}
+        {filterBtn('all', 'all', 'Show all threads')}
         <button className="annota-btn is-small" onClick={props.onClose}>
           ✕
         </button>
@@ -1299,18 +1271,26 @@ function DrawerCard(props: {
         </div>
       )}
       {props.threads.length > 0 && shown.length === 0 && (
-        <div className="annota-status-banner is-info">All threads resolved 🎉 (showing “open only”).</div>
+        <div className="annota-status-banner is-info">
+          {filter === 'open'
+            ? 'Nothing open — everything is fixed or resolved.'
+            : filter === 'review'
+              ? 'Nothing awaiting review — no agent fixes pending.'
+              : 'All threads resolved 🎉.'}
+        </div>
       )}
       {shown.map((t) => {
         const status = props.anchors.get(t.id)?.status ?? 'orphan';
         return (
           <div
             key={t.id}
-            className={`annota-thread-row${t.id === props.activeThread ? ' is-active' : ''}${t.status === 'resolved' ? ' is-resolved' : ''}`}
+            className={`annota-thread-row${t.id === props.activeThread ? ' is-active' : ''}${t.status === 'resolved' ? ' is-resolved' : ''}${t.status === 'fixed' ? ' is-fixed' : ''}`}
             onClick={() => props.onSelect(t.id)}
           >
             <div className="annota-thread-title">
-              <span className={`annota-dot${t.status === 'resolved' ? ' is-resolved' : status === 'orphan' ? ' is-orphan' : ''}`} />
+              <span
+                className={`annota-dot${t.status === 'resolved' ? ' is-resolved' : t.status === 'fixed' ? ' is-fixed' : status === 'orphan' ? ' is-orphan' : ''}`}
+              />
               #{t.number} {t.comments[0]?.body?.split('\n')[0]?.slice(0, 60) ?? '(no text)'}
             </div>
             <div className="annota-thread-sub">
@@ -1319,16 +1299,56 @@ function DrawerCard(props: {
               {t.author} · {t.createdAt.slice(0, 10)}
             </div>
             <div style={{ marginTop: 4 }}>
-              <button
-                className={`annota-btn is-small ${t.status === 'open' ? 'is-ok' : 'is-danger'}`}
-                disabled={props.busy}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  props.onToggleResolve(t);
-                }}
-              >
-                {t.status === 'open' ? 'Resolve' : 'Reopen'}
-              </button>
+              {t.status === 'open' && (
+                <button
+                  className="annota-btn is-small is-ok"
+                  disabled={props.busy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    props.onSetStatus(t, 'resolved');
+                  }}
+                >
+                  Resolve
+                </button>
+              )}
+              {t.status === 'fixed' && (
+                <>
+                  <button
+                    className="annota-btn is-small is-ok"
+                    disabled={props.busy}
+                    title="Confirm the fix — you verified it"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      props.onSetStatus(t, 'resolved');
+                    }}
+                  >
+                    ✓ Confirm
+                  </button>
+                  <button
+                    className="annota-btn is-small is-danger"
+                    disabled={props.busy}
+                    title="Reject — back to open (reply with why)"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      props.onSetStatus(t, 'open');
+                    }}
+                  >
+                    Reject
+                  </button>
+                </>
+              )}
+              {t.status === 'resolved' && (
+                <button
+                  className="annota-btn is-small is-danger"
+                  disabled={props.busy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    props.onSetStatus(t, 'open');
+                  }}
+                >
+                  Reopen
+                </button>
+              )}
             </div>
           </div>
         );

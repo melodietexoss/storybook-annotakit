@@ -25,9 +25,19 @@ export const OVERLAY_CSS = `
   color: inherit;
 }
 
+/* ---------- z-stack (v0.6.3): pins NEVER lose to overlays ----------
+ * Inside .annota-root's stacking context the rule is explicit:
+ *   10 = transient passive overlays (capture hint, toast) — pointer-events
+ *        none (toast: none on the container, auto on its dismiss button),
+ *        so they can neither hide nor swallow a pin
+ *   20 = pins + regions — ALWAYS on top of passive chrome
+ *   30 = deliberate interactive surfaces (composer card, drawer, help) —
+ *        invoked contexts, allowed above pins while open */
+
 /* ---------- pin markers ---------- */
 .annota-pin {
   position: fixed;
+  z-index: 20;
   pointer-events: auto;
   min-width: 22px;
   height: 22px;
@@ -47,12 +57,14 @@ export const OVERLAY_CSS = `
 }
 .annota-pin:hover { transform: scale(1.15); }
 .annota-pin.is-resolved { background: #94a3b8; }
+.annota-pin.is-fixed { background: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.25); }
 .annota-pin.is-orphan { background: #fff; color: #94a3b8; border-style: dashed; }
 .annota-pin.is-active { outline: 2px solid var(--annota-accent); outline-offset: 2px; }
 
 /* ---------- region outlines ---------- */
 .annota-region {
   position: fixed;
+  z-index: 20;
   pointer-events: auto;
   border: 2px dashed var(--annota-accent);
   background: rgba(79, 70, 229, .06);
@@ -60,6 +72,7 @@ export const OVERLAY_CSS = `
   cursor: pointer;
 }
 .annota-region.is-resolved { border-color: #94a3b8; background: rgba(148,163,184,.06); }
+.annota-region.is-fixed { border-color: #2563eb; background: rgba(37,99,235,.08); }
 .annota-region .annota-region-tag {
   position: absolute;
   top: -20px;
@@ -72,10 +85,12 @@ export const OVERLAY_CSS = `
   border-radius: 999px;
 }
 .annota-region.is-resolved .annota-region-tag { background: #94a3b8; }
+.annota-region.is-fixed .annota-region-tag { background: #2563eb; }
 
 /* ---------- capture mode ---------- */
 .annota-capture-hint {
   position: fixed;
+  z-index: 10;
   top: 10px;
   left: 50%;
   transform: translateX(-50%);
@@ -90,6 +105,7 @@ export const OVERLAY_CSS = `
 }
 .annota-hover-box {
   position: fixed;
+  z-index: 10;
   border: 2px solid var(--annota-accent);
   background: rgba(79, 70, 229, .12);
   border-radius: 3px;
@@ -100,6 +116,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 /* drag region */
 .annota-drag-rect {
   position: fixed;
+  z-index: 10;
   border: 2px solid var(--annota-accent);
   background: rgba(79, 70, 229, .12);
   pointer-events: none;
@@ -109,6 +126,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 /* ---------- cards (composer / popover / drawer / help) ---------- */
 .annota-card {
   position: fixed;
+  z-index: 30;
   pointer-events: auto;
   background: #fff;
   border-radius: 10px;
@@ -230,27 +248,6 @@ body.annota-cursor * { cursor: crosshair !important; }
   user-select: none;
 }
 
-/* static-build provenance chip: same visual family, top-right so it never
-   fights the pins/drawer at the bottom of the canvas. */
-.annota-static-chip {
-  position: fixed;
-  right: 18px;
-  top: 12px;
-  pointer-events: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  background: rgba(255, 251, 235, .95);
-  border: 1px solid #fcd34d;
-  border-radius: 999px;
-  padding: 4px 10px;
-  font-weight: 700;
-  font-size: 11px;
-  color: #92400e;
-  box-shadow: 0 2px 10px rgba(15, 23, 42, .10);
-  user-select: none;
-}
-
 /* rich one-line element identity (composer) — same string as the digest */
 .annota-element-summary {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -263,6 +260,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 /* ---------- drawer ---------- */
 .annota-drawer {
   position: fixed;
+  z-index: 30;
   right: 18px;
   /* v0.5.0: no more in-canvas launcher below it — dock to the corner */
   bottom: 18px;
@@ -276,6 +274,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 .annota-thread-row .annota-thread-title { font-weight: 600; font-size: 12.5px; }
 .annota-thread-row .annota-thread-sub { font-size: 11px; color: #64748b; margin-top: 2px; }
 .annota-thread-row.is-resolved .annota-thread-title { text-decoration: line-through; color: #94a3b8; }
+.annota-thread-row.is-fixed .annota-thread-title { color: #2563eb; }
 .annota-dot {
   display: inline-block;
   width: 8px;
@@ -285,11 +284,13 @@ body.annota-cursor * { cursor: crosshair !important; }
   margin-right: 5px;
 }
 .annota-dot.is-resolved { background: var(--annota-ok); }
+.annota-dot.is-fixed { background: #2563eb; }
 .annota-dot.is-orphan { background: #cbd5e1; }
 
 /* ---------- help ---------- */
 .annota-help {
   position: fixed;
+  z-index: 30;
   left: 50%;
   bottom: 60px;
   transform: translateX(-50%);
@@ -312,12 +313,16 @@ body.annota-cursor * { cursor: crosshair !important; }
   color: #334155;
 }
 
-/* ---------- toast (transient overlay errors — never silent) ---------- */
+/* ---------- toast (transient overlay errors — never silent) ----------
+ * z 10 = BELOW pins (pins are never covered); container is pointer-events
+ * none so it never swallows canvas clicks — only its dismiss button is
+ * interactive (children re-enable via their own pointer-events). */
 .annota-toast {
   position: fixed;
+  z-index: 10;
   top: 12px;
   right: 14px;
-  pointer-events: auto;
+  pointer-events: none;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -330,9 +335,8 @@ body.annota-cursor * { cursor: crosshair !important; }
   font-weight: 600;
   max-width: 380px;
   box-shadow: 0 6px 22px rgba(15, 23, 42, .14);
-  z-index: 2;
 }
-.annota-toast .annota-btn { border: none; background: transparent; padding: 0 4px; cursor: pointer; color: inherit; }
+.annota-toast .annota-btn { border: none; background: transparent; padding: 0 4px; cursor: pointer; color: inherit; pointer-events: auto; }
 
 /* ---------- flash highlight (target element in the STORY dom) ---------- */
 @keyframes annota-flash {

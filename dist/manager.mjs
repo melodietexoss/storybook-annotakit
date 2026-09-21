@@ -6,14 +6,14 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-TU6B6TIH.mjs";
+} from "./chunk-Y2DYPSGG.mjs";
 import {
   getGhLinkedStaticStore,
   ghClientStatus
-} from "./chunk-B5CKOYWU.mjs";
+} from "./chunk-XGVDME4E.mjs";
 import {
   renderStaticDigest
-} from "./chunk-EVH4K5TX.mjs";
+} from "./chunk-MLHFKDNW.mjs";
 
 // src/manager/index.tsx
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -75,6 +75,7 @@ function ReviewPanel() {
   const storyId = state.storyId;
   const [scope, setScope] = useState("story");
   const [filter, setFilter] = useState("all");
+  const [sortMode, setSortMode] = useState("story");
   const [threads, setThreads] = useState([]);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
@@ -240,13 +241,13 @@ function ReviewPanel() {
       setBusy(false);
     }
   };
-  const toggleResolve = async (t) => {
+  const setStatus = async (t, status) => {
     setBusy(true);
     try {
       const next = {
         ...t,
-        status: t.status === "open" ? "resolved" : "open",
-        resolvedAt: t.status === "open" ? (/* @__PURE__ */ new Date()).toISOString() : void 0
+        status,
+        resolvedAt: status === "resolved" ? t.resolvedAt ?? (/* @__PURE__ */ new Date()).toISOString() : void 0
       };
       if (staticMode) {
         const store = await getGhLinkedStaticStore();
@@ -372,12 +373,16 @@ function ReviewPanel() {
     setNotice("local overrides cleared \u2014 baked config (if any) applies again");
     window.setTimeout(() => setNotice(null), 5e3);
   };
-  const ordered = useMemo(() => stableSort(threads), [threads]);
+  const ordered = useMemo(
+    () => sortMode === "recent" ? [...threads].sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""))) : stableSort(threads),
+    [threads, sortMode]
+  );
   const shown = useMemo(
-    () => ordered.filter((t) => filter === "all" ? true : t.status === "open"),
+    () => ordered.filter((t) => filter === "all" ? true : filter === "open" ? t.status === "open" : t.status === "fixed"),
     [ordered, filter]
   );
   const openCount = ordered.filter((t) => t.status === "open").length;
+  const fixedCount = ordered.filter((t) => t.status === "fixed").length;
   const chip = (bg, color) => ({
     background: bg,
     color,
@@ -397,7 +402,7 @@ function ReviewPanel() {
     background: active ? bg : "transparent",
     color: active ? "#fff" : theme.textColor
   });
-  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: theme.fontBase, fontSize: 13, padding: "8px 10px", height: "100%", overflow: "auto", color: theme.textColor } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "story"), onClick: () => setScope("story") }, "This story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "all"), onClick: () => setScope("all") }, "All stories")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "all"), onClick: () => setFilter("all"), title: "Show open + resolved" }, "all"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "open"), onClick: () => setFilter("open"), title: "Show only open" }, "open")), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: theme.textMutedColor } }, threads.length ? `${openCount} open / ${threads.length} threads` : "no threads"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: theme.fontBase, fontSize: 13, padding: "8px 10px", height: "100%", overflow: "auto", color: theme.textColor } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "story"), onClick: () => setScope("story") }, "This story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "all"), onClick: () => setScope("all") }, "All stories")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "all"), onClick: () => setFilter("all"), title: "Show everything" }, "all"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "open"), onClick: () => setFilter("open"), title: "Show only open (agent work queue)" }, "open"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "review"), onClick: () => setFilter("review"), title: "Threads the agent marked fixed \u2014 awaiting your verification (the check-latest-batch view)" }, "to review")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "story"), onClick: () => setSortMode("story"), title: "Stable order: story title, then thread number \u2014 resolving never reorders the list" }, "by story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "recent"), onClick: () => setSortMode("recent"), title: "Most recently touched first (replies, status flips) \u2014 the what-was-addressed-since-my-last-visit view" }, "recent")), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: theme.textMutedColor } }, threads.length ? `${openCount} open${fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : ""} / ${threads.length} threads` : "no threads"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
     "input",
     {
       style: { padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor, width: 110 },
@@ -436,7 +441,7 @@ function ReviewPanel() {
         ),
         fontSize: 10
       },
-      title: `Client-side publishing${ghStat.suppressed ? " \u2014 DISABLED by local settings (queued feedback holds until re-enabled)" : ` \u2192 ${ghStat.repo ?? "(not set)"} \xB7 labels: ${(ghStat.labels ?? []).join(", ") || "annotakit"} \xB7 queue: ${ghStat.queue}${ghStat.flushing ? " (flushing)" : ""}${ghStat.parked ? ` \xB7 parked: ${ghStat.parked}` : ""}`}${ghStat.lastError ? ` \xB7 error: ${ghStat.lastError}` : ""}${ghStat.lastPullAt && !ghStat.suppressed ? ` \xB7 pulled ${ago(ghStat.lastPullAt)}` : ""}`
+      title: `Client-side publishing${ghStat.suppressed ? " \u2014 DISABLED by local settings (queued feedback holds until re-enabled)" : ` \u2192 ${ghStat.repo ?? "(not set)"} \xB7 labels: ${(ghStat.labels ?? []).join(", ") || "annotakit"} \xB7 queue: ${ghStat.queue}${ghStat.flushing ? " (flushing)" : ""}${ghStat.parked ? ` \xB7 parked: ${ghStat.parked}` : ""}`}${ghStat.lastError ? ` \xB7 error: ${ghStat.lastError}` : ""}${ghStat.lastPushAt && !ghStat.suppressed ? ` \xB7 pushed ${ago(ghStat.lastPushAt)}` : ""}${ghStat.lastPullAt && !ghStat.suppressed ? ` \xB7 pulled ${ago(ghStat.lastPullAt)}` : ""}`
     },
     ghStat.suppressed ? `static \xB7 client GH off${ghStat.queue > 0 ? ` \xB7 ${ghStat.queue} queued` : ""}` : ghStat.lastError ? `static \u2192 github \xB7 error${ghStat.queue > 0 ? ` \xB7 queued ${ghStat.queue}` : ""}` : ghStat.queue > 0 ? `static \u2192 github \xB7 queued ${ghStat.queue}` : "static \u2192 github"
   )), ghOpen && !staticMode && /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 0", borderBottom: `1px solid ${theme.appBorderColor}`, fontSize: 11, display: "flex", flexDirection: "column", gap: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, sync ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { ...chip(sync.mode === "auto" ? `${theme.colorPositive}22` : "#f59e0b22", sync.mode === "auto" ? theme.colorPositive : "#b45309") } }, sync.mode === "auto" ? "auto-sync" : sync.mode === "unconfigured" ? "local mode" : "mirror off"), /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, sync.mode === "auto" && /* @__PURE__ */ React.createElement(React.Fragment, null, sync.mapped, "/", sync.threads, " threads mirrored", sync.pending > 0 ? ` \xB7 ${sync.pending} queued` : "", sync.stalled > 0 ? ` \xB7 ${sync.stalled} stalled` : "", sync.lastPushAt ? ` \xB7 pushed ${ago(sync.lastPushAt)}` : "", sync.lastPullAt ? ` \xB7 pulled ${ago(sync.lastPullAt)}` : "", sync.pollSec > 0 ? ` \xB7 polls every ${sync.pollSec}s` : "", sync.labels && sync.labels.length ? ` \xB7 labels: ${sync.labels.join(", ")}` : ""), sync.backoffUntil && /* @__PURE__ */ React.createElement(React.Fragment, null, sync.lastError ? " \xB7 " : "", "backoff until ", new Date(sync.backoffUntil).toLocaleTimeString()))) : /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "sync status unavailable (dev server offline?)"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
@@ -506,7 +511,7 @@ function ReviewPanel() {
       title: "Remove localStorage overrides \u2014 the baked annotakit-gh.json applies again"
     },
     "Reset"
-  )), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, "Saved overrides live in THIS browser for THIS deployment (localStorage). Every thread mirrors to exactly ONE issue; queued feedback flushes on the next page load even after crashes. Multiple workstreams on one repo: give each a distinct label set here.")), error && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${theme.colorNegative}22`, color: theme.colorNegative, whiteSpace: "pre-wrap" } }, error), notice && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${theme.colorPositive}22`, color: theme.colorPositive } }, notice), shown.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { padding: "12px 4px", fontSize: 12, color: theme.textMutedColor } }, threads.length === 0 ? scope === "story" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Press ", /* @__PURE__ */ React.createElement("b", null, "\u2325C"), " (Alt+C) in the canvas and click an element \u2014 or ", /* @__PURE__ */ React.createElement("b", null, "\u2325R"), " to drag a region. Everything saves automatically to the dev-server store.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, "\u2325C"), " (Alt+C) in the canvas and click an element.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "All threads resolved \u{1F389} \u2014 switch the filter to \u201Call\u201D to see them.")), shown.map((t) => {
+  )), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, "Saved overrides live in THIS browser for THIS deployment (localStorage). Every thread mirrors to exactly ONE issue; queued feedback flushes on the next page load even after crashes. Multiple workstreams on one repo: give each a distinct label set here.")), error && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${theme.colorNegative}22`, color: theme.colorNegative, whiteSpace: "pre-wrap" } }, error), notice && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${theme.colorPositive}22`, color: theme.colorPositive } }, notice), shown.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { padding: "12px 4px", fontSize: 12, color: theme.textMutedColor } }, threads.length === 0 ? scope === "story" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Press ", /* @__PURE__ */ React.createElement("b", null, "\u2325C"), " (Alt+C) in the canvas and click an element \u2014 or ", /* @__PURE__ */ React.createElement("b", null, "\u2325R"), " to drag a region. Everything saves automatically to the dev-server store.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, "\u2325C"), " (Alt+C) in the canvas and click an element.") : filter === "open" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing open \u2014 everything is fixed (awaiting review) or resolved. Switch the filter to \u201Cto review\u201D or \u201Call\u201D.") : filter === "review" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing awaiting review \u2014 no agent fixes pending.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "All threads resolved \u{1F389}.")), shown.map((t) => {
     const active = t.id === activeThread;
     return /* @__PURE__ */ React.createElement(
       "div",
@@ -519,11 +524,24 @@ function ReviewPanel() {
           border: `1px solid ${active ? theme.colorSecondary : theme.appBorderColor}`,
           background: active ? `${theme.colorSecondary}11` : "transparent",
           cursor: "pointer",
-          opacity: t.status === "open" ? 1 : 0.75
+          opacity: t.status === "resolved" ? 0.75 : 1
         },
         onClick: () => focusThread(t)
       },
-      /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: chip(t.status === "open" ? "#f59e0b22" : "#16a34a22", t.status === "open" ? "#b45309" : "#15803d") }, "#", t.number, " ", t.status === "open" ? "open" : "resolved"), t.gh?.url && /* @__PURE__ */ React.createElement(
+      /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement(
+        "span",
+        {
+          style: chip(
+            t.status === "open" ? "#f59e0b22" : t.status === "fixed" ? "#2563eb22" : "#16a34a22",
+            t.status === "open" ? "#b45309" : t.status === "fixed" ? "#1d4ed8" : "#15803d"
+          ),
+          title: t.status === "fixed" ? "addressed by the agent \u2014 awaiting your verification" : t.status
+        },
+        "#",
+        t.number,
+        " ",
+        t.status === "open" ? "open" : t.status === "fixed" ? "fixed" : "resolved"
+      ), t.gh?.url && /* @__PURE__ */ React.createElement(
         "a",
         {
           href: t.gh.url,
@@ -549,10 +567,10 @@ function ReviewPanel() {
         /* @__PURE__ */ React.createElement(CameraIcon, { width: 10, height: 10 }),
         " dom"
       ), scope === "all" && t.story.name && /* @__PURE__ */ React.createElement("span", { style: chip("#64748b18", theme.textMutedColor) }, t.story.name), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, t.createdAt.slice(0, 10))),
-      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, marginTop: 3, color: theme.textColor, textDecoration: t.status === "open" ? "none" : "line-through" } }, t.comments[0]?.body?.split("\n")[0]?.slice(0, 140) ?? "(no text)"),
+      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, marginTop: 3, color: theme.textColor, textDecoration: t.status === "resolved" ? "line-through" : "none" } }, t.comments[0]?.body?.split("\n")[0]?.slice(0, 140) ?? "(no text)"),
       t.component?.source && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: theme.textMutedColor, fontFamily: theme.fontMonospace, marginTop: 2 } }, t.component.source.file, t.component.source.line ? `:${t.component.source.line}` : ""),
       t.comments.length > 1 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: theme.textMutedColor, marginTop: 2 } }, "+", t.comments.length - 1, " replies"),
-      /* @__PURE__ */ React.createElement(ThreadActions, { thread: t, busy, onReply: reply, onToggleResolve: toggleResolve, active })
+      /* @__PURE__ */ React.createElement(ThreadActions, { thread: t, busy, onReply: reply, onSetStatus: setStatus, active })
     );
   }), /* @__PURE__ */ React.createElement(
     "div",
@@ -586,15 +604,43 @@ function ThreadActions(props) {
         }
       }
     }
+  ), props.thread.status === "open" && /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: "1px solid #86efac", background: "transparent", color: "#15803d", display: "inline-flex", gap: 4, alignItems: "center" },
+      disabled: props.busy,
+      onClick: () => props.onSetStatus(props.thread, "resolved"),
+      title: "Resolve (reviewer-confirmed)"
+    },
+    /* @__PURE__ */ React.createElement(CheckIcon, { width: 11, height: 11 }),
+    "resolve"
+  ), props.thread.status === "fixed" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: "1px solid #86efac", background: "transparent", color: "#15803d", display: "inline-flex", gap: 4, alignItems: "center" },
+      disabled: props.busy,
+      onClick: () => props.onSetStatus(props.thread, "resolved"),
+      title: "Confirm the fix \u2014 the agent addressed this, you verified it"
+    },
+    /* @__PURE__ */ React.createElement(CheckIcon, { width: 11, height: 11 }),
+    "confirm"
   ), /* @__PURE__ */ React.createElement(
     "button",
     {
-      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: `1px solid ${props.thread.status === "open" ? "#86efac" : "#fecaca"}`, background: "transparent", color: props.thread.status === "open" ? "#15803d" : "#b91c1c", display: "inline-flex", gap: 4, alignItems: "center" },
+      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: "1px solid #fecaca", background: "transparent", color: "#b91c1c", display: "inline-flex", gap: 4, alignItems: "center" },
       disabled: props.busy,
-      onClick: () => props.onToggleResolve(props.thread)
+      onClick: () => props.onSetStatus(props.thread, "open"),
+      title: "Reject \u2014 back to open (reply with why)"
     },
-    /* @__PURE__ */ React.createElement(CheckIcon, { width: 11, height: 11 }),
-    props.thread.status === "open" ? "resolve" : "reopen"
+    "reject"
+  )), props.thread.status === "resolved" && /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: "1px solid #fecaca", background: "transparent", color: "#b91c1c", display: "inline-flex", gap: 4, alignItems: "center" },
+      disabled: props.busy,
+      onClick: () => props.onSetStatus(props.thread, "open")
+    },
+    "reopen"
   ));
 }
 function MiniButton(props) {
@@ -650,6 +696,7 @@ function AnnotaKitTool() {
     icon
   );
   const open = ui?.open ?? 0;
+  const fixed = ui?.fixed ?? 0;
   const total = ui?.total ?? 0;
   const drawerOn = ui?.drawerOpen === true;
   return /* @__PURE__ */ React.createElement("div", { key: "annotakit-tool", style: { display: "inline-flex", alignItems: "center", gap: 2 } }, btn("Pin a comment to an element (\u2325C)", /* @__PURE__ */ React.createElement(PinIcon, { width: 14, height: 14 }), ui?.mode === "pin", () => emit("pin")), btn("Mark a region (\u2325R)", /* @__PURE__ */ React.createElement(BoxIcon, { width: 14, height: 14 }), ui?.mode === "region", () => emit("region")), /* @__PURE__ */ React.createElement(
@@ -675,8 +722,11 @@ function AnnotaKitTool() {
     total > 0 && /* @__PURE__ */ React.createElement(
       "span",
       {
+        title: open > 0 ? `${open} open \xB7 ${fixed} fixed (awaiting review) \xB7 ${total} total` : fixed > 0 ? `${fixed} fixed \u2014 awaiting your review (${total} total)` : `${total} threads, all resolved`,
         style: {
-          background: open > 0 ? "#d97706" : "#94a3b8",
+          // v0.6.3: amber = agent work queued, blue = fixes awaiting the
+          // reviewer's verification (0 open + N fixed is NOT "nothing to do")
+          background: open > 0 ? "#d97706" : fixed > 0 ? "#2563eb" : "#94a3b8",
           color: "#fff",
           borderRadius: 999,
           minWidth: 16,
@@ -688,7 +738,7 @@ function AnnotaKitTool() {
           fontWeight: 700
         }
       },
-      open > 0 ? open : total
+      open > 0 ? open : fixed > 0 ? fixed : total
     )
   ), /* @__PURE__ */ React.createElement("span", { key: "annotakit-sep", style: { width: 1, height: 16, background: theme.appBorderColor, margin: "0 4px" } }), btn(
     ui?.visible === false ? "Show Annotakit pins (\u2325L)" : "Hide Annotakit pins (\u2325L)",

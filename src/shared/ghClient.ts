@@ -37,6 +37,7 @@
 
 import { getStaticStore, renderThreadBlock, staticScope, type StaticStore } from './staticStore';
 import type { Comment, Thread } from './types';
+import { ISSUE_BODY_LIMIT, mirrorStateOf } from './types';
 
 /* --------------------------------- constants -------------------------------- */
 
@@ -428,8 +429,10 @@ export async function probeGhConfig(): Promise<GhClientConfig | null> {
 
 function issueTitle(t: Thread): string {
   const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
-  const headline = (t.comments[0]?.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
-  return `[review] ${storyLabel} — #${t.number} ${headline || '(no text)'}`.slice(0, 100);
+  // headline budget 100 (issue #16, server parity): the body carries everything
+  // verbatim; the title is the scannable ID
+  const headline = (t.comments[0]?.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  return `[review] ${storyLabel} — #${t.number} ${headline || '(no text)'}`.slice(0, 160);
 }
 
 function issueBody(t: Thread, cfg: GhClientConfig): string {
@@ -443,17 +446,26 @@ function issueBody(t: Thread, cfg: GhClientConfig): string {
   out.push('');
   out.push(`open: ${storyUrl}`);
   out.push('');
-  out.push(...renderThreadBlock(t, `mirrored from a static build (${origin}) — local copy in the reviewer's browser`));
+  out.push(...renderThreadBlock(t, `mirrored from a static build (${origin}) — local copy in the reviewer's browser`, true));
   out.push('---');
   out.push('');
   out.push(
-    'Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread — ' +
-      'close this issue (the review thread mirrors it automatically). ' +
+    'Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED — do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). ' +
       'Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.',
   );
   out.push('');
   out.push(GH_SENTINEL);
-  return out.join('\n');
+  const body = out.join('\n');
+  // GitHub caps issue bodies at 65,536 chars — clip honestly with a pointer to
+  // the full thread (issue #16; server parity)
+  if (body.length > ISSUE_BODY_LIMIT) {
+    return (
+      body.slice(0, ISSUE_BODY_LIMIT) +
+      `\n\n… (clipped at ${ISSUE_BODY_LIMIT} chars — GitHub caps issue bodies at 65,536; ` +
+      'full thread: the Storybook annotakit panel export (threads → Download JSON))'
+    );
+  }
+  return body;
 }
 
 // Per-comment sentinel: same contract as the server engine — a push that
@@ -668,7 +680,7 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
 
   // 2. lifecycle: thread.status vs mirrored issue state
   const curGh = t.gh;
-  const want = t.status === 'resolved' ? 'closed' : 'open';
+  const want = mirrorStateOf(t.status);
   if (curGh.state !== want) {
     await addIssueCommentRemote(cfg, curGh.issue, want === 'closed' ? resolutionNotice(t) : reopenNotice(t));
     await setIssueStateRemote(cfg, curGh.issue, want);
@@ -778,8 +790,13 @@ async function pullOnce(base: StaticStore): Promise<number> {
       }
     }
 
+    // v0.6.3 (server ghsync parity): a remote close confirms the review from
+    // ANY unconfirmed status (open OR fixed); a remote reopen is a reviewer
+    // REJECTION and only fires from resolved — fixed + open issue is the
+    // NATURAL mirror state, not drift (close→reopen between polls while fixed
+    // nets to open+fixed = no-op phantom; accepted).
     let statusChange: 'resolved' | 'reopen' | null = null;
-    if (issue.state === 'closed' && t.status === 'open') statusChange = 'resolved';
+    if (issue.state === 'closed' && t.status !== 'resolved') statusChange = 'resolved';
     else if (issue.state === 'open' && t.status === 'resolved') statusChange = 'reopen';
 
     const since = mir.syncedAt;
@@ -809,11 +826,13 @@ async function pullOnce(base: StaticStore): Promise<number> {
       const cur = freshThread(base, t.id);
       if (!cur?.gh) continue;
       const next: Thread = { ...cur, gh: { ...cur.gh } };
-      if (statusChange === 'resolved' && next.status === 'open') {
+      if (statusChange === 'resolved' && next.status !== 'resolved') {
+        // reviewer confirmed on GitHub — from open (direct) OR fixed (the gate)
         next.status = 'resolved';
         next.resolvedAt = issue.closed_at ?? pullStartedAt;
         next.comments = [...next.comments, systemComment(`gh-close-${mir.issue}`, issue.closed_by?.login ?? 'github', 'closed on GitHub')];
       } else if (statusChange === 'reopen' && next.status === 'resolved') {
+        // reopen fires from resolved ONLY — fixed+open is the natural state
         next.status = 'open';
         delete next.resolvedAt;
         next.comments = [...next.comments, systemComment(`gh-reopen-${mir.issue}`, 'github', 'reopened on GitHub')];

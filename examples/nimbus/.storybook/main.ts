@@ -13,6 +13,12 @@ const dirname = path.dirname(fileURLToPath(import.meta.url));
 const config: StorybookConfig = {
   stories: ['../src/**/*.stories.@(ts|tsx)'],
   addons: ['storybook-annotakit'],
+  // SB 10 shows an onboarding checklist in the sidebar + a "guide" menu tab
+  // in DEV mode — noise for a review surface; off for good (v0.6.3).
+  features: {
+    sidebarOnboardingChecklist: false,
+    menuOnboardingChecklist: false,
+  },
   // Serving through a reverse proxy whose edge rewrites the Host header?
   // That gets 403 "Invalid host" from the dev server's host validation
   // (DNS-rebinding guard). Both layers must allow the proxy's hosts: Vite's

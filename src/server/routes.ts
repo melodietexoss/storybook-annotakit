@@ -34,7 +34,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.2';
+const VERSION = '0.6.3';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -518,13 +518,14 @@ function groupByStory(threads: Thread[], origin: string): ExportedStory[] {
     if (!entry) {
       entry = {
         story: { ...t.story, url: t.story.url ?? `${origin}/?path=/story/${t.storyId}` },
-        counts: { open: 0, resolved: 0 },
+        counts: { open: 0, fixed: 0, resolved: 0 },
         threads: [],
       };
       map.set(t.storyId, entry);
     }
     entry.threads.push(t);
     if (t.status === 'open') entry.counts.open++;
+    else if (t.status === 'fixed') entry.counts.fixed++;
     else entry.counts.resolved++;
   }
   const out = [...map.values()];
@@ -562,7 +563,7 @@ async function handleApi(
         ['GET', `${API_BASE}/health`, 'agentSurfaces, store, gh + git state — detect your path here first'],
         ['GET', `${API_BASE}/schema`, 'this document'],
         ['GET', `${API_BASE}/threads`, 'ALL threads — envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array)'],
-        ['GET', `${API_BASE}/threads?storyId=<id>&status=<open|resolved>`, 'filtered (an EMPTY storyId param is treated as absent, not a filter)'],
+        ['GET', `${API_BASE}/threads?storyId=<id>&status=<open|fixed|resolved>`, 'filtered (an EMPTY storyId param is treated as absent, not a filter)'],
         ['POST', `${API_BASE}/threads`, 'create → 201; idempotent replay (same id) → 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only — amend via PATCH'],
         ['GET', `${API_BASE}/threads/<id>`, 'one thread doc'],
         ['PATCH', `${API_BASE}/threads/<id>`, 'partial {status} (JSON-merge) or full doc — see PATCH below'],
@@ -580,7 +581,7 @@ async function handleApi(
       PATCH: {
         url: `${API_BASE}/threads/<id>`,
         partialBody: { status: 'resolved' },
-        note: 'partial (JSON-merge) or full-document both accepted; status must be exactly "open" or "resolved" (case-insensitive, normalized — anything else is a 400, the server stamps resolvedAt on open→resolved); comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt)',
+        note: 'partial (JSON-merge) or full-document both accepted; status must be "open", "fixed" or "resolved" (case-insensitive, normalized — anything else is a 400). "fixed" = addressed by the agent, awaiting reviewer verification (the agent Path B terminal state; the GitHub issue stays OPEN). "resolved" = reviewer-confirmed — server stamps resolvedAt on ANY →resolved transition and clears it on demotion out of resolved; PATCHing "fixed" onto a resolved thread is a 400 (reopen first — a stale full-doc PATCH must never demote a confirmation). comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt)',
       },
       COMMENT: {
         url: `${API_BASE}/threads/<id>/comments`,
@@ -724,20 +725,29 @@ async function handleApi(
       // here, and must not make a status-less PATCH un-fixable).
       if ('status' in body && full.status !== undefined) {
         const norm = String(full.status).toLowerCase();
-        if (norm !== 'open' && norm !== 'resolved') {
+        if (norm !== 'open' && norm !== 'fixed' && norm !== 'resolved') {
           throw Object.assign(
-            new Error(`status must be "open" or "resolved" (got ${JSON.stringify(full.status)}) — {"status":"resolved"} resolves (server stamps resolvedAt), {"status":"open"} reopens`),
+            new Error(`status must be "open", "fixed" or "resolved" (got ${JSON.stringify(full.status)}) — {"status":"fixed"} = addressed, awaiting review; {"status":"resolved"} = reviewer-confirmed (server stamps resolvedAt); {"status":"open"} reopens`),
             { status: 400 },
           );
         }
         full.status = norm as Thread['status'];
       }
+      // resolved→fixed guard (design amendment 2): a stale full-doc PATCH must
+      // never silently demote a reviewer confirmation
+      if (prev.status === 'resolved' && full.status === 'fixed') {
+        throw Object.assign(
+          new Error('thread is resolved (reviewer-confirmed) — reopen to "open" first if you want it marked fixed'),
+          { status: 400 },
+        );
+      }
       // server-side resolve bookkeeping: agents forget resolvedAt — the server
-      // stamps/clears it on transitions so digests stay consistent
-      if (prev.status === 'open' && full.status === 'resolved' && !full.resolvedAt) {
+      // stamps it on ANY →resolved transition and clears it on any demotion
+      // out of resolved, so digests stay consistent
+      if (prev.status !== 'resolved' && full.status === 'resolved' && !full.resolvedAt) {
         full.resolvedAt = nowIso();
       }
-      if (prev.status === 'resolved' && full.status === 'open') {
+      if (prev.status === 'resolved' && full.status !== 'resolved') {
         delete full.resolvedAt;
       }
       // SERVER-OWNED mirror fields: a client PATCHing a stale snapshot would
@@ -779,9 +789,11 @@ async function handleApi(
         reason:
           prev.status === 'open' && updated.status === 'resolved'
             ? 'resolved'
-            : prev.status === 'resolved' && updated.status === 'open'
-              ? 'reopened'
-              : 'updated',
+            : prev.status === 'open' && updated.status === 'fixed'
+              ? 'fixed'
+              : prev.status === 'resolved' && updated.status === 'open'
+                ? 'reopened'
+                : 'updated',
       });
       await sendMutationJson(rt, res, 200, updated);
       return true;

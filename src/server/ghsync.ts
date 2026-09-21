@@ -50,8 +50,9 @@ import {
 } from './gh';
 import { renderDigest } from './digest';
 import type { Comment, GhSyncStatus, GhSyncSummary, Thread } from '../shared/types';
+import { ISSUE_BODY_LIMIT, mirrorStateOf } from '../shared/types';
 
-export type EngineReason = 'updated' | 'commented' | 'resolved' | 'reopened';
+export type EngineReason = 'updated' | 'commented' | 'resolved' | 'reopened' | 'fixed';
 
 export interface GhSync {
   /** Queue a push-reconcile for one thread (deduped, ordered). */
@@ -158,17 +159,29 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
 
   function issueTitle(t: Thread): string {
     const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
-    const headline = (t.comments[0]?.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
-    return `[review] ${storyLabel} — #${t.number} ${headline || '(no text)'}`.slice(0, 100);
+    // headline budget 100 (issue #16: titles clipped at 60 hid the substance;
+    // the body now carries everything verbatim, the title is the scannable ID)
+    const headline = (t.comments[0]?.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 100);
+    return `[review] ${storyLabel} — #${t.number} ${headline || '(no text)'}`.slice(0, 160);
   }
 
   function issueBody(t: Thread): string {
     const origin = opts.origin();
     const storyUrl = t.story?.url ?? `${origin}/?path=/story/${t.storyId}`;
-    return renderDigest(
-      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === 'open' ? 1 : 0, resolved: t.status === 'open' ? 0 : 1 }, threads: [t] }],
-      { origin, mirror: true },
+    const body = renderDigest(
+      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === 'open' ? 1 : 0, fixed: t.status === 'fixed' ? 1 : 0, resolved: t.status === 'resolved' ? 1 : 0 }, threads: [t] }],
+      { origin, mirror: true, fullText: true },
     );
+    // pathological threads (several 64k comments) can exceed GitHub's 65,536-char
+    // issue-body cap — clip honestly WITH a pointer to the full thread (issue #16)
+    if (body.length > ISSUE_BODY_LIMIT) {
+      return (
+        body.slice(0, ISSUE_BODY_LIMIT) +
+        `\n\n… (clipped at ${ISSUE_BODY_LIMIT} chars — GitHub caps issue bodies at 65,536; ` +
+        `full thread: GET ${origin}/annotakit/api/threads/${encodeURIComponent(t.id)})`
+      );
+    }
+    return body;
   }
 
   // Per-comment sentinel: embedded in every mirrored body so a push that
@@ -243,8 +256,9 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       pushed++;
     }
 
-    // 2. lifecycle: thread.status vs mirrored issue state
-    const want = t.status === 'resolved' ? 'closed' : 'open';
+    // 2. lifecycle: thread.status vs mirrored issue state (fixed keeps the
+    //    issue OPEN — mirrorStateOf is the single source of truth)
+    const want = mirrorStateOf(t.status);
     if (t.gh.state !== want) {
       await addIssueComment(tk, rp, t.gh.issue, want === 'closed' ? resolutionNotice(t) : reopenNotice(t));
       await setIssueState(tk, rp, t.gh.issue, want);
@@ -329,7 +343,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     return threads.filter((t) => {
       if (queued.has(t.id) || inflight.has(t.id)) return false;
       const unmirrored = t.comments.some((c) => !c.ghId && c.source !== 'github');
-      const stateDrift = t.gh ? t.gh.state !== (t.status === 'resolved' ? 'closed' : 'open') : true;
+      const stateDrift = t.gh ? t.gh.state !== mirrorStateOf(t.status) : true;
       return unmirrored || stateDrift;
     });
   }
@@ -391,9 +405,14 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       }
 
       // decide deltas against the pre-read snapshot; mutateThread re-checks
-      // against the CURRENT doc so a concurrent local change is never clobbered
+      // against the CURRENT doc so a concurrent local change is never clobbered.
+      // v0.6.3: a remote close confirms the review from ANY unconfirmed status
+      // (open OR fixed); a remote reopen is a reviewer REJECTION and only fires
+      // from resolved — fixed + open issue is the NATURAL mirror state (the
+      // whole point of 'fixed'), not drift. (close→reopen between polls while
+      // fixed nets to open+fixed = no-op phantom; accepted, design amendment 3.)
       let statusChange: 'resolved' | 'reopen' | null = null;
-      if (issue.state === 'closed' && t.status === 'open') statusChange = 'resolved';
+      if (issue.state === 'closed' && t.status !== 'resolved') statusChange = 'resolved';
       else if (issue.state === 'open' && t.status === 'resolved') statusChange = 'reopen';
 
       const since = mir.syncedAt;
@@ -426,11 +445,14 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
         if (statusChange) reason = statusChange === 'resolved' ? 'resolved' : 'reopened';
         else if (fresh.length > 0) reason = 'commented';
         const after = await store.mutateThread(t.id, (cur) => {
-          if (statusChange === 'resolved' && cur.status === 'open') {
+          if (statusChange === 'resolved' && cur.status !== 'resolved') {
+            // reviewer confirmed on GitHub — from open (direct confirm) OR from
+            // fixed (the review gate closing)
             cur.status = 'resolved';
             cur.resolvedAt = issue.closed_at ?? nowIso();
             systemComment(cur, `gh-close-${mir.issue}`, issue.closed_by?.login ?? 'github', 'closed on GitHub');
           } else if (statusChange === 'reopen' && cur.status === 'resolved') {
+            // reopen fires from resolved ONLY — fixed+open is natural (see above)
             cur.status = 'open';
             delete cur.resolvedAt;
             systemComment(cur, `gh-reopen-${mir.issue}`, 'github', 'reopened on GitHub');
@@ -634,7 +656,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       pollTimer.unref?.();
     }
     console.warn(
-      `[storybook-annotakit] GH mirror: auto — every thread gets ONE issue; lifecycle (open/resolved, replies) syncs both ways${opts.pollSec > 0 ? `, pull every ${opts.pollSec}s` : ', pull on POST /sync'}`,
+      `[storybook-annotakit] GH mirror: auto — every thread gets ONE issue; lifecycle (open/fixed/resolved, replies) syncs both ways${opts.pollSec > 0 ? `, pull every ${opts.pollSec}s` : ', pull on POST /sync'}`,
     );
     // initial backfill: unmapped threads get their issue; remote changes land
     void run(syncAllRaw).catch((err) => {

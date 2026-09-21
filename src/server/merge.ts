@@ -12,9 +12,13 @@
  * Field-level semantics (A3):
  *   - threads: union by id; tombstones (deleted_threads) WIN over any row
  *   - per thread: comments union by comment id (body of higher row wins on
- *     same id), status = resolved-wins (monotonic — a lost reopen is accepted
- *     and documented), gh mapping = either side's (mapping loss = duplicate
- *     issues), every other scalar from the row with higher updatedAt
+ *     same id), status = monotonic precedence open < fixed < resolved
+ *     (v0.6.3 — extends "resolved-wins": a stale 'open' can't clobber 'fixed',
+ *     a stale 'fixed' can't clobber 'resolved'; documented losses: a lost
+ *     reopen AND a machine-A 'fixed' beating machine-B's newer explicit
+ *     reject-to-open — accepted, same class), gh mapping = either side's
+ *     (mapping loss = duplicate issues), every other scalar from the row with
+ *     higher updatedAt
  *   - tombstone sets: union (a delete observed anywhere is final)
  *   - counters: NOT merged here — the store recomputes next_number as
  *     max(existing number)+1 per story after import (A11)
@@ -56,6 +60,9 @@ function unionComments(a: Thread, b: Thread): Comment[] {
   return out;
 }
 
+/** Monotonic status precedence (v0.6.3): open < fixed < resolved. */
+const STATUS_RANK: Record<Thread['status'], number> = { open: 0, fixed: 1, resolved: 2 };
+
 /** Merge ONE thread id from both sides (rows may be absent on either side). */
 function mergeThread(local: Thread | undefined, remote: Thread | undefined): Thread | null {
   if (!local) return remote ? cloneThread(remote) : null;
@@ -63,9 +70,11 @@ function mergeThread(local: Thread | undefined, remote: Thread | undefined): Thr
   const newer = later(local, remote);
   const older = newer === local ? remote : local;
   const merged = cloneThread(newer);
-  // status: resolved wins (monotonic reopen-loss accepted + documented)
-  if (local.status === 'resolved' || remote.status === 'resolved') merged.status = 'resolved';
-  else merged.status = 'open';
+  // status: monotonic precedence open < fixed < resolved (design amendment 8 —
+  // recency-resolved status was considered and rejected: loses agent fixes
+  // more often than it saves)
+  merged.status =
+    STATUS_RANK[local.status] >= STATUS_RANK[remote.status] ? local.status : remote.status;
   if (merged.status === 'resolved' && !merged.resolvedAt) {
     merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
   }

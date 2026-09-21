@@ -8,14 +8,14 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-TU6B6TIH.mjs";
+} from "./chunk-Y2DYPSGG.mjs";
 import {
   getGhLinkedStaticStore
-} from "./chunk-B5CKOYWU.mjs";
+} from "./chunk-XGVDME4E.mjs";
 import {
   MAX_BODY_CHARS,
   elementSummary
-} from "./chunk-EVH4K5TX.mjs";
+} from "./chunk-MLHFKDNW.mjs";
 
 // src/preview/index.ts
 import React2 from "react";
@@ -1036,9 +1036,19 @@ var OVERLAY_CSS = `
   color: inherit;
 }
 
+/* ---------- z-stack (v0.6.3): pins NEVER lose to overlays ----------
+ * Inside .annota-root's stacking context the rule is explicit:
+ *   10 = transient passive overlays (capture hint, toast) \u2014 pointer-events
+ *        none (toast: none on the container, auto on its dismiss button),
+ *        so they can neither hide nor swallow a pin
+ *   20 = pins + regions \u2014 ALWAYS on top of passive chrome
+ *   30 = deliberate interactive surfaces (composer card, drawer, help) \u2014
+ *        invoked contexts, allowed above pins while open */
+
 /* ---------- pin markers ---------- */
 .annota-pin {
   position: fixed;
+  z-index: 20;
   pointer-events: auto;
   min-width: 22px;
   height: 22px;
@@ -1058,12 +1068,14 @@ var OVERLAY_CSS = `
 }
 .annota-pin:hover { transform: scale(1.15); }
 .annota-pin.is-resolved { background: #94a3b8; }
+.annota-pin.is-fixed { background: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.25); }
 .annota-pin.is-orphan { background: #fff; color: #94a3b8; border-style: dashed; }
 .annota-pin.is-active { outline: 2px solid var(--annota-accent); outline-offset: 2px; }
 
 /* ---------- region outlines ---------- */
 .annota-region {
   position: fixed;
+  z-index: 20;
   pointer-events: auto;
   border: 2px dashed var(--annota-accent);
   background: rgba(79, 70, 229, .06);
@@ -1071,6 +1083,7 @@ var OVERLAY_CSS = `
   cursor: pointer;
 }
 .annota-region.is-resolved { border-color: #94a3b8; background: rgba(148,163,184,.06); }
+.annota-region.is-fixed { border-color: #2563eb; background: rgba(37,99,235,.08); }
 .annota-region .annota-region-tag {
   position: absolute;
   top: -20px;
@@ -1083,10 +1096,12 @@ var OVERLAY_CSS = `
   border-radius: 999px;
 }
 .annota-region.is-resolved .annota-region-tag { background: #94a3b8; }
+.annota-region.is-fixed .annota-region-tag { background: #2563eb; }
 
 /* ---------- capture mode ---------- */
 .annota-capture-hint {
   position: fixed;
+  z-index: 10;
   top: 10px;
   left: 50%;
   transform: translateX(-50%);
@@ -1101,6 +1116,7 @@ var OVERLAY_CSS = `
 }
 .annota-hover-box {
   position: fixed;
+  z-index: 10;
   border: 2px solid var(--annota-accent);
   background: rgba(79, 70, 229, .12);
   border-radius: 3px;
@@ -1111,6 +1127,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 /* drag region */
 .annota-drag-rect {
   position: fixed;
+  z-index: 10;
   border: 2px solid var(--annota-accent);
   background: rgba(79, 70, 229, .12);
   pointer-events: none;
@@ -1120,6 +1137,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 /* ---------- cards (composer / popover / drawer / help) ---------- */
 .annota-card {
   position: fixed;
+  z-index: 30;
   pointer-events: auto;
   background: #fff;
   border-radius: 10px;
@@ -1241,27 +1259,6 @@ body.annota-cursor * { cursor: crosshair !important; }
   user-select: none;
 }
 
-/* static-build provenance chip: same visual family, top-right so it never
-   fights the pins/drawer at the bottom of the canvas. */
-.annota-static-chip {
-  position: fixed;
-  right: 18px;
-  top: 12px;
-  pointer-events: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  background: rgba(255, 251, 235, .95);
-  border: 1px solid #fcd34d;
-  border-radius: 999px;
-  padding: 4px 10px;
-  font-weight: 700;
-  font-size: 11px;
-  color: #92400e;
-  box-shadow: 0 2px 10px rgba(15, 23, 42, .10);
-  user-select: none;
-}
-
 /* rich one-line element identity (composer) \u2014 same string as the digest */
 .annota-element-summary {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1274,6 +1271,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 /* ---------- drawer ---------- */
 .annota-drawer {
   position: fixed;
+  z-index: 30;
   right: 18px;
   /* v0.5.0: no more in-canvas launcher below it \u2014 dock to the corner */
   bottom: 18px;
@@ -1287,6 +1285,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 .annota-thread-row .annota-thread-title { font-weight: 600; font-size: 12.5px; }
 .annota-thread-row .annota-thread-sub { font-size: 11px; color: #64748b; margin-top: 2px; }
 .annota-thread-row.is-resolved .annota-thread-title { text-decoration: line-through; color: #94a3b8; }
+.annota-thread-row.is-fixed .annota-thread-title { color: #2563eb; }
 .annota-dot {
   display: inline-block;
   width: 8px;
@@ -1296,11 +1295,13 @@ body.annota-cursor * { cursor: crosshair !important; }
   margin-right: 5px;
 }
 .annota-dot.is-resolved { background: var(--annota-ok); }
+.annota-dot.is-fixed { background: #2563eb; }
 .annota-dot.is-orphan { background: #cbd5e1; }
 
 /* ---------- help ---------- */
 .annota-help {
   position: fixed;
+  z-index: 30;
   left: 50%;
   bottom: 60px;
   transform: translateX(-50%);
@@ -1323,12 +1324,16 @@ body.annota-cursor * { cursor: crosshair !important; }
   color: #334155;
 }
 
-/* ---------- toast (transient overlay errors \u2014 never silent) ---------- */
+/* ---------- toast (transient overlay errors \u2014 never silent) ----------
+ * z 10 = BELOW pins (pins are never covered); container is pointer-events
+ * none so it never swallows canvas clicks \u2014 only its dismiss button is
+ * interactive (children re-enable via their own pointer-events). */
 .annota-toast {
   position: fixed;
+  z-index: 10;
   top: 12px;
   right: 14px;
-  pointer-events: auto;
+  pointer-events: none;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1341,9 +1346,8 @@ body.annota-cursor * { cursor: crosshair !important; }
   font-weight: 600;
   max-width: 380px;
   box-shadow: 0 6px 22px rgba(15, 23, 42, .14);
-  z-index: 2;
 }
-.annota-toast .annota-btn { border: none; background: transparent; padding: 0 4px; cursor: pointer; color: inherit; }
+.annota-toast .annota-btn { border: none; background: transparent; padding: 0 4px; cursor: pointer; color: inherit; pointer-events: auto; }
 
 /* ---------- flash highlight (target element in the STORY dom) ---------- */
 @keyframes annota-flash {
@@ -1427,7 +1431,6 @@ function hotkeyMatches(e, spec) {
 function AnnotaLayer({ storyId, title, name, hotkeys }) {
   const [apiOk, setApiOk] = useState(null);
   const [staticMode, setStaticMode] = useState(false);
-  const [ghStatus, setGhStatus] = useState(null);
   const [modeResolved, setModeResolved] = useState(false);
   const [threads, setThreads] = useState([]);
   const [anchors, setAnchors] = useState(/* @__PURE__ */ new Map());
@@ -1596,7 +1599,6 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       unsubStore = store.subscribe(() => void refresh());
       const readStatus = () => {
         if (!alive) return;
-        setGhStatus(store.gh?.status() ?? null);
         setStorageError(store.info().lastStorageError ?? null);
       };
       readStatus();
@@ -1704,6 +1706,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     emitLayerState(visible);
   }, [visible, emitLayerState]);
   const openCountMemo = threads.filter((t) => t.status === "open").length;
+  const fixedCountMemo = threads.filter((t) => t.status === "fixed").length;
   useEffect(() => {
     const state = {
       apiOk,
@@ -1711,13 +1714,14 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       mode,
       drawerOpen,
       open: openCountMemo,
+      fixed: fixedCountMemo,
       total: threads.length
     };
     try {
       sbChannel().emit(UI_STATE, state);
     } catch {
     }
-  }, [apiOk, visible, mode, drawerOpen, openCountMemo, threads.length]);
+  }, [apiOk, visible, mode, drawerOpen, openCountMemo, fixedCountMemo, threads.length]);
   const focusThread = useCallback(
     (threadId) => {
       setActiveThread(threadId);
@@ -1915,14 +1919,14 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     },
     [refresh]
   );
-  const toggleResolve = useCallback(
-    async (thread) => {
+  const setStatus = useCallback(
+    async (thread, status) => {
       setBusy(true);
       try {
         const next = {
           ...thread,
-          status: thread.status === "open" ? "resolved" : "open",
-          resolvedAt: thread.status === "open" ? (/* @__PURE__ */ new Date()).toISOString() : void 0
+          status,
+          resolvedAt: status === "resolved" ? thread.resolvedAt ?? (/* @__PURE__ */ new Date()).toISOString() : void 0
         };
         const updated = await dataRef.current.patch(next);
         setThreads((prev) => prev.map((t) => t.id === updated.id ? updated : t));
@@ -1974,7 +1978,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       "div",
       {
         key: thread.id,
-        className: `annota-region${thread.status === "resolved" ? " is-resolved" : ""}${thread.id === activeThread ? " is-active" : ""}`,
+        className: `annota-region${thread.status === "resolved" ? " is-resolved" : ""}${thread.status === "fixed" ? " is-fixed" : ""}${thread.id === activeThread ? " is-active" : ""}`,
         style: { left: clamp(fixed.x, 0, Math.max(window.innerWidth - fixed.w, 0)), top: clamp(fixed.y, 0, Math.max(window.innerHeight - fixed.h, 0)), width: fixed.w, height: fixed.h },
         onClick: () => setActiveThread(thread.id),
         title: `#${thread.number}`
@@ -1987,6 +1991,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
         className: [
           "annota-pin",
           thread.status === "resolved" ? "is-resolved" : "",
+          thread.status === "fixed" ? "is-fixed" : "",
           status === "orphan" ? "is-orphan" : "",
           thread.id === activeThread ? "is-active" : ""
         ].filter(Boolean).join(" "),
@@ -2008,35 +2013,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       },
       thread.number
     )
-  ), staticMode && !ghStatus?.configured && !ghStatus?.suppressed && /* @__PURE__ */ React.createElement("div", { className: "annota-static-chip", title: "Static `storybook build` \u2014 no dev server. Threads live in this browser's localStorage for this deployment; export to hand-carry them back. Nothing syncs." }, "\u{1F4CC} static \xB7 local-only"), staticMode && ghStatus?.suppressed && /* @__PURE__ */ React.createElement(
-    "div",
-    {
-      className: "annota-static-chip",
-      style: { background: "#92400e22", color: "#b45309", borderColor: "#92400e66" },
-      title: [
-        "Static build + client-side GitHub publishing \u2014 DISABLED by local settings.",
-        ghStatus && ghStatus.queue > 0 ? `queued feedback holds until re-enabled: ${ghStatus.queue}` : null,
-        "Open the annotakit panel \u2192 GitHub (static) settings to re-enable."
-      ].filter(Boolean).join("\n")
-    },
-    "\u{1F4CC} static \xB7 client GH off",
-    ghStatus && ghStatus.queue > 0 ? ` \xB7 ${ghStatus.queue} queued` : ""
-  ), staticMode && ghStatus?.configured && !ghStatus.suppressed && /* @__PURE__ */ React.createElement(
-    "div",
-    {
-      className: "annota-static-chip",
-      style: ghStatus.lastError ? { background: "#dc262622", color: "#b91c1c", borderColor: "#dc262666" } : { background: "#16a34a22", color: "#15803d", borderColor: "#16a34a66" },
-      title: [
-        `Static build + client-side GitHub publishing \u2192 ${ghStatus.repo ?? "(not set)"}`,
-        `labels: ${ghStatus.labels.length ? ghStatus.labels.join(", ") : "(default)"}`,
-        `queue: ${ghStatus.queue}${ghStatus.flushing ? " (flushing)" : ""}${ghStatus.parked ? ` \xB7 parked: ${ghStatus.parked} (rejected by GitHub \u2014 not retrying)` : ""}`,
-        ghStatus.lastPushAt ? `last push: ${ghStatus.lastPushAt.replace("T", " ").slice(5, 16)}` : null,
-        ghStatus.lastPullAt ? `last pull: ${ghStatus.lastPullAt.replace("T", " ").slice(5, 16)}` : null,
-        ghStatus.lastError ? `error: ${ghStatus.lastError}` : null
-      ].filter(Boolean).join("\n")
-    },
-    ghStatus.lastError ? `\u{1F4CC} static \u2192 github \xB7 error${ghStatus.queue > 0 ? ` \xB7 queued ${ghStatus.queue}` : ""}` : ghStatus.queue > 0 ? `\u{1F4CC} static \u2192 github \xB7 queued ${ghStatus.queue}` : "\u{1F4CC} static \u2192 github"
-  ), hint && mode === "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint", role: "status" }, hint), staticMode && storageError && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, "\u26A0 ", storageError, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setStorageError(null) }, "\u2715")), mode !== "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint" }, mode === "pin" ? "Click the element to pin \xB7 Esc cancels" : "Drag to mark a region \xB7 Esc cancels"), hoverBox && /* @__PURE__ */ React.createElement("div", { className: "annota-hover-box", style: { left: hoverBox.x, top: hoverBox.y, width: hoverBox.w, height: hoverBox.h } }), dragRect && /* @__PURE__ */ React.createElement("div", { className: "annota-drag-rect", style: { left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h } }), error && !composer && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, error, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setError(null) }, "\u2715")), composer && /* @__PURE__ */ React.createElement(
+  ), hint && mode === "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint", role: "status" }, hint), staticMode && storageError && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, "\u26A0 ", storageError, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setStorageError(null) }, "\u2715")), hoverBox && /* @__PURE__ */ React.createElement("div", { className: "annota-hover-box", style: { left: hoverBox.x, top: hoverBox.y, width: hoverBox.w, height: hoverBox.h } }), dragRect && /* @__PURE__ */ React.createElement("div", { className: "annota-drag-rect", style: { left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h } }), error && !composer && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, error, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setError(null) }, "\u2715")), composer && /* @__PURE__ */ React.createElement(
     ComposerCard,
     {
       x: composer.x,
@@ -2056,7 +2033,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       busy,
       error,
       onReply: reply,
-      onToggleResolve: toggleResolve,
+      onSetStatus: setStatus,
       onClose: () => setActiveThread(null)
     }
   ), drawerOpen && !composer && /* @__PURE__ */ React.createElement(
@@ -2068,7 +2045,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       busy,
       hotkeys: hk,
       onSelect: (id) => focusThread(id),
-      onToggleResolve: toggleResolve,
+      onSetStatus: setStatus,
       onClose: () => setDrawerOpen(false)
     }
   ), helpOpen && /* @__PURE__ */ React.createElement(HelpCard, { hotkeys: hk, onClose: () => setHelpOpen(false) }));
@@ -2141,7 +2118,7 @@ function ThreadCard(props) {
   const near = props.pin?.fixed;
   const { ref, style } = useClampedPosition(near ? near.x + (near.x > window.innerWidth / 2 ? -120 : 120) : 40, near ? near.y : 60);
   const comp = t.component;
-  return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "#", t.number, " ", t.status === "open" ? "" : "(resolved)"), t.gh?.url && /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "#", t.number, " ", t.status === "open" ? "" : t.status === "fixed" ? "(fixed \u2014 awaiting your review)" : "(resolved)"), t.gh?.url && /* @__PURE__ */ React.createElement(
     "a",
     {
       className: "annota-chip is-gh",
@@ -2168,49 +2145,86 @@ function ThreadCard(props) {
         }
       }
     }
-  ), /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      className: `annota-btn ${t.status === "open" ? "is-ok" : "is-danger"}`,
-      disabled: props.busy,
-      onClick: () => props.onToggleResolve(t)
-    },
-    t.status === "open" ? "Resolve" : "Reopen"
-  )));
+  ), t.status === "open" && /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Resolve (reviewer-confirmed)" }, "Resolve"), t.status === "fixed" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Confirm the fix \u2014 the agent addressed this, you verified it" }, "\u2713 Confirm"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "open"), title: "Reject \u2014 back to open (reply with why)" }, "Reject")), t.status === "resolved" && /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "open") }, "Reopen")));
 }
 function DrawerCard(props) {
   const [filter, setFilter] = useState("all");
-  const shown = props.threads.filter((t) => filter === "all" ? true : t.status === "open");
-  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-drawer" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow", title: "Press ? for all keyboard shortcuts" }, "Threads \u2014 this story (", props.threads.filter((t) => t.status === "open").length, " open)"), /* @__PURE__ */ React.createElement(
+  const shown = props.threads.filter(
+    (t) => filter === "all" ? true : filter === "open" ? t.status === "open" : t.status === "fixed"
+  );
+  const openCount = props.threads.filter((t) => t.status === "open").length;
+  const fixedCount = props.threads.filter((t) => t.status === "fixed").length;
+  const filterBtn = (key, label, title) => /* @__PURE__ */ React.createElement(
     "button",
     {
-      className: `annota-btn is-small${filter === "open" ? " is-primary" : ""}`,
-      onClick: () => setFilter((f) => f === "open" ? "all" : "open"),
-      title: `Filter: ${filter === "open" ? "open only" : "all"} \u2014 click to ${filter === "open" ? "show all threads" : "show only open threads"}`
+      className: `annota-btn is-small${filter === key ? " is-primary" : ""}`,
+      onClick: () => setFilter(key),
+      title
     },
-    filter === "open" ? "open only" : "all"
-  ), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), props.threads.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info" }, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, props.hotkeys.pin.toUpperCase()), " and click an element (or", " ", /* @__PURE__ */ React.createElement("b", null, props.hotkeys.region.toUpperCase()), " to drag a region)."), props.threads.length > 0 && shown.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info" }, "All threads resolved \u{1F389} (showing \u201Copen only\u201D)."), shown.map((t) => {
+    label
+  );
+  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-drawer" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow", title: "Press ? for all keyboard shortcuts" }, "Threads \u2014 this story (", openCount, " open", fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : "", ")"), filterBtn("open", "open", "Show only open threads (agent work queue)"), filterBtn("review", "to review", "Show threads the agent marked fixed \u2014 awaiting your verification"), filterBtn("all", "all", "Show all threads"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), props.threads.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info" }, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, props.hotkeys.pin.toUpperCase()), " and click an element (or", " ", /* @__PURE__ */ React.createElement("b", null, props.hotkeys.region.toUpperCase()), " to drag a region)."), props.threads.length > 0 && shown.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info" }, filter === "open" ? "Nothing open \u2014 everything is fixed or resolved." : filter === "review" ? "Nothing awaiting review \u2014 no agent fixes pending." : "All threads resolved \u{1F389}."), shown.map((t) => {
     const status = props.anchors.get(t.id)?.status ?? "orphan";
     return /* @__PURE__ */ React.createElement(
       "div",
       {
         key: t.id,
-        className: `annota-thread-row${t.id === props.activeThread ? " is-active" : ""}${t.status === "resolved" ? " is-resolved" : ""}`,
+        className: `annota-thread-row${t.id === props.activeThread ? " is-active" : ""}${t.status === "resolved" ? " is-resolved" : ""}${t.status === "fixed" ? " is-fixed" : ""}`,
         onClick: () => props.onSelect(t.id)
       },
-      /* @__PURE__ */ React.createElement("div", { className: "annota-thread-title" }, /* @__PURE__ */ React.createElement("span", { className: `annota-dot${t.status === "resolved" ? " is-resolved" : status === "orphan" ? " is-orphan" : ""}` }), "#", t.number, " ", t.comments[0]?.body?.split("\n")[0]?.slice(0, 60) ?? "(no text)"),
+      /* @__PURE__ */ React.createElement("div", { className: "annota-thread-title" }, /* @__PURE__ */ React.createElement(
+        "span",
+        {
+          className: `annota-dot${t.status === "resolved" ? " is-resolved" : t.status === "fixed" ? " is-fixed" : status === "orphan" ? " is-orphan" : ""}`
+        }
+      ), "#", t.number, " ", t.comments[0]?.body?.split("\n")[0]?.slice(0, 60) ?? "(no text)"),
       /* @__PURE__ */ React.createElement("div", { className: "annota-thread-sub" }, t.component?.name ? `${t.component.name} \xB7 ` : "", t.comments.length - 1 > 0 ? `${t.comments.length - 1} replies \xB7 ` : "", t.author, " \xB7 ", t.createdAt.slice(0, 10)),
-      /* @__PURE__ */ React.createElement("div", { style: { marginTop: 4 } }, /* @__PURE__ */ React.createElement(
+      /* @__PURE__ */ React.createElement("div", { style: { marginTop: 4 } }, t.status === "open" && /* @__PURE__ */ React.createElement(
         "button",
         {
-          className: `annota-btn is-small ${t.status === "open" ? "is-ok" : "is-danger"}`,
+          className: "annota-btn is-small is-ok",
           disabled: props.busy,
           onClick: (e) => {
             e.stopPropagation();
-            props.onToggleResolve(t);
+            props.onSetStatus(t, "resolved");
           }
         },
-        t.status === "open" ? "Resolve" : "Reopen"
+        "Resolve"
+      ), t.status === "fixed" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          className: "annota-btn is-small is-ok",
+          disabled: props.busy,
+          title: "Confirm the fix \u2014 you verified it",
+          onClick: (e) => {
+            e.stopPropagation();
+            props.onSetStatus(t, "resolved");
+          }
+        },
+        "\u2713 Confirm"
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          className: "annota-btn is-small is-danger",
+          disabled: props.busy,
+          title: "Reject \u2014 back to open (reply with why)",
+          onClick: (e) => {
+            e.stopPropagation();
+            props.onSetStatus(t, "open");
+          }
+        },
+        "Reject"
+      )), t.status === "resolved" && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          className: "annota-btn is-small is-danger",
+          disabled: props.busy,
+          onClick: (e) => {
+            e.stopPropagation();
+            props.onSetStatus(t, "open");
+          }
+        },
+        "Reopen"
       ))
     );
   }));

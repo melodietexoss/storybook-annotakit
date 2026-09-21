@@ -39,6 +39,9 @@ export interface UiState {
   mode: 'idle' | 'pin' | 'region';
   drawerOpen: boolean;
   open: number;
+  /** v0.6.3: threads the agent marked fixed — 0 open + N fixed must NOT read
+   *  as "nothing to do" (they await the reviewer's verification). */
+  fixed: number;
   total: number;
 }
 
@@ -47,8 +50,9 @@ export interface ThreadsChangedPayload {
   storyId?: string;
   threadId?: string;
   /** v0.5.0: 'restored' (boot restore / divergence merge imported rows) —
-   *  the other values are user/engine mutations. */
-  reason: 'created' | 'updated' | 'commented' | 'resolved' | 'reopened' | 'restored';
+   *  the other values are user/engine mutations. v0.6.3: 'fixed' (agent
+   *  addressed, awaiting review). */
+  reason: 'created' | 'updated' | 'commented' | 'resolved' | 'reopened' | 'fixed' | 'restored';
 }
 
 /** API base path on the storybook dev server (same-origin). */

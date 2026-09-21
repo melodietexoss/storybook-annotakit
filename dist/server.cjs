@@ -500,8 +500,10 @@ function readConfig(configDir) {
 }
 
 // src/shared/types.ts
+var mirrorStateOf = (status) => status === "resolved" ? "closed" : "open";
 var MAX_BODY_CHARS = 64e3;
 var DIGEST_CLIP_CHARS = 200;
+var ISSUE_BODY_LIMIT = 6e4;
 
 // src/shared/describe.ts
 function clip(s, n) {
@@ -715,14 +717,18 @@ function fmtDate(iso) {
 function oneLine(body) {
   return body.replace(/\s+/g, " ").trim();
 }
+function firstLine(body, n = 80) {
+  const line = oneLine(body.split("\n")[0] ?? "");
+  return line.length > n ? line.slice(0, n) + "\u2026" : line;
+}
 function clip2(body) {
   const line = oneLine(body);
   return line.length > DIGEST_CLIP_CHARS ? line.slice(0, DIGEST_CLIP_CHARS) + "\u2026" : line;
 }
-function threadBlock(t, snapshotUrl) {
+function threadBlock(t, snapshotUrl, full) {
   const first = t.comments[0];
-  const headline = first ? clip2(first.body) : "(no text)";
-  const status = t.status === "open" ? "OPEN" : "resolved";
+  const headline = first ? full ? firstLine(first.body) || "(no text)" : clip2(first.body) : "(no text)";
+  const status = t.status === "open" ? "OPEN" : t.status === "fixed" ? "FIXED" : "RESOLVED";
   const out = [];
   out.push(`### #${t.number} ${status} \u2014 ${headline}`);
   out.push("");
@@ -755,24 +761,38 @@ function threadBlock(t, snapshotUrl) {
     out.push(`- dom-snapshot: ${snapshotUrl} (story DOM at pin time; append ?format=html to render)`);
   }
   const replies = t.comments.slice(1);
-  for (const r of replies) {
-    const via = r.source === "github" ? " (via github)" : "";
-    out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip2(r.body)}`);
+  if (full) {
+    for (const [i, c] of t.comments.entries()) {
+      const via = c.source === "github" ? " via github" : "";
+      const label = i === 0 ? "note" : "reply";
+      out.push(`**${label} \u2014 ${c.author}${via} ${fmtDate(c.createdAt)} (verbatim):**`);
+      out.push("");
+      out.push(c.body?.trim() || "(empty)");
+      out.push("");
+    }
+  } else {
+    for (const r of replies) {
+      const via = r.source === "github" ? " (via github)" : "";
+      out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip2(r.body)}`);
+    }
   }
   if (t.status === "resolved" && t.resolvedAt) {
     out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
+  } else if (t.status === "fixed") {
+    out.push("  - fixed: addressed, awaiting reviewer verification (confirm \u2192 resolved, reject \u2192 open)");
   }
   out.push("");
   return out;
 }
 function renderDigest(stories, opts) {
   const out = [];
-  const open = stories.reduce((n, s) => n + s.counts.open, 0);
-  const resolved = stories.reduce((n, s) => n + s.counts.resolved, 0);
+  const open = stories.reduce((n, s) => n + (Number(s.counts.open) || 0), 0);
+  const fixed = stories.reduce((n, s) => n + (Number(s.counts.fixed) || 0), 0);
+  const resolved = stories.reduce((n, s) => n + (Number(s.counts.resolved) || 0), 0);
   const title = stories.length === 1 ? `UI review \u2014 ${stories[0].story.title ?? stories[0].story.storyId}` : `UI review \u2014 ${stories.length} stories`;
   out.push(`# ${title}`);
   out.push("");
-  out.push(`${open} open / ${resolved} resolved \xB7 ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " ")}`);
+  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${resolved} resolved \xB7 ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " ")}`);
   if (opts?.origin) out.push(`storybook: ${opts.origin}`);
   out.push("");
   for (const s of stories) {
@@ -791,20 +811,26 @@ function renderDigest(stories, opts) {
       continue;
     }
     const openThreads = s.threads.filter((t) => t.status === "open");
-    const done = s.threads.filter((t) => t.status !== "open");
+    const reviewThreads = s.threads.filter((t) => t.status === "fixed");
+    const done = s.threads.filter((t) => t.status === "resolved");
     const snapUrl = (t) => !opts?.mirror && opts?.snapshotIds?.has(t.id) ? `${opts?.origin ?? ""}/annotakit/api/threads/${encodeURIComponent(t.id)}/snapshot` : void 0;
-    for (const t of openThreads) out.push(...threadBlock(t, snapUrl(t)));
+    for (const t of openThreads) out.push(...threadBlock(t, snapUrl(t), opts?.fullText));
+    if (reviewThreads.length) {
+      out.push(`**${reviewThreads.length} awaiting review (agent marked fixed):**`);
+      out.push("");
+      for (const t of reviewThreads) out.push(...threadBlock(t, snapUrl(t), opts?.fullText));
+    }
     if (done.length) {
       out.push(`<details><summary>${done.length} resolved</summary>`);
       out.push("");
-      for (const t of done) out.push(...threadBlock(t, snapUrl(t)));
+      for (const t of done) out.push(...threadBlock(t, snapUrl(t), opts?.fullText));
       out.push(`</details>`);
       out.push("");
     }
   }
   out.push("---");
   out.push("");
-  const footer = opts?.mirror ? "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread \u2014 close this issue (the Storybook review thread mirrors it automatically). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node." : `Agent loop: fix the code at the \`jsx:\`/\`component file:\` paths, then resolve the thread \u2014 PATCH ${opts?.origin ?? ""}/annotakit/api/threads/<id> with the full thread JSON and status "resolved" (GET /annotakit/api/threads returns the full docs). Note: \`jsx: file:line\` points at the component definition (may be a few lines off); the \`element:\`/\`selector:\` lines pinpoint the exact pinned node.`;
+  const footer = opts?.mirror ? "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED \u2014 do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node." : `Agent loop: fix the code at the \`jsx:\`/\`component file:\` paths, then PATCH ${opts?.origin ?? ""}/annotakit/api/threads/<id> with {"status":"fixed"} (addressed, awaiting the reviewer's verification \u2014 {"status":"resolved"} is the reviewer's confirmation, not yours). Note: \`jsx: file:line\` points at the component definition (may be a few lines off); the \`element:\`/\`selector:\` lines pinpoint the exact pinned node.`;
   out.push(footer);
   out.push("");
   return out.join("\n");
@@ -1029,16 +1055,22 @@ function createGhSync(opts) {
   };
   function issueTitle(t) {
     const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
-    const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 60);
-    return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 100);
+    const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
+    return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 160);
   }
   function issueBody(t) {
     const origin = opts.origin();
     const storyUrl = t.story?.url ?? `${origin}/?path=/story/${t.storyId}`;
-    return renderDigest(
-      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === "open" ? 1 : 0, resolved: t.status === "open" ? 0 : 1 }, threads: [t] }],
-      { origin, mirror: true }
+    const body = renderDigest(
+      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === "open" ? 1 : 0, fixed: t.status === "fixed" ? 1 : 0, resolved: t.status === "resolved" ? 1 : 0 }, threads: [t] }],
+      { origin, mirror: true, fullText: true }
     );
+    if (body.length > ISSUE_BODY_LIMIT) {
+      return body.slice(0, ISSUE_BODY_LIMIT) + `
+
+\u2026 (clipped at ${ISSUE_BODY_LIMIT} chars \u2014 GitHub caps issue bodies at 65,536; full thread: GET ${origin}/annotakit/api/threads/${encodeURIComponent(t.id)})`;
+    }
+    return body;
   }
   const SENTINEL_RE = /<!--\s*annotakit:c_(\S+?)\s*-->/;
   const mirrorBody = (c) => `**${c.author}:** ${c.body}
@@ -1090,7 +1122,7 @@ thread deleted in Storybook \u2014 closing.`);
       if (after) opts.onEngineMutation(after, "updated");
       pushed++;
     }
-    const want = t.status === "resolved" ? "closed" : "open";
+    const want = mirrorStateOf(t.status);
     if (t.gh.state !== want) {
       await addIssueComment(tk, rp, t.gh.issue, want === "closed" ? resolutionNotice(t) : reopenNotice(t));
       await setIssueState(tk, rp, t.gh.issue, want);
@@ -1163,7 +1195,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
     return threads.filter((t) => {
       if (queued.has(t.id) || inflight.has(t.id)) return false;
       const unmirrored = t.comments.some((c) => !c.ghId && c.source !== "github");
-      const stateDrift = t.gh ? t.gh.state !== (t.status === "resolved" ? "closed" : "open") : true;
+      const stateDrift = t.gh ? t.gh.state !== mirrorStateOf(t.status) : true;
       return unmirrored || stateDrift;
     });
   }
@@ -1208,7 +1240,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
         }
       }
       let statusChange = null;
-      if (issue.state === "closed" && t.status === "open") statusChange = "resolved";
+      if (issue.state === "closed" && t.status !== "resolved") statusChange = "resolved";
       else if (issue.state === "open" && t.status === "resolved") statusChange = "reopen";
       const since = mir.syncedAt;
       const issueActive = !since || !issue.updated_at || issue.updated_at > since;
@@ -1234,7 +1266,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
         if (statusChange) reason = statusChange === "resolved" ? "resolved" : "reopened";
         else if (fresh.length > 0) reason = "commented";
         const after = await store.mutateThread(t.id, (cur) => {
-          if (statusChange === "resolved" && cur.status === "open") {
+          if (statusChange === "resolved" && cur.status !== "resolved") {
             cur.status = "resolved";
             cur.resolvedAt = issue.closed_at ?? nowIso();
             systemComment(cur, `gh-close-${mir.issue}`, issue.closed_by?.login ?? "github", "closed on GitHub");
@@ -1407,7 +1439,7 @@ thread deleted in Storybook \u2014 closing.`);
       pollTimer.unref?.();
     }
     console.warn(
-      `[storybook-annotakit] GH mirror: auto \u2014 every thread gets ONE issue; lifecycle (open/resolved, replies) syncs both ways${opts.pollSec > 0 ? `, pull every ${opts.pollSec}s` : ", pull on POST /sync"}`
+      `[storybook-annotakit] GH mirror: auto \u2014 every thread gets ONE issue; lifecycle (open/fixed/resolved, replies) syncs both ways${opts.pollSec > 0 ? `, pull every ${opts.pollSec}s` : ", pull on POST /sync"}`
     );
     void run(syncAllRaw).catch((err) => {
       lastError = err instanceof Error ? err.message : String(err);
@@ -1447,14 +1479,14 @@ function unionComments(a, b) {
   out.sort((x, y) => String(x.createdAt ?? "").localeCompare(String(y.createdAt ?? "")));
   return out;
 }
+var STATUS_RANK = { open: 0, fixed: 1, resolved: 2 };
 function mergeThread(local, remote) {
   if (!local) return remote ? cloneThread(remote) : null;
   if (!remote) return cloneThread(local);
   const newer = later(local, remote);
   const older = newer === local ? remote : local;
   const merged = cloneThread(newer);
-  if (local.status === "resolved" || remote.status === "resolved") merged.status = "resolved";
-  else merged.status = "open";
+  merged.status = STATUS_RANK[local.status] >= STATUS_RANK[remote.status] ? local.status : remote.status;
   if (merged.status === "resolved" && !merged.resolvedAt) {
     merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
   }
@@ -2059,7 +2091,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.2";
+var VERSION = "0.6.3";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2394,13 +2426,14 @@ function groupByStory(threads, origin) {
     if (!entry) {
       entry = {
         story: { ...t.story, url: t.story.url ?? `${origin}/?path=/story/${t.storyId}` },
-        counts: { open: 0, resolved: 0 },
+        counts: { open: 0, fixed: 0, resolved: 0 },
         threads: []
       };
       map.set(t.storyId, entry);
     }
     entry.threads.push(t);
     if (t.status === "open") entry.counts.open++;
+    else if (t.status === "fixed") entry.counts.fixed++;
     else entry.counts.resolved++;
   }
   const out = [...map.values()];
@@ -2427,7 +2460,7 @@ async function handleApi(req, res, url, configDir, origin) {
         ["GET", `${API_BASE}/health`, "agentSurfaces, store, gh + git state \u2014 detect your path here first"],
         ["GET", `${API_BASE}/schema`, "this document"],
         ["GET", `${API_BASE}/threads`, "ALL threads \u2014 envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array)"],
-        ["GET", `${API_BASE}/threads?storyId=<id>&status=<open|resolved>`, "filtered (an EMPTY storyId param is treated as absent, not a filter)"],
+        ["GET", `${API_BASE}/threads?storyId=<id>&status=<open|fixed|resolved>`, "filtered (an EMPTY storyId param is treated as absent, not a filter)"],
         ["POST", `${API_BASE}/threads`, "create \u2192 201; idempotent replay (same id) \u2192 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only \u2014 amend via PATCH"],
         ["GET", `${API_BASE}/threads/<id>`, "one thread doc"],
         ["PATCH", `${API_BASE}/threads/<id>`, "partial {status} (JSON-merge) or full doc \u2014 see PATCH below"],
@@ -2445,7 +2478,7 @@ async function handleApi(req, res, url, configDir, origin) {
       PATCH: {
         url: `${API_BASE}/threads/<id>`,
         partialBody: { status: "resolved" },
-        note: 'partial (JSON-merge) or full-document both accepted; status must be exactly "open" or "resolved" (case-insensitive, normalized \u2014 anything else is a 400, the server stamps resolvedAt on open\u2192resolved); comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt)'
+        note: 'partial (JSON-merge) or full-document both accepted; status must be "open", "fixed" or "resolved" (case-insensitive, normalized \u2014 anything else is a 400). "fixed" = addressed by the agent, awaiting reviewer verification (the agent Path B terminal state; the GitHub issue stays OPEN). "resolved" = reviewer-confirmed \u2014 server stamps resolvedAt on ANY \u2192resolved transition and clears it on demotion out of resolved; PATCHing "fixed" onto a resolved thread is a 400 (reopen first \u2014 a stale full-doc PATCH must never demote a confirmation). comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt)'
       },
       COMMENT: {
         url: `${API_BASE}/threads/<id>/comments`,
@@ -2562,18 +2595,24 @@ async function handleApi(req, res, url, configDir, origin) {
       const full = buildPatchCandidate(prev, body);
       if ("status" in body && full.status !== void 0) {
         const norm = String(full.status).toLowerCase();
-        if (norm !== "open" && norm !== "resolved") {
+        if (norm !== "open" && norm !== "fixed" && norm !== "resolved") {
           throw Object.assign(
-            new Error(`status must be "open" or "resolved" (got ${JSON.stringify(full.status)}) \u2014 {"status":"resolved"} resolves (server stamps resolvedAt), {"status":"open"} reopens`),
+            new Error(`status must be "open", "fixed" or "resolved" (got ${JSON.stringify(full.status)}) \u2014 {"status":"fixed"} = addressed, awaiting review; {"status":"resolved"} = reviewer-confirmed (server stamps resolvedAt); {"status":"open"} reopens`),
             { status: 400 }
           );
         }
         full.status = norm;
       }
-      if (prev.status === "open" && full.status === "resolved" && !full.resolvedAt) {
+      if (prev.status === "resolved" && full.status === "fixed") {
+        throw Object.assign(
+          new Error('thread is resolved (reviewer-confirmed) \u2014 reopen to "open" first if you want it marked fixed'),
+          { status: 400 }
+        );
+      }
+      if (prev.status !== "resolved" && full.status === "resolved" && !full.resolvedAt) {
         full.resolvedAt = nowIso();
       }
-      if (prev.status === "resolved" && full.status === "open") {
+      if (prev.status === "resolved" && full.status !== "resolved") {
         delete full.resolvedAt;
       }
       if (prev.gh) full.gh = prev.gh;
@@ -2599,7 +2638,7 @@ async function handleApi(req, res, url, configDir, origin) {
       afterMutation(rt, {
         storyId: updated.storyId,
         threadId: updated.id,
-        reason: prev.status === "open" && updated.status === "resolved" ? "resolved" : prev.status === "resolved" && updated.status === "open" ? "reopened" : "updated"
+        reason: prev.status === "open" && updated.status === "resolved" ? "resolved" : prev.status === "open" && updated.status === "fixed" ? "fixed" : prev.status === "resolved" && updated.status === "open" ? "reopened" : "updated"
       });
       await sendMutationJson(rt, res, 200, updated);
       return true;

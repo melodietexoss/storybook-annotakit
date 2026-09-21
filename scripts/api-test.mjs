@@ -307,11 +307,45 @@ async function main() {
   const enumId = enumT.json?.id;
   if (enumId) ownIds.push(enumId);
   const badStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'closed' });
-  check('PATCH bogus status → 400 naming open|resolved', badStatus.status === 400 && /"open" or "resolved"/.test(String(badStatus.json?.error)), `status=${badStatus.status}`);
+  check('PATCH bogus status → 400 naming open|fixed|resolved', badStatus.status === 400 && /"open", "fixed" or "resolved"/.test(String(badStatus.json?.error)), `status=${badStatus.status}`);
   const upperStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'RESOLVED' });
   check('PATCH status case-normalized + resolvedAt stamped', upperStatus.status === 200 && upperStatus.json?.status === 'resolved' && typeof upperStatus.json?.resolvedAt === 'string', `status=${upperStatus.status}`);
   const lowerStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'OPEN' });
   check('PATCH reopen via OPEN clears resolvedAt', lowerStatus.status === 200 && lowerStatus.json?.status === 'open' && !lowerStatus.json?.resolvedAt, `status=${lowerStatus.status}`);
+
+  // (a2) v0.6.3 review-flow triage: open → fixed (agent) → resolved (reviewer)
+  const fixT = await j('POST', `${API}/threads`, {
+    storyId,
+    story: { storyId, title: 'Contract', name: 'FixedFlow', importPath: './src/x.stories.tsx' },
+    target: { kind: 'pin', selector: { cssSelector: 'div', fragment: { x: 1, y: 1, w: 2, h: 2 } }, fingerprint: { tag: 'div' }, context: { tag: 'div', text: 'fixed flow carrier' }, bbox: { x: 1, y: 1, w: 2, h: 2 } },
+    comments: [{ id: 'c-fix-1', author: 'api-test', body: 'fixed-status flow carrier', createdAt: new Date().toISOString() }],
+  });
+  const fixId = fixT.json?.id;
+  if (fixId) ownIds.push(fixId);
+  const toFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'FIXED' });
+  check('PATCH {status:fixed} → 200, case-normalized, no resolvedAt', toFixed.status === 200 && toFixed.json?.status === 'fixed' && !toFixed.json?.resolvedAt, `status=${toFixed.status}`);
+  const confirmFromFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'resolved' });
+  check('fixed → resolved (reviewer confirm) stamps resolvedAt', confirmFromFixed.status === 200 && confirmFromFixed.json?.status === 'resolved' && typeof confirmFromFixed.json?.resolvedAt === 'string', `status=${confirmFromFixed.status}`);
+  const guardFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' });
+  check('resolved → fixed is a 400 (demotion guard)', guardFixed.status === 400 && /resolved \(reviewer-confirmed\)/.test(String(guardFixed.json?.error)), `status=${guardFixed.status}`);
+  const rejectPath = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' });
+  check('resolved → open reopen clears resolvedAt', rejectPath.status === 200 && rejectPath.json?.status === 'open' && !rejectPath.json?.resolvedAt, `status=${rejectPath.status}`);
+  const fixedAgain = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' });
+  check('open → fixed again (re-addressed) works', fixedAgain.status === 200 && fixedAgain.json?.status === 'fixed', `status=${fixedAgain.status}`);
+  const rejectFromFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' });
+  check('fixed → open (reviewer reject) works', rejectFromFixed.status === 200 && rejectFromFixed.json?.status === 'open', `status=${rejectFromFixed.status}`);
+  // ?status=fixed filter + three-way export counts + digest rendering
+  const fixedFilterList = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' }).then(() => j('GET', `${API}/threads?storyId=${encodeURIComponent(storyId)}&status=fixed`));
+  check('?status=fixed filter returns only fixed threads', Array.isArray(fixedFilterList.json?.threads) && fixedFilterList.json.threads.every((t) => t.status === 'fixed') && fixedFilterList.json.threads.some((t) => t.id === fixId), JSON.stringify(fixedFilterList.json?.threads?.map((t) => t.status) ?? null));
+  const fixExport = await fetch(`${API}/export?format=json&storyId=${encodeURIComponent(storyId)}`);
+  const fixExportJson = await fixExport.json();
+  const fixStory = (fixExportJson?.stories ?? []).find((s) => s.threads?.some((t) => t.id === fixId));
+  check('export json counts carry fixed (three-way)', fixStory && typeof fixStory.counts?.fixed === 'number' && fixStory.counts.fixed >= 1 && typeof fixStory.counts?.open === 'number' && typeof fixStory.counts?.resolved === 'number', JSON.stringify(fixStory?.counts ?? null));
+  const fixMd = await fetch(`${API}/export?format=md&storyId=${encodeURIComponent(storyId)}`);
+  const fixMdText = await fixMd.text();
+  check('digest renders FIXED heading + review note', fixMdText.includes('FIXED —') && /awaiting reviewer verification/.test(fixMdText), 'FIXED rendering missing');
+  check('digest three-way summary line', /\d+ open \/ \d+ fixed \(awaiting review\) \/ \d+ resolved/.test(fixMdText), 'three-way counts line missing');
+  check('digest footer teaches the fixed contract (Path B)', fixMdText.includes('{"status":"fixed"}'), 'agent-loop footer not flipped');
 
   // (b) POST idempotent replay is FLAGGED (body + header) — a replay of a
   // DIFFERENT body must not masquerade as "landed"

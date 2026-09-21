@@ -26,9 +26,10 @@
            │ zero commits on code branches, pushed to the remote)
            ▼ agent consumption (GET /health → agentSurfaces)
   Path A — GitHub mirror: each thread = ONE issue labeled `annotakit`
-  → agent comments fix evidence + closes it → thread resolves in Storybook
+  → agent comments fix evidence (does NOT close — closing = reviewer-confirmed)
+  → reviewer confirms → thread resolves in Storybook
   Path B — local REST (always available): /threads + /schema + /export?format=md|json
-  → reply + PATCH resolve on the dev server itself
+  → reply + PATCH {"status":"fixed"} on the dev server itself
   POST /annotakit/api/sync   (idempotent reconcile, both directions)
 ```
 
@@ -54,7 +55,7 @@ That's the entire setup — **local mode works with zero configuration**: pinnin
 2. **Annotakit toolbar buttons** (native Storybook toolbar): pin · region · threads (+count) · show/hide pins — or press **`⌥C`** and click an element (**`⌥R`** → drag a region)
 3. The composer shows the exact element identity — `<button#save.primary.btn:nth(2) [testid=save-btn] "Save">` — the SAME string the agent later reads in the digest
 4. Type → **Pin it** (⌘/Ctrl+Enter). Saved, automatically — there is no DB setup to fail.
-5. Threads live in the **Annotakit** panel (bottom dock): reply, resolve, export, sync status, and a 📷 *dom* chip per thread opening the captured DOM evidence
+5. Threads live in the **Annotakit** panel (bottom dock): reply, resolve / confirm / reject / reopen, export, sync status, and a 📷 *dom* chip per thread opening the captured DOM evidence. v0.6.3 review flow: agents mark threads `fixed` (addressed, awaiting your verification — blue pins, `to review` filter, `recent` sort); `resolved` is your confirmation
 6. Pins follow their element through re-renders, HMR, and DOM changes (multi-selector anchoring with text/attr fallbacks — ported unchanged from AnnotaKit's proven engine)
 7. With a GitHub token configured, **every thread mirrors to exactly one GitHub issue, automatically** — create → issue, reply → comment, resolve → close, reopen → reopen, delete → close+note. No publish button, no duplicate issues, ever.
 
@@ -100,21 +101,21 @@ curl "$BASE/annotakit/api/export?format=md"              # lean digest (default)
 curl "$BASE/annotakit/api/export?format=json&status=open"  # lean JSON bundle
 ```
 
-- The digest maps every thread to **the file to edit** (`jsx:` line, repo-root-relative) plus story file + component + props + selector. Fix the UI, then resolve:
-- **Resolve programmatically (Path B)**: `GET /api/threads` → take the thread OBJECT → set `"status":"resolved"` → `PATCH` the FULL object to `/annotakit/api/threads/<id>` (the server stamps `resolvedAt` on transitions; stale snapshots are merged server-side — omitted comments are never dropped). The lighter partial form works too: `PATCH` with just `{"status":"resolved"}` (JSON-merge semantics, same field guarantees). v0.6.1: status is a validated enum — `open`/`resolved`, case-insensitive, anything else is a 400 (garbage statuses used to store silently and break digest counts). `POST` is create-only: an idempotent replay (same id) returns 200 with `replayed:true` in the body (and an `X-Annotakit-Replayed` header) — your amended body does NOT land, amend via PATCH. Comment bodies are capped at 64,000 chars (413 beyond); GET /schema documents both PATCH forms and every endpoint.
+- The digest maps every thread to **the file to edit** (`jsx:` line, repo-root-relative) plus story file + component + props + selector. Fix the UI, then hand it to the reviewer:
+- **Mark fixed programmatically (Path B)**: `GET /api/threads` → take the thread OBJECT → set `"status":"fixed"` → `PATCH` the FULL object to `/annotakit/api/threads/<id>` = addressed, AWAITING REVIEWER VERIFICATION. The lighter partial form works too: `PATCH` with just `{"status":"fixed"}` (JSON-merge semantics, same field guarantees). `"resolved"` is the reviewer's confirmation (panel ✓ or closing the GitHub issue) — direct open→resolved stays legal for trivial fixes. Status is a validated enum — `open`/`fixed`/`resolved`, case-insensitive, anything else is a 400; the server stamps `resolvedAt` on any →resolved transition and rejects `resolved→fixed` with a 400 (reopen first — a stale full-doc PATCH must never demote a confirmation); stale snapshots are merged server-side — omitted comments are never dropped. `POST` is create-only: an idempotent replay (same id) returns 200 with `replayed:true` in the body (and an `X-Annotakit-Replayed` header) — your amended body does NOT land, amend via PATCH. Comment bodies are capped at 64,000 chars (413 beyond); GET /schema documents both PATCH forms and every endpoint.
 - **Create threads programmatically** (idempotent upsert by `id`): POST `/annotakit/api/threads` with `{id?, storyId, story?, component?, target, comments:[{id,author,body,createdAt}]}` — include a stable top-level `id` (e.g. `"fix-header-overflow"`) so replayed/retried POSTs return 200 with the existing thread instead of minting a duplicate (201; the /schema example includes it). Numbers are server-assigned per story; comment ids are deterministically re-hashed server-side — key threads by `id`. With GH auto-sync on, each POST **creates a real issue within ~1s**.
 - **GitHub lifecycle mirror (Path A, v0.4.0 production-grade)** — one issue per thread, forever:
   - The local DB (`threads.db`, git-tracked) is the **status source of truth**; each thread's `gh.issue` field pins its mirror.
   - **Push on every mutation** (debounced, serialized): thread → issue, reply → comment, resolve → close, reopen → reopen, delete → close + note. Idempotent — `POST /annotakit/api/sync` reconciles both directions and creates **zero** duplicates, no matter how often you call it. A thread deleted while its issue is being created self-closes it (no orphans).
-  - **Pull every 60s** (configurable): an agent closing the issue on GitHub resolves the thread in Storybook within a minute, importing its comments as replies (`source: "github"`). Reopening re-opens the thread; commenting on a closed issue still imports.
+  - **Pull every 60s** (configurable): closing the issue on GitHub CONFIRMS the review — the thread resolves in Storybook within a minute (from open or fixed), importing its comments as replies (`source: "github"`). Reopening re-opens the thread; commenting on a closed issue still imports. A thread the agent marked `fixed` keeps its issue OPEN — the review gate.
   - **Failure behavior**: 401 → self-healing a/b/c steps, mirror pauses, local mode keeps working. Rate limits → timed backoff (Retry-After respected). Remote issue deleted → mapping resets and heals. Fetch timeouts, pagination (>100), and comment-`since` gating keep the API budget flat as threads grow.
   - Knobs: `ANNOTAKIT_GH_AUTO=0` (local mode) · `ANNOTAKIT_GH_POLL=<sec>` · `ANNOTAKIT_GH_REPO` · `ANNOTAKIT_GH_API` (GHE) · `ANNOTAKIT_GH_INTERVAL=<ms>`.
   - `POST /gh` is kept as a legacy alias of `POST /sync` (the old bulk-digest publishing is gone).
-- Loop: reviewer pins → issue appears → agent fixes code at the `jsx:` path → agent comments evidence + closes → thread resolves in Storybook (60s poll) → reviewer re-checks, may reopen → issue reopens. Hands-free both directions; without GitHub, the same loop runs entirely over Path B.
+- Loop: reviewer pins → issue appears (carrying the FULL verbatim notes — v0.6.3, issue #16: mirrors never shorten) → agent fixes code at the `jsx:` path → agent comments evidence, marks the thread fixed (panel) / leaves the issue open (GitHub — closing means reviewer-confirmed) → reviewer verifies: ✓ confirm (→ resolved, issue closes) or reject (→ open, issue reopens, reply why) → hands-free both directions; without GitHub, the same loop runs entirely over Path B.
 
 ## Lean exports (feedback-driven)
 
-No W3C envelope, no outerHTML dumps, no anchor forensics — one line per fact, the comment as headline, `outerHTML` clipped to 200 chars (full thread docs only), resolved threads folded into `<details>`. 3 threads ≈ 3.2 KB.
+No W3C envelope, no outerHTML dumps, no anchor forensics — one line per fact, the comment as headline, `outerHTML` clipped to 200 chars (full thread docs only), fixed threads surfaced as awaiting review, resolved threads folded into `<details>`. 3 threads ≈ 3.2 KB.
 
 ## Configuration (all optional)
 
@@ -174,7 +175,7 @@ Feedback threads are per-PROJECT, not per-branch — you review `feature-x`'s St
 
 - **the store lives in the repo's common git dir** (`.git/annotakit/`) — checkouts and `git clean -fdx` physically cannot touch it, and "is the db gitignored" is structurally impossible; all worktrees of one repo share it
 - **durability is a dedicated ORPHAN branch** (`refs/heads/annotakit`, tree = `README` + `threads.db`): pure git plumbing (hash-object/mktree/commit-tree/update-ref — no index, no work tree), pushed with the same debounced mutation flow. Zero commits on your code branches (no CI noise, no review pollution); a foreign branch with the same name is detected and avoided (falls back to `annotakit-store`)
-- **divergence is a logical merge, not a conflict**: two machines pushing the same branch reconcile by union (threads by id, delete-wins tombstones, resolved-wins, comment union) — committed on top of the remote head, never force-pushed
+- **divergence is a logical merge, not a conflict**: two machines pushing the same branch reconcile by union (threads by id, delete-wins tombstones, monotonic status precedence open < fixed < resolved, comment union) — committed on top of the remote head, never force-pushed
 - **fresh clones / agent sandboxes boot-restore** from the remote branch (offline-capable right after clone via the tracking ref); a legacy v0.4 tracked db is migrated row-by-row, the old file left untouched
 - no repo / `autoSync:false` → classic `<configDir>/annotakit/threads.db`, disk-only (your choice, no git flow)
 
@@ -215,7 +216,9 @@ node node_modules/storybook-annotakit/scripts/bake-static-threads.mjs <sb-output
 
 ## Status
 
-v0.6.2 — docs-deflate round (MIT; not yet on the npm registry — install via `file:` or tarball). Full battery green — API contract, lifecycle engine, store robustness (branch switch, clean -fdx, fresh-clone restore, two-machine divergence, delete-wins tombstones, subdir monorepo, marker adoption), static store, client publisher — against real git repos and a live GitHub mirror; static mode E2E-verified through a public preview gateway, including client-side GH publishing with the file server killed mid-reply (the backend can die, feedback can't).
+v0.6.3 — review-flow round (MIT; not yet on the npm registry — install via `file:` or tarball). **`fixed` status: open → fixed (agent addressed) → resolved (reviewer confirms)** — the reviewer's "check the latest batch" workflow: blue pins, `to review` filter, `recent` sort (updatedAt DESC), toolbar badge fixed-aware; monotonic merge precedence; GitHub issues stay OPEN while awaiting review (closing = reviewer-confirmed, both engines); resolved→fixed is a 400 (a stale full-doc PATCH can never demote a confirmation); additive `counts.fixed` in exports + `?status=fixed` filter. **Mirrors never shorten (issue #16):** GitHub issue bodies carry VERBATIM comment bodies (newlines preserved — the lean 200-char clip is display-only, never on the mirror); title headline budget 60→100; honest 60k clip guard vs GitHub's 65,536-char cap with a pointer to the full thread. **Canvas stays overlay-free:** the static-GH chip and the capture-mode banner are gone (status lives in the panel; Esc stays functional); explicit z-stack — pins above passive overlays, interactive surfaces above pins. Full battery green (suites self-report their totals).
+
+**v0.6.2 — docs-deflate round:** SKILL/README/PLAN deflated to Read-tool one-pass sizes (public SKILL 48.2k→28.3k chars, empirically verified); every surviving fact justified through four sub-agent review rounds + a cold-start mission test; stage-release's 7 fragile prose-anchor transforms replaced by ONE structural cut.
 
 **v0.6.1 — hardening round:** fixed the local-only tab freeze (infinite microtask re-arm in the flusher; regression-tested incl. boot-drain). Agent contracts: PATCH status validated enum; idempotent POST replays FLAGGED (`replayed:true` + `X-Annotakit-Replayed`); comment bodies capped at 64,000 chars at every door (413s + composer maxLength); ≥2MB requests get a real 413 (was a silent TCP reset); 404 hints; trailing-slash tolerance; unknown formats 400; `/schema` endpoints index (+ the never-existing `?format=svg` removed). Durability: machine-readable git health (`/health` `git` block, durability degrades to `git-commit` while pushes fail, POST /sync forces the git cycle); versioned store-branch marker (`annotakit-store: v1`, prose-agnostic); deduped failures re-log at 1/5/25/100. Client: Save/Reset retries queued ops immediately (one per user action); 422 rejections park ops (named, surfaced); quota failures surface in the canvas; pins work with a thread popup open; two-stage Esc; keyboard-reachable pin dots; minified names suppressed; digests clip headlines (200 chars) + `(via github)` provenance. Release hygiene: npm `files` whitelist (no private staging script / dev SKILL in the tarball — pack-guard verified) + `npm run release-check` gate.
 

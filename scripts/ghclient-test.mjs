@@ -373,6 +373,35 @@ let createdThread;
   ok('close system comment', t4?.comments.some((c) => c.body === 'closed on GitHub' && c.source === 'github'));
 }
 
+/* 8b — v0.6.3 fixed: issue stays OPEN (review gate); remote close confirms FROM fixed */
+{
+  const ghc8b = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc8b.getGhLinkedStaticStore();
+  await store.create(threadInput('th_fixed'));
+  await until(() => queueOps(ghc8b).length === 0);
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_fixed'));
+  // FRESH read (the create return predates the flusher's issue-body stamp —
+  // patching a stale doc would regress comments[0].ghId and re-mirror it)
+  const t = store.list().find((x) => x.id === 'th_fixed');
+  ok('setup: issue-body stamp present', t?.comments[0]?.ghId === 'issue-body');
+  // agent marks fixed → the push must NOT touch the issue (open = natural)
+  const noticesBefore = issue?.comments.length ?? 0;
+  await store.patch({ ...t, status: 'fixed' });
+  await until(() => queueOps(ghc8b).length === 0, 'fixed flush');
+  ok('issue stays OPEN while fixed (review gate)', issue?.state === 'open', `state=${issue?.state}`);
+  ok('no lifecycle notice while fixed', (issue?.comments.length ?? -1) === noticesBefore, `comments=${issue?.comments.length}`);
+  // reviewer confirms ON GitHub → pull resolves FROM fixed
+  const later = () => new Date(Date.now() + 5000).toISOString();
+  issue.state = 'closed';
+  issue.closed_at = later();
+  issue.closed_by = { login: 'human' };
+  issue.updated_at = later();
+  await store.gh?.syncNow();
+  const t2 = store.list().find((x) => x.id === 'th_fixed');
+  ok('remote close confirms FROM fixed → resolved + resolvedAt', t2?.status === 'resolved' && Boolean(t2?.resolvedAt) && t2?.gh?.state === 'closed', `${t2?.status} ${t2?.resolvedAt}`);
+  ok('close system comment', t2?.comments.some((c) => c.body === 'closed on GitHub' && c.source === 'github'));
+}
+
 /* 9 — follower doc: enqueue only, no flush (leader election) */
 {
   const ghc9 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });

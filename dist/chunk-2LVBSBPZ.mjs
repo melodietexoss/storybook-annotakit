@@ -1,0 +1,727 @@
+import {
+  ISSUE_BODY_LIMIT,
+  getStaticStore,
+  mirrorStateOf,
+  renderThreadBlock,
+  staticScope
+} from "./chunk-ZCCQXJCX.mjs";
+
+// src/shared/ghClient.ts
+var GH_FILE = "annotakit-gh.json";
+var CFG_PREFIX = "annotakit:ghcfg:";
+var QUEUE_PREFIX = "annotakit:ghq:";
+var DEFAULT_LABEL = "annotakit";
+var DEFAULT_POLL_MS = 6e4;
+var FETCH_TIMEOUT_MS = 15e3;
+var MAX_BACKOFF_MS = 15 * 6e4;
+var GH_SENTINEL = "<!-- annotakit -->";
+var SENTINEL_RE = /<!--\s*annotakit:c_(\S+?)\s*-->/;
+var DEFAULT_API = "https://api.github.com";
+var transport = null;
+function __ghSetTransportForTests(fn) {
+  transport = fn;
+}
+function tx() {
+  return transport ?? ((u, i) => fetch(u, i));
+}
+async function ghError(res, method, pathname) {
+  const text = await res.text().catch(() => "");
+  const retryMs = retryAfterMs(res);
+  if (res.status === 401) {
+    throw Object.assign(
+      new Error(
+        `GitHub rejected the token (401: ${text.slice(0, 160)}). Open the annotakit panel \u2192 static GitHub settings and paste a fresh PAT (github.com/settings/tokens, classic: repo scope). Feedback stays queued until then.`
+      ),
+      { status: 401 }
+    );
+  }
+  const isRate = res.status === 429 || res.status === 403 && /rate limit|abuse/i.test(text);
+  if (isRate) {
+    throw Object.assign(
+      new Error(`GitHub rate-limited ${method} ${pathname} (${text.slice(0, 120)}) \u2014 retrying with backoff`),
+      { status: 429, transient: true, retryMs: retryMs ?? 6e4 }
+    );
+  }
+  if (res.status === 404) {
+    throw Object.assign(new Error(`GitHub 404 on ${method} ${pathname} (${text.slice(0, 160)})`), { status: 404 });
+  }
+  if (res.status === 422) {
+    throw Object.assign(
+      new Error(`GitHub rejected the request body (422: ${text.slice(0, 200)}) \u2014 this op will not be retried automatically; edit or delete the offending thread feedback.`),
+      { status: 422, park: true }
+    );
+  }
+  throw Object.assign(new Error(`GitHub API ${res.status} on ${method} ${pathname}: ${text.slice(0, 300)}`), {
+    status: 502,
+    transient: true
+  });
+}
+function retryAfterMs(res) {
+  const ra = res.headers?.get?.("retry-after");
+  if (ra) {
+    const n = Number.parseInt(ra, 10);
+    if (Number.isFinite(n) && n > 0) return Math.min(n * 1e3, 9e5);
+  }
+  const reset = res.headers?.get?.("x-ratelimit-reset");
+  if (reset) {
+    const n = Number.parseInt(reset, 10);
+    if (Number.isFinite(n) && n > 0) return Math.min((n - Math.floor(Date.now() / 1e3)) * 1e3, 9e5);
+  }
+  return void 0;
+}
+async function ghJson(cfg, method, pathname, body) {
+  let res;
+  try {
+    res = await tx()(`${cfg.apiBase}${pathname}`, {
+      method,
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${cfg.token}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+        ...body !== void 0 ? { "Content-Type": "application/json" } : {}
+      },
+      ...body !== void 0 ? { body: JSON.stringify(body) } : {},
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw Object.assign(new Error(`GitHub timeout on ${method} ${pathname} (15s)`), { status: 504, transient: true });
+    }
+    throw Object.assign(
+      new Error(`GitHub unreachable (${pathname}): ${err instanceof Error ? err.message : String(err)}`),
+      { status: 503, transient: true }
+    );
+  }
+  if (!res.ok) throw await ghError(res, method, pathname);
+  if (res.status === 204 || method === "HEAD") return {};
+  return await res.json();
+}
+async function ghJsonPaged(cfg, pathname, maxPages = 5) {
+  const out = [];
+  let url = `${cfg.apiBase}${pathname}`;
+  for (let page = 0; page < maxPages && url; page++) {
+    let res;
+    try {
+      res = await tx()(url, {
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${cfg.token}`,
+          "X-GitHub-Api-Version": "2022-11-28"
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      });
+    } catch {
+      throw Object.assign(new Error(`GitHub unreachable (${pathname})`), { status: 503, transient: true });
+    }
+    if (!res.ok) throw await ghError(res, "GET", pathname);
+    const data = await res.json();
+    out.push(...data);
+    const link = res.headers?.get?.("link") ?? "";
+    const next = link.match(/<([^>]+)>;\s*rel="next"/);
+    if (!next) {
+      url = null;
+    } else {
+      try {
+        url = new URL(next[1]).origin === new URL(cfg.apiBase).origin ? next[1] : null;
+      } catch {
+        url = null;
+      }
+    }
+  }
+  return out;
+}
+function createIssueRemote(cfg, input) {
+  return ghJson(cfg, "POST", `/repos/${cfg.repo}/issues`, { title: input.title, body: input.body, labels: cfg.labels });
+}
+function addIssueCommentRemote(cfg, issue, body) {
+  return ghJson(cfg, "POST", `/repos/${cfg.repo}/issues/${issue}/comments`, { body });
+}
+function setIssueStateRemote(cfg, issue, state2) {
+  return ghJson(cfg, "PATCH", `/repos/${cfg.repo}/issues/${issue}`, { state: state2 });
+}
+function getIssueRemote(cfg, issue) {
+  return ghJson(cfg, "GET", `/repos/${cfg.repo}/issues/${issue}`);
+}
+function listLabeledIssuesRemote(cfg) {
+  const labels = encodeURIComponent(cfg.labels.join(","));
+  return ghJsonPaged(
+    cfg,
+    `/repos/${cfg.repo}/issues?labels=${labels}&state=all&per_page=100&sort=updated&direction=desc`,
+    5
+  );
+}
+function listIssueCommentsRemote(cfg, issue, since) {
+  const q = since ? `?per_page=100&since=${encodeURIComponent(since)}` : "?per_page=100";
+  return ghJsonPaged(cfg, `/repos/${cfg.repo}/issues/${issue}/comments${q}`, 3);
+}
+var GH_CLIENT_SENTINEL = GH_SENTINEL;
+function ls() {
+  try {
+    return typeof localStorage === "undefined" ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
+function cfgKey() {
+  return CFG_PREFIX + staticScope();
+}
+function queueKey() {
+  return QUEUE_PREFIX + staticScope();
+}
+var bakedPromise = null;
+var resolvedBaked = null;
+async function tryFetchGhFile(url) {
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body && typeof body === "object" ? body : null;
+  } catch {
+    return null;
+  }
+}
+function probeBakedGhConfig() {
+  if (bakedPromise) return bakedPromise;
+  bakedPromise = (async () => {
+    const candidates = [new URL(GH_FILE, document.baseURI).href];
+    try {
+      const parent = window.parent && window.parent !== window ? window.parent.location.href : null;
+      if (parent && parent !== window.location.href) candidates.push(new URL(GH_FILE, parent).href);
+    } catch {
+    }
+    candidates.push(new URL(`/${GH_FILE}`, window.location.origin).href);
+    for (const url of [...new Set(candidates)]) {
+      const body = await tryFetchGhFile(url);
+      if (body) {
+        resolvedBaked = body;
+        return body;
+      }
+    }
+    return null;
+  })();
+  return bakedPromise;
+}
+function readOverride() {
+  const store = ls();
+  if (!store) return null;
+  try {
+    const raw = store.getItem(cfgKey());
+    if (!raw) return null;
+    const doc = JSON.parse(raw);
+    return doc && typeof doc === "object" ? doc : null;
+  } catch {
+    return null;
+  }
+}
+function writeOverride(patch) {
+  const store = ls();
+  if (!store) return;
+  const next = { ...readOverride(), ...patch };
+  try {
+    store.setItem(cfgKey(), JSON.stringify(next));
+  } catch {
+  }
+}
+function resolveGhConfig(baked, override) {
+  const merged = { ...baked ?? {}, ...override ?? {} };
+  if (merged.disabled) return null;
+  const token = (merged.token ?? "").trim();
+  const repo = (merged.repo ?? "").trim();
+  if (!token || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return null;
+  const labels = (merged.labels ?? []).map((l) => String(l).trim()).filter(Boolean);
+  const pollMs = typeof merged.pollMs === "number" && Number.isFinite(merged.pollMs) && merged.pollMs >= 0 ? Math.floor(merged.pollMs) : DEFAULT_POLL_MS;
+  const apiBase = (merged.apiBase ?? "").trim() || DEFAULT_API;
+  return { token, repo, labels: labels.length ? labels : [DEFAULT_LABEL], apiBase, pollMs };
+}
+async function probeGhConfig() {
+  const baked = await probeBakedGhConfig();
+  return resolveGhConfig(baked, readOverride());
+}
+function issueTitle(t) {
+  const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
+  const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
+  return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 160);
+}
+function issueBody(t, cfg) {
+  const origin = staticScope();
+  const storyUrl = t.story?.url ?? `${origin}?path=/story/${t.storyId}`;
+  const out = [];
+  out.push(`# UI review \u2014 ${t.story?.title ?? t.storyId}`);
+  out.push("");
+  out.push(`storybook (static deployment): ${origin}`);
+  out.push(`mirror: ${cfg.repo} \xB7 labels: ${cfg.labels.join(", ")} \xB7 client-side publish`);
+  out.push("");
+  out.push(`open: ${storyUrl}`);
+  out.push("");
+  out.push(...renderThreadBlock(t, `mirrored from a static build (${origin}) \u2014 local copy in the reviewer's browser`, true));
+  out.push("---");
+  out.push("");
+  out.push(
+    "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED \u2014 do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node."
+  );
+  out.push("");
+  out.push(GH_SENTINEL);
+  const body = out.join("\n");
+  if (body.length > ISSUE_BODY_LIMIT) {
+    return body.slice(0, ISSUE_BODY_LIMIT) + `
+
+\u2026 (clipped at ${ISSUE_BODY_LIMIT} chars \u2014 GitHub caps issue bodies at 65,536; full thread: the Storybook annotakit panel export (threads \u2192 Download JSON))`;
+  }
+  return body;
+}
+function mirrorBody(c) {
+  return `**${c.author}:** ${c.body}
+<!-- annotakit:c_${c.id} -->`;
+}
+function parseSentinel(body) {
+  const m = body.match(SENTINEL_RE);
+  return m ? m[1] : null;
+}
+function resolutionNotice(t) {
+  return `${GH_SENTINEL}
+resolved in Storybook \u2014 thread #${t.number}${t.resolvedAt ? `, ${t.resolvedAt.slice(0, 16).replace("T", " ")}` : ""}. Fix evidence is in the replies above.`;
+}
+function reopenNotice(t) {
+  return `${GH_SENTINEL}
+reopened in Storybook \u2014 thread #${t.number}.`;
+}
+function readQueue() {
+  const store = ls();
+  if (!store) return [];
+  try {
+    const raw = store.getItem(queueKey());
+    if (!raw) return [];
+    const doc = JSON.parse(raw);
+    return Array.isArray(doc?.ops) ? doc.ops : [];
+  } catch {
+    return [];
+  }
+}
+function writeQueue(ops) {
+  const store = ls();
+  if (!store) return;
+  try {
+    store.setItem(queueKey(), JSON.stringify({ v: 1, ops }));
+  } catch {
+    if (state) state.lastError = "outbox write failed (storage full) \u2014 publishing paused for new feedback; free space or export + re-add later";
+  }
+}
+function opKeyOf(op) {
+  return op.kind === "sync" ? `sync:${op.threadId}` : `close:${op.issue}`;
+}
+function enqueue(kind, ref) {
+  const ops = readQueue();
+  const key = kind === "sync" ? `sync:${ref}` : `close:${ref}`;
+  const existing = ops.find((o) => opKeyOf(o) === key);
+  const op = existing ? { ...existing, enqueuedAt: (/* @__PURE__ */ new Date()).toISOString(), notBefore: 0, lastError: void 0 } : {
+    id: `op_${Math.random().toString(36).slice(2, 10)}`,
+    kind,
+    ...kind === "sync" ? { threadId: String(ref) } : { issue: Number(ref) },
+    enqueuedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const next = existing ? ops.map((o) => opKeyOf(o) === key ? op : o) : [...ops, op];
+  writeQueue(next);
+  wake();
+}
+function removeOp(id) {
+  writeQueue(readQueue().filter((o) => o.id !== id));
+}
+function clearOpBackoff() {
+  const ops = readQueue();
+  if (!ops.some((o) => !o.parked && ((o.notBefore ?? 0) > 0 || o.lastError))) return;
+  writeQueue(ops.map((o) => o.parked ? o : { ...o, notBefore: 0, lastError: void 0 }));
+}
+function bumpOp(id, err) {
+  const ops = readQueue();
+  const idx = ops.findIndex((o) => o.id === id);
+  const transient = Boolean(err?.transient) || [429, 502, 503, 504].includes(Number(err?.status));
+  const park = Boolean(err?.park);
+  if (idx >= 0) {
+    const op = ops[idx];
+    if (park) {
+      const ref = op.kind === "sync" ? `thread ${op.threadId}` : `issue #${op.issue}`;
+      ops[idx] = { ...op, parked: true, lastError: `parked (422 \u2014 GitHub rejected the body, ${ref}): ${err instanceof Error ? err.message.slice(0, 200) : String(err)}` };
+      writeQueue(ops);
+      return { transient: false };
+    }
+    const attempts = (op.attempts ?? 0) + 1;
+    const retryMs = Number(err?.retryMs) || Math.min(15e3 * 2 ** Math.min(attempts, 5), MAX_BACKOFF_MS);
+    ops[idx] = { ...op, attempts, notBefore: Date.now() + retryMs, lastError: err instanceof Error ? err.message.slice(0, 300) : String(err) };
+    writeQueue(ops);
+  }
+  return { transient };
+}
+var wake = () => void 0;
+function setWake(fn) {
+  wake = fn;
+}
+var state = null;
+function isLeaderDoc() {
+  try {
+    return !window.parent || window.parent === window;
+  } catch {
+    return false;
+  }
+}
+function freshThread(base, id) {
+  base.reloadFromPersisted();
+  return base.list().find((t) => t.id === id);
+}
+function threadPending(id) {
+  return readQueue().some((o) => o.kind === "sync" && o.threadId === id);
+}
+async function processSyncOp(base, cfg, op) {
+  const t = freshThread(base, String(op.threadId));
+  if (!t) return;
+  if (!t.gh) {
+    const created = await createIssueRemote(cfg, { title: issueTitle(t), body: issueBody(t, cfg) });
+    const cur = freshThread(base, t.id);
+    if (!cur) {
+      await addIssueCommentRemote(cfg, created.number, `${GH_SENTINEL}
+thread deleted in Storybook (static) \u2014 closing.`);
+      await setIssueStateRemote(cfg, created.number, "closed");
+      return;
+    }
+    const stamped = {
+      ...cur,
+      gh: { issue: created.number, url: created.html_url, state: "open", syncedAt: (/* @__PURE__ */ new Date()).toISOString() },
+      comments: cur.comments.map((c) => c.ghId || c.source === "github" ? c : { ...c, ghId: "issue-body" })
+    };
+    await base.patch(stamped);
+    if (cur.status === "resolved") {
+      await addIssueCommentRemote(cfg, created.number, resolutionNotice(stamped));
+      await setIssueStateRemote(cfg, created.number, "closed");
+      const fresh = freshThread(base, t.id);
+      if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, state: "closed" } });
+    }
+    state && (state.lastPushAt = (/* @__PURE__ */ new Date()).toISOString());
+    return;
+  }
+  let pushed = 0;
+  for (const c of t.comments) {
+    if (c.ghId || c.source === "github") continue;
+    const gh = await addIssueCommentRemote(cfg, t.gh.issue, mirrorBody(c));
+    const cur = freshThread(base, t.id);
+    if (!cur) return;
+    const idx = cur.comments.findIndex((x) => x.id === c.id);
+    const curGh2 = cur.gh;
+    if (idx >= 0 && curGh2 && !cur.comments[idx].ghId) {
+      const comments = [...cur.comments];
+      comments[idx] = { ...comments[idx], ghId: String(gh.id) };
+      await base.patch({ ...cur, gh: curGh2, comments });
+    }
+    pushed++;
+  }
+  const curGh = t.gh;
+  const want = mirrorStateOf(t.status);
+  if (curGh.state !== want) {
+    await addIssueCommentRemote(cfg, curGh.issue, want === "closed" ? resolutionNotice(t) : reopenNotice(t));
+    await setIssueStateRemote(cfg, curGh.issue, want);
+    const fresh = freshThread(base, t.id);
+    if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, state: want, syncedAt: (/* @__PURE__ */ new Date()).toISOString() } });
+    pushed++;
+  } else if (pushed > 0) {
+    const fresh = freshThread(base, t.id);
+    if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, syncedAt: (/* @__PURE__ */ new Date()).toISOString() } });
+  }
+  if (pushed > 0 && state) state.lastPushAt = (/* @__PURE__ */ new Date()).toISOString();
+}
+async function processCloseOp(cfg, op) {
+  if (!op.issue) return;
+  await addIssueCommentRemote(cfg, op.issue, `${GH_SENTINEL}
+thread deleted in Storybook (static) \u2014 closing.`);
+  await setIssueStateRemote(cfg, op.issue, "closed");
+}
+async function flushOnce(base) {
+  if (!state || state.flushing) return;
+  state.flushing = true;
+  let ranWork = false;
+  try {
+    for (; ; ) {
+      const cfg = await probeGhConfig();
+      if (!cfg) return;
+      const ops = readQueue().filter((o) => !o.parked && (o.notBefore ?? 0) <= Date.now());
+      if (!ops.length) return;
+      ranWork = true;
+      const op = ops[0];
+      try {
+        if (op.kind === "sync") await processSyncOp(base, cfg, op);
+        else await processCloseOp(cfg, op);
+        removeOp(op.id);
+        if (state) state.lastError = void 0;
+      } catch (err) {
+        const { transient } = bumpOp(op.id, err);
+        if (state) state.lastError = err instanceof Error ? err.message : String(err);
+        if (!transient) return;
+        return;
+      }
+    }
+  } finally {
+    if (state) {
+      state.flushing = false;
+      if (ranWork && readQueue().some((o) => !o.parked && (o.notBefore ?? 0) <= Date.now())) void flushOnce(base);
+    }
+  }
+}
+function systemComment(ghId, author, body) {
+  return {
+    id: `c_gh_${Math.random().toString(36).slice(2, 10)}`,
+    author,
+    body,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+    ghId,
+    source: "github"
+  };
+}
+async function pullOnce(base) {
+  if (!state) return 0;
+  const cfg = await probeGhConfig();
+  if (!cfg) return 0;
+  const pullStartedAt = (/* @__PURE__ */ new Date()).toISOString();
+  let pulled = 0;
+  const remote = new Map((await listLabeledIssuesRemote(cfg)).map((i) => [i.number, i]));
+  for (const t of base.list()) {
+    if (!t.gh) continue;
+    if (threadPending(t.id)) continue;
+    const mir = t.gh;
+    let issue = remote.get(mir.issue);
+    if (!issue) {
+      try {
+        issue = await getIssueRemote(cfg, mir.issue);
+      } catch (err) {
+        if (err?.status === 404) {
+          const fresh2 = freshThread(base, t.id);
+          if (fresh2) {
+            await base.patch({
+              ...fresh2,
+              gh: void 0,
+              comments: [...fresh2.comments, systemComment(`gh-deleted-${mir.issue}`, "annotakit", "GitHub issue deleted remotely \u2014 the mirror will be re-created on the next sync.")]
+            });
+            enqueue("sync", t.id);
+            pulled++;
+          }
+          continue;
+        }
+        throw err;
+      }
+    }
+    let statusChange = null;
+    if (issue.state === "closed" && t.status !== "resolved") statusChange = "resolved";
+    else if (issue.state === "open" && t.status === "resolved") statusChange = "reopen";
+    const since = mir.syncedAt;
+    const issueActive = !since || !issue.updated_at || issue.updated_at > since;
+    let fresh = [];
+    if (issueActive) {
+      const ghComments = await listIssueCommentsRemote(cfg, mir.issue, since);
+      const known = new Set(t.comments.map((c) => c.ghId).filter((x) => Boolean(x)));
+      let malformed = 0;
+      for (const c of ghComments) {
+        if (typeof c?.body !== "string" || c.created_at !== void 0 && typeof c.created_at !== "string") {
+          malformed++;
+          continue;
+        }
+        if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
+      }
+      if (malformed > 0 && state) {
+        state.lastError = `pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at)`;
+      }
+      fresh.sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
+    }
+    if (statusChange || fresh.length > 0 || mir.state !== issue.state || issueActive) {
+      const cur = freshThread(base, t.id);
+      if (!cur?.gh) continue;
+      const next = { ...cur, gh: { ...cur.gh } };
+      if (statusChange === "resolved" && next.status !== "resolved") {
+        next.status = "resolved";
+        next.resolvedAt = issue.closed_at ?? pullStartedAt;
+        next.comments = [...next.comments, systemComment(`gh-close-${mir.issue}`, issue.closed_by?.login ?? "github", "closed on GitHub")];
+      } else if (statusChange === "reopen" && next.status === "resolved") {
+        next.status = "open";
+        delete next.resolvedAt;
+        next.comments = [...next.comments, systemComment(`gh-reopen-${mir.issue}`, "github", "reopened on GitHub")];
+      }
+      const knownNow = new Set(next.comments.map((c) => c.ghId).filter((x) => Boolean(x)));
+      const imported = [];
+      for (const c of fresh) {
+        if (knownNow.has(String(c.id))) continue;
+        const localId = parseSentinel(c.body);
+        const target = localId ? next.comments.find((x) => x.id === localId && !x.ghId) : void 0;
+        if (target) {
+          target.ghId = String(c.id);
+          continue;
+        }
+        imported.push({
+          id: `c_gh_${Math.random().toString(36).slice(2, 10)}`,
+          author: c.user?.login ?? "github",
+          body: c.body.replace(SENTINEL_RE, "").trimEnd(),
+          createdAt: typeof c.created_at === "string" && c.created_at ? c.created_at : (/* @__PURE__ */ new Date()).toISOString(),
+          ghId: String(c.id),
+          source: "github"
+        });
+      }
+      if (imported.length) next.comments = [...next.comments, ...imported];
+      const gh = next.gh;
+      if (gh) {
+        next.gh = {
+          ...gh,
+          state: issue.state,
+          // idle threads cost zero requests later (engine parity)
+          ...issueActive ? { syncedAt: pullStartedAt } : {}
+        };
+      }
+      await base.patch(next);
+      if (statusChange || imported.length) pulled++;
+    }
+  }
+  return pulled;
+}
+function startRuntime(base) {
+  if (state) return;
+  state = { leader: isLeaderDoc(), flushing: false };
+  void probeGhConfig().then(
+    () => void 0,
+    () => void 0
+  );
+  window.addEventListener("storage", (e) => {
+    if (!state) return;
+    if (e.key === queueKey() || e.key === cfgKey() || e.key === null) {
+      if (state.leader) void flushOnce(base);
+    }
+  });
+  if (!state.leader) return;
+  setWake(() => {
+    void flushOnce(base);
+  });
+  void flushOnce(base);
+  state.sweepTimer = setInterval(() => void flushOnce(base), 3e4);
+  state.sweepTimer?.unref?.();
+  state.lastPullTick = Date.now();
+  state.tickTimer = setInterval(() => {
+    const st = state;
+    if (!st?.leader) return;
+    void (async () => {
+      const cfg = await probeGhConfig();
+      if (!cfg || cfg.pollMs <= 0) return;
+      const last = st.lastPullTick ?? 0;
+      if (Date.now() - last < cfg.pollMs) return;
+      st.lastPullTick = Date.now();
+      try {
+        const pulled = await pullOnce(base);
+        st.lastPullAt = (/* @__PURE__ */ new Date()).toISOString();
+        st.lastPullCount = pulled;
+        st.lastError = void 0;
+      } catch (err) {
+        st.lastError = err instanceof Error ? err.message : String(err);
+      }
+    })();
+  }, 5e3);
+  state.tickTimer?.unref?.();
+}
+var LINKED = /* @__PURE__ */ Symbol("annotakit-gh-linked");
+function buildStatus() {
+  const override = readOverride();
+  const resolved = resolveGhConfig(resolvedBaked, override);
+  const ops = readQueue();
+  const suppressed = Boolean(override?.disabled);
+  return {
+    configured: Boolean(resolved) || suppressed,
+    suppressed,
+    repo: resolved?.repo ?? override?.repo ?? null,
+    labels: resolved?.labels ?? override?.labels ?? [],
+    leader: state?.leader ?? false,
+    queue: ops.filter((o) => !o.parked).length,
+    parked: ops.filter((o) => Boolean(o.parked)).length,
+    flushing: state?.flushing ?? false,
+    // parked errors FIRST: they are terminal + name the thread (actionable);
+    // the raw state error would otherwise shadow them with a generic message
+    lastError: ops.find((o) => o.parked && o.lastError)?.lastError || (state?.lastError ?? void 0) || ops.find((o) => o.lastError)?.lastError,
+    lastPushAt: state?.lastPushAt,
+    lastPullAt: state?.lastPullAt,
+    lastPullCount: state?.lastPullCount,
+    pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS
+  };
+}
+async function ghClientStatus() {
+  const cfg = await probeGhConfig();
+  const sync = buildStatus();
+  return {
+    ...sync,
+    configured: Boolean(cfg),
+    suppressed: Boolean(readOverride()?.disabled),
+    repo: cfg?.repo ?? sync.repo,
+    labels: cfg?.labels ?? sync.labels,
+    pollMs: cfg?.pollMs ?? sync.pollMs
+  };
+}
+async function getGhLinkedStaticStore() {
+  const base = await getStaticStore();
+  const existing = base[LINKED];
+  if (existing) return existing;
+  const linked = Object.create(base);
+  linked.create = (input) => base.create(input).then((t) => {
+    enqueue("sync", t.id);
+    return t;
+  });
+  linked.addComment = (threadId, body, author) => base.addComment(threadId, body, author).then((t) => {
+    enqueue("sync", t.id);
+    return t;
+  });
+  linked.patch = (next) => base.patch(next).then((t) => {
+    enqueue("sync", t.id);
+    return t;
+  });
+  linked.deleteThread = (threadId) => {
+    const victim = base.list().find((t) => t.id === threadId);
+    const issue = victim?.gh?.issue;
+    return base.deleteThread(threadId).then(() => {
+      if (issue) enqueue("close", issue);
+    });
+  };
+  linked.gh = {
+    status: buildStatus,
+    saveSettings(patch) {
+      writeOverride(patch);
+      clearOpBackoff();
+      if (state?.leader) void flushOnce(base);
+    },
+    clearSettings() {
+      const store = ls();
+      if (store) store.removeItem(cfgKey());
+      clearOpBackoff();
+      if (state?.leader) void flushOnce(base);
+    },
+    async syncNow() {
+      await flushOnce(base);
+      if (state?.leader) {
+        const pulled = await pullOnce(base);
+        if (state) {
+          state.lastPullAt = (/* @__PURE__ */ new Date()).toISOString();
+          state.lastPullCount = pulled;
+        }
+      }
+    }
+  };
+  base[LINKED] = linked;
+  linked[LINKED] = linked;
+  startRuntime(base);
+  return linked;
+}
+function __ghResetForTests() {
+  state?.sweepTimer && clearInterval(state.sweepTimer);
+  state?.tickTimer && clearInterval(state.tickTimer);
+  state = null;
+  bakedPromise = null;
+  resolvedBaked = null;
+  setWake(() => void 0);
+}
+
+export {
+  __ghSetTransportForTests,
+  GH_CLIENT_SENTINEL,
+  probeBakedGhConfig,
+  resolveGhConfig,
+  probeGhConfig,
+  ghClientStatus,
+  getGhLinkedStaticStore,
+  __ghResetForTests
+};

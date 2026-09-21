@@ -154,6 +154,51 @@ resetStaticStoreForTests();
   ok('create with explicit id is idempotent upsert', again.id === 'fixed-id' && s.list().filter((t2) => t2.id === 'fixed-id').length === 1);
 }
 
+/* 6b — v0.6.3: fixed-status patch door (enum + stamping + demotion guard) */
+resetStaticStoreForTests();
+{
+  const s = await getStaticStore();
+  const created = await s.create({ id: 'th_door', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_d1', author: 'agent', body: 'door test', createdAt: new Date().toISOString() }] });
+  const fixed = await s.patch({ ...created, status: 'FIXED' });
+  ok('patch normalizes FIXED, no resolvedAt while awaiting review', fixed.status === 'fixed' && !fixed.resolvedAt);
+  let threw = false;
+  try { await s.patch({ ...fixed, status: 'nope' }); } catch { threw = true; }
+  ok('patch rejects bogus status (client parity with the 400 door)', threw);
+  const confirmed = await s.patch({ ...fixed, status: 'resolved' });
+  ok('fixed→resolved stamps resolvedAt', confirmed.status === 'resolved' && Boolean(confirmed.resolvedAt));
+  threw = false;
+  try { await s.patch({ ...confirmed, status: 'fixed' }); } catch { threw = true; }
+  ok('patch guard: resolved→fixed rejected (no silent demotion)', threw);
+  const rejected = await s.patch({ ...confirmed, status: 'open' });
+  ok('resolved→open clears resolvedAt', rejected.status === 'open' && !rejected.resolvedAt);
+}
+
+/* 6c — v0.6.3 merge precedence (via the REAL consumer path: seed union →
+ * logicalMerge): a FRESHER row with a LOWER status must not clobber —
+ * open < fixed < resolved, monotonic (design amendment 8). */
+resetStaticStoreForTests();
+{
+  const s0 = await getStaticStore();
+  const c1 = await s0.create({ id: 'th_mrg1', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_m1', author: 'a', body: 'm1', createdAt: new Date().toISOString() }] });
+  await s0.patch({ ...c1, status: 'fixed' });
+  const c3 = await s0.create({ id: 'th_mrg3', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_m3', author: 'a', body: 'm3', createdAt: new Date().toISOString() }] });
+  await s0.patch({ ...c3, status: 'resolved' });
+}
+resetStaticStoreForTests();
+{
+  const laterTs = new Date(Date.now() + 120_000).toISOString();
+  seedData.threads = [
+    thread('th_mrg1', { number: 10, updatedAt: laterTs, status: 'open' }), // fresher, LOWER rank
+    thread('th_mrg3', { number: 12, updatedAt: laterTs, status: 'fixed' }), // fresher, LOWER rank
+    thread('th_seed2', { number: 2, status: 'resolved', resolvedAt: '2026-09-05T00:00:00.000Z' }),
+  ];
+  const s = await getStaticStore();
+  const m1 = s.list().find((t) => t.id === 'th_mrg1');
+  ok('merge: fresher open does NOT clobber fixed', m1?.status === 'fixed', `status=${m1?.status}`);
+  const m3 = s.list().find((t) => t.id === 'th_mrg3');
+  ok('merge: fresher fixed does NOT clobber resolved', m3?.status === 'resolved', `status=${m3?.status}`);
+}
+
 /* 7 — scope isolation: another deployment dir gets its own storage */
 pageUrl = 'https://site.test/other/index.html';
 resetStaticStoreForTests();
@@ -180,6 +225,18 @@ resetStaticStoreForTests(); // scope switched in test 7 — drop the cached stor
   // v0.6.1: hostile/absent dates degrade to ''/raw text, never "Invalid Date"
   // or "undefined" in digest lines
   ok('digest tolerates absent comment date', !md.includes('undefined'));
+}
+
+/* 8b — v0.6.3: three-way digest (FIXED heading + review note + counts) */
+{
+  const s = await getStaticStore();
+  // fresh thread (inherited docs may already be resolved — the guard would throw)
+  const t = await s.create({ id: 'th_fx8', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_fx8', author: 'r', body: 'fix me', createdAt: new Date().toISOString() }] });
+  await s.patch({ ...t, status: 'fixed' });
+  const md = renderStaticDigest(s.list());
+  ok('digest renders FIXED heading', md.includes('FIXED —'));
+  ok('digest carries the awaiting-review note', md.includes('awaiting reviewer verification'));
+  ok('digest three-way summary line', /\d+ open \/ \d+ fixed \(awaiting review\) \/ \d+ resolved/.test(md));
 }
 
 /* 9 — v0.6.1: huge first comment is display-clipped (server digest parity):
