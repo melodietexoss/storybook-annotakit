@@ -25,6 +25,11 @@
  *      comment UNION preserves it
  *  15. PATCH after delete → 404 (never resurrect); PUT /threads → 405;
  *      foreign Origin → no ACAO (CORS lockdown)
+ * 15b. v0.6.4 mirror self-heal (issue #16): a pre-v0.6.3 mirror (lean
+ *      200-char-clipped body WITHOUT the verbatim marker + 60-char title) is
+ *      repaired in place on the next sync — title to the 100-char budget,
+ *      body to verbatim paragraphs; exactly ONE edit (idempotent); a human
+ *      rewrite (no thread-id stamp, foreign title) is NEVER touched.
  */
 
 import http from 'node:http';
@@ -147,7 +152,8 @@ function ghHandler(req, res) {
     });
     return;
   }
-  // PATCH /repos/test/repo/issues/:n → state
+  // PATCH /repos/test/repo/issues/:n → state (setIssueState) and/or
+  // title/body (editIssue — the v0.6.4 mirror self-heal write side)
   const pm = p.match(/^\/repos\/[^/]+\/[^/]+\/issues\/(\d+)$/);
   if (m === 'PATCH' && pm) {
     let body = '';
@@ -160,6 +166,11 @@ function ghHandler(req, res) {
         issue.state = input.state;
         issue.closed_at = input.state === 'closed' ? new Date().toISOString() : null;
         issue.closed_by = input.state === 'closed' ? { login: 'remote-actor' } : null;
+      }
+      if (typeof input.title === 'string' || typeof input.body === 'string') {
+        if (typeof input.title === 'string') issue.title = input.title;
+        if (typeof input.body === 'string') issue.body = input.body;
+        issue.edits = (issue.edits ?? 0) + 1; // heal idempotence probe (v0.6.4)
       }
       touchIssue(issue.number);
       json(200, { number: issue.number, state: issue.state, html_url: issueUrl(issue.number) });
@@ -437,6 +448,61 @@ async function main() {
   check('foreign Origin → NO Access-Control-Allow-Origin', !foreign.headers.get('access-control-allow-origin'), `acao=${foreign.headers.get('access-control-allow-origin')}`);
   const local = await j('GET', '/annotakit/api/health', undefined, { origin: 'http://localhost:4000' });
   check('localhost Origin → ACAO echoed', local.headers.get('access-control-allow-origin') === 'http://localhost:4000', `acao=${local.headers.get('access-control-allow-origin')}`);
+
+  console.log('== 15b. v0.6.4 mirror self-heal: pre-v0.6.3 clipped mirror repaired on sync ==');
+  const longNote =
+    'Floorplan should be the primary view for room and layout authoring because director view is a secondary lens — this note deliberately exceeds both the old 60-char title budget and the old 200-char body clip.';
+  const longBody = `${longNote}\n\nSecond paragraph with structure:\n- spacing rhythm feels off at 360px\n- the label hierarchy competes with the value`;
+  const healInput = threadInput(21);
+  healInput.comments[0].body = longBody;
+  const healCreate = await j('POST', '/annotakit/api/threads', healInput);
+  check('heal thread created → 201', healCreate.status === 201);
+  await waitFor(() => gh.issues.some((i) => i.title.includes('Case 21') && i.body.includes('Second paragraph')), 5000, 'verbatim issue auto-created');
+  await sleep(300); // let the create push settle (ghId stamps)
+  const healThread = (await j('GET', '/annotakit/api/threads')).body.threads.find((t) => t.storyId.includes('case-21'));
+  const healIssue = gh.issues.find((i) => i.title.includes('Case 21'));
+  check('mirror created verbatim by the current engine', healIssue.body.includes('(verbatim):**') && healIssue.body.includes('- spacing rhythm feels off at 360px'), healIssue.body.slice(0, 80));
+  // simulate a pre-v0.6.3 engine having written this mirror: 60-char title,
+  // lean single-line clipped body, NO verbatim marker (issue #16's report)
+  const headline = (s) => s.replace(/\s+/g, ' ').trim();
+  const wantTitle = `[review] Case 21 — #${healThread.number} ${headline(longBody).slice(0, 100)}`.slice(0, 160);
+  const oldTitle = `[review] Case 21 — #${healThread.number} ${headline(longBody).slice(0, 60)}`.slice(0, 160);
+  healIssue.title = oldTitle;
+  healIssue.body = [
+    '# UI review — Test/Comp21',
+    '',
+    'storybook: http://localhost:4000',
+    '',
+    `### #${healThread.number} OPEN — ${headline(longBody).slice(0, 80)}…`,
+    '',
+    '- story: Test/Comp21 / Case 21 (src/Comp21.stories.tsx)',
+    `- thread id: ${healThread.id}`,
+    '- component: Comp21',
+    '- jsx: src/Comp21.tsx:12',
+    '- element: <button "Click">',
+    '- selector: button',
+    '',
+    `  - reviewer 09-21 13:00: ${headline(longBody).slice(0, 200)}…`,
+    '',
+    '---',
+    '',
+    'Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread — close this issue (the review thread mirrors it automatically).',
+    '',
+    '<!-- annotakit -->',
+  ].join('\n');
+  const verbatimSync = await j('POST', '/annotakit/api/sync');
+  check('sync reports exactly ONE healed mirror', (verbatimSync.body.healed ?? 0) === 1, JSON.stringify(verbatimSync.body));
+  check('title healed to the 100-char headline budget', healIssue.title === wantTitle, healIssue.title);
+  check('body healed to verbatim (multi-paragraph + marker)', healIssue.body.includes('(verbatim):**') && healIssue.body.includes('Second paragraph with structure:') && healIssue.body.includes('- the label hierarchy competes with the value'), healIssue.body.slice(0, 120));
+  const editsAfterHeal = healIssue.edits ?? 0;
+  check('exactly one edit landed', editsAfterHeal === 1, `edits=${editsAfterHeal}`);
+  const verbatimSync2 = await j('POST', '/annotakit/api/sync');
+  check('second sync: ZERO heals (idempotent)', (verbatimSync2.body.healed ?? 0) === 0 && (healIssue.edits ?? 0) === editsAfterHeal, `healed=${verbatimSync2.body.healed} edits=${healIssue.edits}`);
+  // negative control: a human rewrite (stamp gone, foreign title) is untouchable
+  healIssue.title = 'renamed by a human';
+  healIssue.body = 'rewritten by a human — no annotakit stamps at all';
+  const verbatimSync3 = await j('POST', '/annotakit/api/sync');
+  check('human-edited mirror NEVER touched', (verbatimSync3.body.healed ?? 0) === 0 && healIssue.title === 'renamed by a human' && healIssue.body === 'rewritten by a human — no annotakit stamps at all', `healed=${verbatimSync3.body.healed}`);
 
   api.close();
   console.log(`\n${passed} passed, ${failed} failed (in-process)`);

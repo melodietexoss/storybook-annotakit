@@ -6,14 +6,14 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-Y2DYPSGG.mjs";
+} from "./chunk-GQOT3JEX.mjs";
 import {
   getGhLinkedStaticStore,
   ghClientStatus
-} from "./chunk-XGVDME4E.mjs";
+} from "./chunk-R7L24GTE.mjs";
 import {
   renderStaticDigest
-} from "./chunk-MLHFKDNW.mjs";
+} from "./chunk-UO3SMM6I.mjs";
 
 // src/manager/index.tsx
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -420,30 +420,26 @@ function ReviewPanel() {
       title: "Flush the client queue + pull remote changes now"
     },
     /* @__PURE__ */ React.createElement(SyncIcon, { width: 12, height: 12 }),
-    " sync"
+    " sync",
+    ghStat.queue > 0 ? ` \xB7 ${ghStat.queue}` : ""
   ), staticMode && /* @__PURE__ */ React.createElement(
     "button",
     {
-      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: "pointer", borderRadius: 6, border: `1px solid ${ghStat?.configured ? "#16a34a66" : theme.appBorderColor}`, background: ghStat?.configured && !ghStat.suppressed ? "#16a34a18" : "transparent", color: ghStat?.configured && !ghStat.suppressed ? "#15803d" : theme.textColor, display: "inline-flex", gap: 4, alignItems: "center" },
+      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: "pointer", borderRadius: 6, border: `1px solid ${theme.appBorderColor}`, background: "transparent", color: theme.textColor, display: "inline-flex", gap: 4, alignItems: "center" },
       onClick: openGhSettings,
-      title: "Client-side GitHub publishing (static builds): issue repo, labels, token"
+      title: [
+        "Client-side GitHub publishing (static builds): issue repo, labels, token",
+        ghStat?.configured ? ghStat.suppressed ? `DISABLED by local settings${ghStat.queue > 0 ? ` \u2014 ${ghStat.queue} queued feedback holds until re-enabled` : ""}` : `\u2192 ${ghStat.repo ?? "(not set)"} \xB7 labels: ${(ghStat.labels ?? []).join(", ") || "annotakit"} \xB7 queue: ${ghStat.queue}${ghStat.flushing ? " (flushing)" : ""}${ghStat.parked ? ` \xB7 parked: ${ghStat.parked}` : ""}` : "unconfigured \u2014 threads stay in this browser (local-only) until a repo + token are set",
+        ghStat?.lastError ? `error: ${ghStat.lastError}` : null,
+        ghStat?.lastPushAt && !ghStat.suppressed ? `pushed ${ago(ghStat.lastPushAt)}` : null,
+        ghStat?.lastPullAt && !ghStat.suppressed ? `pulled ${ago(ghStat.lastPullAt)}` : null
+      ].filter(Boolean).join("\n")
     },
     /* @__PURE__ */ React.createElement(SyncIcon, { width: 12, height: 12 }),
     " GitHub",
-    ghStat?.lastError && /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: 999, background: theme.colorNegative, display: "inline-block" } })
-  ), staticMode && !ghStat?.configured && /* @__PURE__ */ React.createElement("span", { style: { ...chip("#f59e0b22", "#b45309"), fontSize: 10 }, title: "Static `storybook build` \u2014 no dev server. Threads live in this browser's localStorage for this deployment. Configure client-side GitHub publishing (GitHub button) to land feedback as issues straight from the browser." }, "static \xB7 local-only"), staticMode && ghStat?.configured && /* @__PURE__ */ React.createElement(
-    "span",
-    {
-      style: {
-        ...chip(
-          ghStat.suppressed ? "#92400e22" : ghStat.lastError ? "#dc262622" : ghStat.queue > 0 ? "#f59e0b22" : "#16a34a22",
-          ghStat.suppressed ? "#b45309" : ghStat.lastError ? "#b91c1c" : ghStat.queue > 0 ? "#b45309" : "#15803d"
-        ),
-        fontSize: 10
-      },
-      title: `Client-side publishing${ghStat.suppressed ? " \u2014 DISABLED by local settings (queued feedback holds until re-enabled)" : ` \u2192 ${ghStat.repo ?? "(not set)"} \xB7 labels: ${(ghStat.labels ?? []).join(", ") || "annotakit"} \xB7 queue: ${ghStat.queue}${ghStat.flushing ? " (flushing)" : ""}${ghStat.parked ? ` \xB7 parked: ${ghStat.parked}` : ""}`}${ghStat.lastError ? ` \xB7 error: ${ghStat.lastError}` : ""}${ghStat.lastPushAt && !ghStat.suppressed ? ` \xB7 pushed ${ago(ghStat.lastPushAt)}` : ""}${ghStat.lastPullAt && !ghStat.suppressed ? ` \xB7 pulled ${ago(ghStat.lastPullAt)}` : ""}`
-    },
-    ghStat.suppressed ? `static \xB7 client GH off${ghStat.queue > 0 ? ` \xB7 ${ghStat.queue} queued` : ""}` : ghStat.lastError ? `static \u2192 github \xB7 error${ghStat.queue > 0 ? ` \xB7 queued ${ghStat.queue}` : ""}` : ghStat.queue > 0 ? `static \u2192 github \xB7 queued ${ghStat.queue}` : "static \u2192 github"
+    ghStat?.lastError && /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: 999, background: theme.colorNegative, display: "inline-block" }, title: "publishing error \u2014 open for details" }),
+    !ghStat?.lastError && ghStat?.configured && !ghStat.suppressed && /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: 999, background: theme.colorPositive, display: "inline-block" }, title: "client publishing live \u2014 feedback lands on GitHub from this browser" }),
+    !ghStat?.lastError && ghStat?.configured && ghStat.suppressed && /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: 999, background: "#f59e0b", display: "inline-block" }, title: ghStat.queue > 0 ? `client GH off \u2014 ${ghStat.queue} queued (holds until re-enabled)` : "client GH off (local-only)" })
   )), ghOpen && !staticMode && /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 0", borderBottom: `1px solid ${theme.appBorderColor}`, fontSize: 11, display: "flex", flexDirection: "column", gap: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, sync ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { ...chip(sync.mode === "auto" ? `${theme.colorPositive}22` : "#f59e0b22", sync.mode === "auto" ? theme.colorPositive : "#b45309") } }, sync.mode === "auto" ? "auto-sync" : sync.mode === "unconfigured" ? "local mode" : "mirror off"), /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, sync.mode === "auto" && /* @__PURE__ */ React.createElement(React.Fragment, null, sync.mapped, "/", sync.threads, " threads mirrored", sync.pending > 0 ? ` \xB7 ${sync.pending} queued` : "", sync.stalled > 0 ? ` \xB7 ${sync.stalled} stalled` : "", sync.lastPushAt ? ` \xB7 pushed ${ago(sync.lastPushAt)}` : "", sync.lastPullAt ? ` \xB7 pulled ${ago(sync.lastPullAt)}` : "", sync.pollSec > 0 ? ` \xB7 polls every ${sync.pollSec}s` : "", sync.labels && sync.labels.length ? ` \xB7 labels: ${sync.labels.join(", ")}` : ""), sync.backoffUntil && /* @__PURE__ */ React.createElement(React.Fragment, null, sync.lastError ? " \xB7 " : "", "backoff until ", new Date(sync.backoffUntil).toLocaleTimeString()))) : /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "sync status unavailable (dev server offline?)"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
     "button",
     {

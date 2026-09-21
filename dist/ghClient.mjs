@@ -4,17 +4,26 @@ import {
   __ghSetTransportForTests,
   getGhLinkedStaticStore,
   ghClientStatus,
+  mirrorIssueBody,
+  mirrorIssueTitle,
   probeBakedGhConfig,
   probeGhConfig,
   resolveGhConfig
-} from "./chunk-XGVDME4E.mjs";
-import "./chunk-MLHFKDNW.mjs";
+} from "./chunk-R7L24GTE.mjs";
+import {
+  ISSUE_BODY_LIMIT,
+  MIRROR_VERBATIM_MARKER
+} from "./chunk-UO3SMM6I.mjs";
 export {
   GH_CLIENT_SENTINEL,
+  ISSUE_BODY_LIMIT,
+  MIRROR_VERBATIM_MARKER,
   __ghResetForTests,
   __ghSetTransportForTests,
   getGhLinkedStaticStore,
   ghClientStatus,
+  mirrorIssueBody,
+  mirrorIssueTitle,
   probeBakedGhConfig,
   probeGhConfig,
   resolveGhConfig

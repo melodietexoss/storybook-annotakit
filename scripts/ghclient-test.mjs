@@ -75,7 +75,7 @@ function makeFakeGH() {
     failNext: null, // {match, status, body} — one-shot failure
   };
   const issueOut = (i) => ({
-    number: i.number, state: i.state, title: i.title, html_url: `https://github.com/fake/i/${i.number}`,
+    number: i.number, state: i.state, title: i.title, body: i.body, html_url: `https://github.com/fake/i/${i.number}`,
     closed_at: i.closed_at ?? null, closed_by: i.closed_by ?? null, updated_at: i.updated_at,
   });
   const headers = { get: (n) => (n === 'link' ? null : null) };
@@ -111,7 +111,8 @@ function makeFakeGH() {
       const out = since ? issue.comments.filter((c) => c.created_at > since) : issue.comments;
       return { ok: true, status: 200, json: async () => out, headers };
     }
-    // PATCH /repos/:repo/issues/:n — state flip
+    // PATCH /repos/:repo/issues/:n — state flip and/or title/body edit
+    // (editIssue — the v0.6.4 mirror self-heal write side)
     m = path.match(/^\/repos\/(.+)\/issues\/(\d+)$/);
     if (m && method === 'PATCH') {
       const issue = gh.issues.get(Number(m[2]));
@@ -121,6 +122,12 @@ function makeFakeGH() {
         issue.updated_at = new Date().toISOString();
         if (body.state === 'closed') { issue.closed_at = new Date().toISOString(); issue.closed_by = { login: 'storybook-annotakit' }; }
         else { issue.closed_at = null; issue.closed_by = null; }
+      }
+      if (typeof body.title === 'string' || typeof body.body === 'string') {
+        if (typeof body.title === 'string') issue.title = body.title;
+        if (typeof body.body === 'string') issue.body = body.body;
+        issue.edits = (issue.edits ?? 0) + 1; // heal idempotence probe (v0.6.4)
+        issue.updated_at = new Date().toISOString();
       }
       return { ok: true, status: 200, json: async () => issueOut(issue), headers };
     }
@@ -641,6 +648,60 @@ let createdThread;
     const st = store.gh?.status();
     ok('skip surfaced in status.lastError', Boolean(st?.lastError?.includes('malformed') || st?.lastError?.includes('skipped')));
   }
+}
+
+/* 19 — v0.6.4 mirror self-heal (issue #16, server parity): a pre-v0.6.3
+ * static mirror (lean 200-char-clipped body WITHOUT the verbatim marker,
+ * 60-char title) is repaired IN PLACE on the next syncNow — title to the
+ * 100-char budget, body to verbatim paragraphs; exactly one edit
+ * (idempotent); a human rewrite (stamps gone, foreign title) is NEVER
+ * touched. */
+{
+  const ghc19 = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'], pollMs: 600_000 });
+  const store = await ghc19.getGhLinkedStaticStore();
+  const longBody =
+    'Floorplan should be the primary view for room and layout authoring because director view is a secondary lens — deliberately past the old 60-char title and 200-char body budgets.';
+  const fullBody = `${longBody}\n\nSecond paragraph with structure:\n- spacing rhythm feels off at 360px\n- the label hierarchy competes with the value`;
+  await store.create(threadInput('th_heal', fullBody));
+  await until(() => queueOps(ghc19).length === 0, 'mirror created');
+  const own = store.list().find((x) => x.id === 'th_heal');
+  const issue = gh.issues.get(own?.gh?.issue ?? 0);
+  ok('setup: current engine wrote the verbatim mirror', Boolean(issue?.body.includes('(verbatim):**') && issue?.body.includes('- the label hierarchy competes with the value')));
+  // simulate the pre-v0.6.3 client having written this mirror (issue #16)
+  const headline = (s) => s.replace(/\s+/g, ' ').trim();
+  const wantTitle = `[review] primary — #${own.number} ${headline(fullBody).slice(0, 100)}`.slice(0, 160);
+  const oldTitle = `[review] primary — #${own.number} ${headline(fullBody).slice(0, 60)}`.slice(0, 160);
+  issue.title = oldTitle;
+  issue.body = [
+    '# UI review — Button',
+    '',
+    'storybook (static deployment): https://site.test/stories/',
+    'mirror: acme/web · labels: annotakit · client-side publish',
+    '',
+    'open: https://site.test/stories/?path=/story/s1',
+    '',
+    `### #${own.number} OPEN — ${headline(fullBody).slice(0, 80)}…`,
+    '',
+    '- story: Button/primary',
+    '- thread id: th_heal',
+    '',
+    `  - reviewer 09-21 13:00: ${headline(fullBody).slice(0, 200)}…`,
+    '',
+    '---',
+    '',
+    '<!-- annotakit -->',
+  ].join('\n');
+  await store.gh?.syncNow(); // flush (empty) + pull → heal
+  ok('title healed to the 100-char headline budget', issue.title === wantTitle, issue.title);
+  ok('body healed verbatim (paragraphs + marker)', Boolean(issue.body.includes('(verbatim):**') && issue.body.includes('Second paragraph with structure:') && issue.body.includes('- spacing rhythm feels off at 360px')), issue.body.slice(0, 100));
+  ok('exactly one edit landed', (issue.edits ?? 0) === 1, `edits=${issue.edits}`);
+  await store.gh?.syncNow();
+  ok('idempotent: second sync edits nothing', (issue.edits ?? 0) === 1, `edits=${issue.edits}`);
+  // negative control: human rewrite — no thread-id stamp, foreign title
+  issue.title = 'renamed by a human';
+  issue.body = 'rewritten by a human — no annotakit stamps at all';
+  await store.gh?.syncNow();
+  ok('human-edited mirror NEVER touched', issue.title === 'renamed by a human' && issue.body === 'rewritten by a human — no annotakit stamps at all');
 }
 
 /* cleanup + summary */

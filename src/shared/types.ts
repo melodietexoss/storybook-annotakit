@@ -41,6 +41,14 @@ export const DIGEST_CLIP_CHARS = 200;
  *  mirrored VERBATIM (digest lean-clip is display-only, never on the mirror). */
 export const ISSUE_BODY_LIMIT = 60_000;
 
+/** v0.6.4 mirror self-heal (issue #16): every full-text mirror body marks
+ *  each comment block with this string. A mapped issue body WITHOUT it was
+ *  written by a pre-v0.6.3 engine (comment bodies clipped at 200 chars,
+ *  titles at 60) and is a heal candidate — the engines re-push the verbatim
+ *  body on pull until it sticks. Single constant so the server engine, the
+ *  static client engine and scripts/heal-mirrors.mjs can never disagree. */
+export const MIRROR_VERBATIM_MARKER = '(verbatim):**';
+
 /** Story metadata captured at pin time (from /index.json + CSF render context). */
 export interface StoryRef {
   storyId: string;
@@ -335,6 +343,9 @@ export interface GhSyncSummary {
   pushed: number;
   /** Remote changes imported (state flips + comments). */
   pulled: number;
+  /** Pre-v0.6.3 mirrors repaired in place (clipped body/title re-pushed
+   *  verbatim — issue #16). After the upgrade wave this stays 0. */
+  healed?: number;
   closedTombstones: number;
   issuesTotal: number;
   /** Threads still carrying un-mirrored deltas after this sync. */

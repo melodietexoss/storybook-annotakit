@@ -37,7 +37,9 @@
 
 import { getStaticStore, renderThreadBlock, staticScope, type StaticStore } from './staticStore';
 import type { Comment, Thread } from './types';
-import { ISSUE_BODY_LIMIT, mirrorStateOf } from './types';
+import { ISSUE_BODY_LIMIT, MIRROR_VERBATIM_MARKER, mirrorStateOf } from './types';
+// re-exported for scripts/heal-mirrors.mjs — one constant, no drift (v0.6.4)
+export { ISSUE_BODY_LIMIT, MIRROR_VERBATIM_MARKER };
 
 /* --------------------------------- constants -------------------------------- */
 
@@ -228,6 +230,11 @@ async function ghJson<T>(cfg: GhClientConfig, method: string, pathname: string, 
 interface GhIssueRemote {
   number: number;
   state: 'open' | 'closed';
+  /** Listings/gets include bodies — the pull loop reads them for the v0.6.4
+   *  mirror self-heal (server-engine parity). Optional: hostile remotes may
+   *  omit it. */
+  title?: string;
+  body?: string;
   html_url: string;
   closed_at?: string | null;
   closed_by?: { login: string } | null;
@@ -292,6 +299,12 @@ function addIssueCommentRemote(cfg: GhClientConfig, issue: number, body: string)
 
 function setIssueStateRemote(cfg: GhClientConfig, issue: number, state: 'open' | 'closed'): Promise<GhIssueRemote> {
   return ghJson(cfg, 'PATCH', `/repos/${cfg.repo}/issues/${issue}`, { state });
+}
+
+/** Edit an issue's title and/or body — the write side of the v0.6.4 mirror
+ *  self-heal (repair pre-v0.6.3 clipped mirrors; server-engine parity). */
+function editIssueRemote(cfg: GhClientConfig, issue: number, fields: { title?: string; body?: string }): Promise<GhIssueRemote> {
+  return ghJson(cfg, 'PATCH', `/repos/${cfg.repo}/issues/${issue}`, fields);
 }
 
 function getIssueRemote(cfg: GhClientConfig, issue: number): Promise<GhIssueRemote> {
@@ -427,7 +440,10 @@ export async function probeGhConfig(): Promise<GhClientConfig | null> {
 
 /* ------------------------------ issue body build ---------------------------- */
 
-function issueTitle(t: Thread): string {
+/** Mirror title builder — exported for scripts/heal-mirrors.mjs (the backfill
+ *  twin of the pull-path self-heal) so tooling can never drift from the
+ *  engine's exact format. */
+export function mirrorIssueTitle(t: Thread): string {
   const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
   // headline budget 100 (issue #16, server parity): the body carries everything
   // verbatim; the title is the scannable ID
@@ -435,7 +451,9 @@ function issueTitle(t: Thread): string {
   return `[review] ${storyLabel} — #${t.number} ${headline || '(no text)'}`.slice(0, 160);
 }
 
-function issueBody(t: Thread, cfg: GhClientConfig): string {
+/** Mirror body builder — exported for scripts/heal-mirrors.mjs. cfg needs only
+ *  repo + labels (the rest of GhClientConfig is transport, not format). */
+export function mirrorIssueBody(t: Thread, cfg: { repo: string; labels: string[] }): string {
   const origin = staticScope();
   const storyUrl = t.story?.url ?? `${origin}?path=/story/${t.storyId}`;
   const out: string[] = [];
@@ -478,6 +496,44 @@ function mirrorBody(c: Comment): string {
 function parseSentinel(body: string): string | null {
   const m = body.match(SENTINEL_RE);
   return m ? (m[1] as string) : null;
+}
+
+/** v0.6.4 mirror self-heal (issue #16, server-engine parity): detect a mirror
+ *  written by a pre-v0.6.3 client (comment bodies clipped at 200 chars,
+ *  titles at 60) and return the fields to re-push. Runs on PULL — the remote
+ *  body is already in hand, so the check costs zero extra requests and heals
+ *  every existing deployment on its first sync after upgrade.
+ *
+ *  Safety contract (identical to ghsync.ts):
+ *  - TITLE: heal only when the remote title is a STRICT PREFIX of the wanted
+ *    one (the 60→100 headline budget makes old titles exact prefixes). A
+ *    human-edited title is not a prefix → untouched.
+ *  - BODY: heal only when the remote body still carries our thread-id stamp
+ *    (it is this thread's mirror, not a human rewrite), LACKS the verbatim
+ *    marker (predates full-text bodies), and the rebuild is not shorter
+ *    (never shorten — human appends survive).
+ *  - Idempotent: after one heal both conditions are false forever. */
+function mirrorHealFields(
+  t: Thread,
+  remote: { title?: unknown; body?: unknown },
+  cfg: GhClientConfig,
+): { title?: string; body?: string } | null {
+  const fields: { title?: string; body?: string } = {};
+  if (typeof remote.title === 'string' && remote.title) {
+    const want = mirrorIssueTitle(t);
+    if (want !== remote.title && want.startsWith(remote.title)) fields.title = want;
+  }
+  if (typeof remote.body === 'string' && remote.body) {
+    const oldFormat =
+      t.comments.length > 0 &&
+      remote.body.includes(`- thread id: ${t.id}`) &&
+      !remote.body.includes(MIRROR_VERBATIM_MARKER);
+    if (oldFormat) {
+      const want = mirrorIssueBody(t, cfg);
+      if (want.length >= remote.body.length) fields.body = want;
+    }
+  }
+  return Object.keys(fields).length ? fields : null;
 }
 
 function resolutionNotice(t: Thread): string {
@@ -632,7 +688,7 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
   if (!t) return; // thread deleted — its own 'close' op owns the issue
 
   if (!t.gh) {
-    const created = await createIssueRemote(cfg, { title: issueTitle(t), body: issueBody(t, cfg) });
+    const created = await createIssueRemote(cfg, { title: mirrorIssueTitle(t), body: mirrorIssueBody(t, cfg) });
     // ORPHAN GUARD (engine parity): the thread may have been deleted while
     // the create was in flight — close the just-created issue, no orphans.
     const cur = freshThread(base, t.id);
@@ -788,6 +844,16 @@ async function pullOnce(base: StaticStore): Promise<number> {
         }
         throw err;
       }
+    }
+
+    // v0.6.4 mirror self-heal (issue #16, server parity): repair pre-v0.6.3
+    // mirrors (200-char clipped bodies, 60-char titles) using the body this
+    // pull already fetched. Non-fatal: a failed edit must not kill the pull.
+    try {
+      const heal = mirrorHealFields(t, issue, cfg);
+      if (heal) await editIssueRemote(cfg, mir.issue, heal);
+    } catch (err) {
+      if (state) state.lastError = `mirror heal failed (issue #${mir.issue}): ${err instanceof Error ? err.message : String(err)}`;
     }
 
     // v0.6.3 (server ghsync parity): a remote close confirms the review from

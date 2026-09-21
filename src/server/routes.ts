@@ -34,7 +34,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.3';
+const VERSION = '0.6.4';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -1067,3 +1067,8 @@ export function devServerHook(app: ServerAppLike, options?: { configDir?: string
   const middleware = createMiddleware(configDir);
   app.use(middleware as unknown as Parameters<ServerAppLike['use']>[1]);
 }
+
+/** v0.6.4: expose the digest renderer for scripts/heal-mirrors.mjs (the
+ *  backfill twin of the engine's pull-path mirror self-heal) so tooling
+ *  rebuilds EXACTLY the body the engine would push — never a drifted format. */
+export { renderDigest } from './digest';

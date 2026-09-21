@@ -41,6 +41,7 @@ import {
   GH_SENTINEL,
   addIssueComment,
   createIssue,
+  editIssue,
   getIssue,
   listIssueComments,
   listLabeledIssues,
@@ -50,7 +51,7 @@ import {
 } from './gh';
 import { renderDigest } from './digest';
 import type { Comment, GhSyncStatus, GhSyncSummary, Thread } from '../shared/types';
-import { ISSUE_BODY_LIMIT, mirrorStateOf } from '../shared/types';
+import { ISSUE_BODY_LIMIT, MIRROR_VERBATIM_MARKER, mirrorStateOf } from '../shared/types';
 
 export type EngineReason = 'updated' | 'commented' | 'resolved' | 'reopened' | 'fixed';
 
@@ -62,7 +63,7 @@ export interface GhSync {
   /** Force full reconcile: push every thread, then pull remote. Idempotent. */
   syncAll(): Promise<GhSyncSummary>;
   /** Pull remote state/comments into the store (used by the poll timer too). */
-  pullOnce(): Promise<{ pulled: number; closedTombstones: number }>;
+  pullOnce(): Promise<{ pulled: number; closedTombstones: number; healed: number }>;
   status(): Promise<GhSyncStatus>;
   /** Kick the initial backfill + first pull (call once at server boot). */
   start(): void;
@@ -195,6 +196,39 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     const m = body.match(SENTINEL_RE);
     return m ? (m[1] as string) : null;
   };
+
+  /** v0.6.4 mirror self-heal (issue #16): detect a mirror written by a
+   *  pre-v0.6.3 engine and return the fields to re-push. Runs on PULL — the
+   *  remote body is already in hand, so the check costs zero extra requests
+   *  and heals every existing deployment on its first sync after upgrade.
+   *
+   *  Safety contract (mirrored exactly in the static client engine):
+   *  - TITLE: heal only when the remote title is a STRICT PREFIX of the
+   *    wanted one (the 60→100 headline budget makes old titles exact
+   *    prefixes). A human-edited title is not a prefix → untouched.
+   *  - BODY: heal only when the remote body still carries our thread-id
+   *    stamp (it is this thread's mirror, not a human rewrite), LACKS the
+   *    verbatim marker (predates full-text bodies), and the rebuild is not
+   *    shorter (never shorten — human appends survive).
+   *  - Idempotent: after one heal both conditions are false forever. */
+  function mirrorHealFields(t: Thread, remote: { title?: unknown; body?: unknown }): { title?: string; body?: string } | null {
+    const fields: { title?: string; body?: string } = {};
+    if (typeof remote.title === 'string' && remote.title) {
+      const want = issueTitle(t);
+      if (want !== remote.title && want.startsWith(remote.title)) fields.title = want;
+    }
+    if (typeof remote.body === 'string' && remote.body) {
+      const oldFormat =
+        t.comments.length > 0 &&
+        remote.body.includes(`- thread id: ${t.id}`) &&
+        !remote.body.includes(MIRROR_VERBATIM_MARKER);
+      if (oldFormat) {
+        const want = issueBody(t);
+        if (want.length >= remote.body.length) fields.body = want;
+      }
+    }
+    return Object.keys(fields).length ? fields : null;
+  }
 
   /**
    * Reconcile ONE thread against its GitHub mirror. Idempotent: no mapping →
@@ -355,14 +389,15 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
    * Threads with queued/in-flight pushes are skipped — their remote state is
    * stale. Idempotent by construction: every import is guarded by ghId.
    */
-  const pullOnceRaw = async (): Promise<{ pulled: number; closedTombstones: number }> => {
+  const pullOnceRaw = async (): Promise<{ pulled: number; closedTombstones: number; healed: number }> => {
     const cfg = configured();
-    if (cfg.error) return { pulled: 0, closedTombstones: 0 }; // local mode: no error spam
-    if (Date.now() < backoffUntil) return { pulled: 0, closedTombstones: 0 };
+    if (cfg.error) return { pulled: 0, closedTombstones: 0, healed: 0 }; // local mode: no error spam
+    if (Date.now() < backoffUntil) return { pulled: 0, closedTombstones: 0, healed: 0 };
     const { token: tk, repo: rp } = cfg as { token: string; repo: string };
     const pullStartedAt = nowIso();
     let pulled = 0;
     let closedTombstones = 0;
+    let healed = 0;
     const threads = await store.listThreads();
 
     // one listing per cycle (paged); per-thread comment fetches are gated by
@@ -402,6 +437,29 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
           }
           throw err;
         }
+      }
+
+      // v0.6.4 mirror self-heal (issue #16): repair pre-v0.6.3 mirrors
+      // (200-char clipped bodies, 60-char titles) using the body this pull
+      // already fetched. Non-fatal: a failed edit must not kill the pull.
+      try {
+        const heal = mirrorHealFields(t, issue);
+        if (heal) {
+          await editIssue(tk, rp, mir.issue, heal);
+          healed++;
+          console.warn(
+            `[storybook-annotakit] gh-sync: healed mirror issue #${mir.issue} (${[
+              heal.title ? 'full title' : null,
+              heal.body ? 'verbatim body' : null,
+            ]
+              .filter(Boolean)
+              .join(' + ')}) — pre-v0.6.3 clip (issue #16)`,
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[storybook-annotakit] gh-sync: mirror heal failed (issue #${mir.issue}): ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
 
       // decide deltas against the pre-read snapshot; mutateThread re-checks
@@ -525,7 +583,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     }
 
     lastPullAt = nowIso();
-    return { pulled, closedTombstones };
+    return { pulled, closedTombstones, healed };
   };
 
   /* --------------------------------- public --------------------------------- */
@@ -568,10 +626,12 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     }
     let pulled = 0;
     let closedTombstones = 0;
+    let healed = 0;
     try {
       const r = await pullOnceRaw();
       pulled = r.pulled;
       closedTombstones = r.closedTombstones;
+      healed = r.healed;
     } catch (err) {
       // pull failures (rate limit, transient) must not fail the whole sync —
       // pushes already landed; surface the pull problem via lastError/backoff.
@@ -582,7 +642,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     // hard push failures outrank the pull's informational notes
     if (pushError) lastError = pushError;
     const stalled = (await stalledThreads()).length;
-    return { ok: true, created, pushed, pulled, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled };
+    return { ok: true, created, pushed, pulled, healed, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled };
   };
 
   const syncAll = async (): Promise<GhSyncSummary> => {
@@ -592,7 +652,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     if (cfg.error) {
       // Local mode: a no-op summary with the a/b/c steps — NOT an error. The
       // REST/digest surface is fully functional; agents branch on this.
-      return { ok: true, noop: true, reason: cfg.error, created: 0, pushed: 0, pulled: 0, closedTombstones: 0, issuesTotal };
+      return { ok: true, noop: true, reason: cfg.error, created: 0, pushed: 0, pulled: 0, healed: 0, closedTombstones: 0, issuesTotal };
     }
     return run(syncAllRaw);
   };

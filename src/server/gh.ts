@@ -21,6 +21,10 @@ export interface GhIssue {
   number: number;
   state: 'open' | 'closed';
   title: string;
+  /** Issue bodies come with every listing/get (GitHub includes them) — the
+   *  pull loop reads them for the v0.6.4 mirror self-heal without extra
+   *  requests. Typed optional: hostile/fake remotes may omit it. */
+  body?: string;
   html_url: string;
   comments: number;
   closed_at: string | null;
@@ -238,6 +242,18 @@ export function setIssueState(
   state: 'open' | 'closed',
 ): Promise<{ number: number; state: 'open' | 'closed'; html_url: string }> {
   return ghJson(token, 'PATCH', `/repos/${repo}/issues/${issue}`, { state });
+}
+
+/** Edit an issue's title and/or body (mirror self-heal, v0.6.4): re-push the
+ *  verbatim body / full-budget title over a mirror created by an older
+ *  version that clipped comment bodies at 200 chars and titles at 60. */
+export function editIssue(
+  token: string,
+  repo: string,
+  issue: number,
+  fields: { title?: string; body?: string },
+): Promise<{ number: number; html_url: string }> {
+  return ghJson(token, 'PATCH', `/repos/${repo}/issues/${issue}`, fields);
 }
 
 export function getIssue(token: string, repo: string, issue: number): Promise<GhIssue> {

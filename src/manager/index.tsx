@@ -565,43 +565,38 @@ function ReviewPanel(): React.ReactElement {
             disabled={syncing}
             title="Flush the client queue + pull remote changes now"
           >
-            <SyncIcon width={12} height={12} /> sync
+            <SyncIcon width={12} height={12} /> sync{ghStat.queue > 0 ? ` · ${ghStat.queue}` : ''}
           </button>
         )}
+        {/* v0.6.4 (user directive): NO persistent status stickers in the
+            toolbar — the "static → github" / "static · local-only" chips are
+            gone. Status lives ON the affordances: dots on the GitHub button
+            (green live / amber disabled-with-queue / red error), the queue
+            depth on the sync button while it drains, and the full picture
+            (repo, labels, queue, pushed/pulled) in the tooltip + settings. */}
         {staticMode && (
           <button
-            style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: 'pointer', borderRadius: 6, border: `1px solid ${ghStat?.configured ? '#16a34a66' : theme.appBorderColor}`, background: ghStat?.configured && !ghStat.suppressed ? '#16a34a18' : 'transparent', color: ghStat?.configured && !ghStat.suppressed ? '#15803d' : theme.textColor, display: 'inline-flex', gap: 4, alignItems: 'center' }}
+            style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: 'pointer', borderRadius: 6, border: `1px solid ${theme.appBorderColor}`, background: 'transparent', color: theme.textColor, display: 'inline-flex', gap: 4, alignItems: 'center' }}
             onClick={openGhSettings}
-            title="Client-side GitHub publishing (static builds): issue repo, labels, token"
+            title={[
+              'Client-side GitHub publishing (static builds): issue repo, labels, token',
+              ghStat?.configured
+                ? ghStat.suppressed
+                  ? `DISABLED by local settings${ghStat.queue > 0 ? ` — ${ghStat.queue} queued feedback holds until re-enabled` : ''}`
+                  : `→ ${ghStat.repo ?? '(not set)'} · labels: ${(ghStat.labels ?? []).join(', ') || 'annotakit'} · queue: ${ghStat.queue}${ghStat.flushing ? ' (flushing)' : ''}${ghStat.parked ? ` · parked: ${ghStat.parked}` : ''}`
+                : 'unconfigured — threads stay in this browser (local-only) until a repo + token are set',
+              ghStat?.lastError ? `error: ${ghStat.lastError}` : null,
+              ghStat?.lastPushAt && !ghStat.suppressed ? `pushed ${ago(ghStat.lastPushAt)}` : null,
+              ghStat?.lastPullAt && !ghStat.suppressed ? `pulled ${ago(ghStat.lastPullAt)}` : null,
+            ]
+              .filter(Boolean)
+              .join('\n')}
           >
             <SyncIcon width={12} height={12} /> GitHub
-            {ghStat?.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: theme.colorNegative, display: 'inline-block' }} />}
+            {ghStat?.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: theme.colorNegative, display: 'inline-block' }} title="publishing error — open for details" />}
+            {!ghStat?.lastError && ghStat?.configured && !ghStat.suppressed && <span style={{ width: 6, height: 6, borderRadius: 999, background: theme.colorPositive, display: 'inline-block' }} title="client publishing live — feedback lands on GitHub from this browser" />}
+            {!ghStat?.lastError && ghStat?.configured && ghStat.suppressed && <span style={{ width: 6, height: 6, borderRadius: 999, background: '#f59e0b', display: 'inline-block' }} title={ghStat.queue > 0 ? `client GH off — ${ghStat.queue} queued (holds until re-enabled)` : 'client GH off (local-only)'} />}
           </button>
-        )}
-        {staticMode && !ghStat?.configured && (
-          <span style={{ ...chip('#f59e0b22', '#b45309'), fontSize: 10 }} title="Static `storybook build` — no dev server. Threads live in this browser's localStorage for this deployment. Configure client-side GitHub publishing (GitHub button) to land feedback as issues straight from the browser.">
-            static · local-only
-          </span>
-        )}
-        {staticMode && ghStat?.configured && (
-          <span
-            style={{
-              ...chip(
-                ghStat.suppressed ? '#92400e22' : ghStat.lastError ? '#dc262622' : ghStat.queue > 0 ? '#f59e0b22' : '#16a34a22',
-                ghStat.suppressed ? '#b45309' : ghStat.lastError ? '#b91c1c' : ghStat.queue > 0 ? '#b45309' : '#15803d',
-              ),
-              fontSize: 10,
-            }}
-            title={`Client-side publishing${ghStat.suppressed ? ' — DISABLED by local settings (queued feedback holds until re-enabled)' : ` → ${ghStat.repo ?? '(not set)'} · labels: ${(ghStat.labels ?? []).join(', ') || 'annotakit'} · queue: ${ghStat.queue}${ghStat.flushing ? ' (flushing)' : ''}${ghStat.parked ? ` · parked: ${ghStat.parked}` : ''}`}${ghStat.lastError ? ` · error: ${ghStat.lastError}` : ''}${ghStat.lastPushAt && !ghStat.suppressed ? ` · pushed ${ago(ghStat.lastPushAt)}` : ''}${ghStat.lastPullAt && !ghStat.suppressed ? ` · pulled ${ago(ghStat.lastPullAt)}` : ''}`}
-          >
-            {ghStat.suppressed
-              ? `static · client GH off${ghStat.queue > 0 ? ` · ${ghStat.queue} queued` : ''}`
-              : ghStat.lastError
-                ? `static → github · error${ghStat.queue > 0 ? ` · queued ${ghStat.queue}` : ''}`
-                : ghStat.queue > 0
-                  ? `static → github · queued ${ghStat.queue}`
-                  : 'static → github'}
-          </span>
         )}
       </div>
 

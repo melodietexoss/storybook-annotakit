@@ -504,6 +504,7 @@ var mirrorStateOf = (status) => status === "resolved" ? "closed" : "open";
 var MAX_BODY_CHARS = 64e3;
 var DIGEST_CLIP_CHARS = 200;
 var ISSUE_BODY_LIMIT = 6e4;
+var MIRROR_VERBATIM_MARKER = "(verbatim):**";
 
 // src/shared/describe.ts
 function clip(s, n) {
@@ -986,6 +987,9 @@ function addIssueComment(token, repo, issue, body) {
 function setIssueState(token, repo, issue, state) {
   return ghJson(token, "PATCH", `/repos/${repo}/issues/${issue}`, { state });
 }
+function editIssue(token, repo, issue, fields) {
+  return ghJson(token, "PATCH", `/repos/${repo}/issues/${issue}`, fields);
+}
 function getIssue(token, repo, issue) {
   return ghJson(token, "GET", `/repos/${repo}/issues/${issue}`);
 }
@@ -1079,6 +1083,21 @@ function createGhSync(opts) {
     const m = body.match(SENTINEL_RE);
     return m ? m[1] : null;
   };
+  function mirrorHealFields(t, remote) {
+    const fields = {};
+    if (typeof remote.title === "string" && remote.title) {
+      const want = issueTitle(t);
+      if (want !== remote.title && want.startsWith(remote.title)) fields.title = want;
+    }
+    if (typeof remote.body === "string" && remote.body) {
+      const oldFormat = t.comments.length > 0 && remote.body.includes(`- thread id: ${t.id}`) && !remote.body.includes(MIRROR_VERBATIM_MARKER);
+      if (oldFormat) {
+        const want = issueBody(t);
+        if (want.length >= remote.body.length) fields.body = want;
+      }
+    }
+    return Object.keys(fields).length ? fields : null;
+  }
   async function syncThread(id) {
     const cfg = configured();
     if (cfg.error) throw Object.assign(new Error(cfg.error), { status: 400 });
@@ -1201,12 +1220,13 @@ reopened in Storybook \u2014 thread #${t.number}.`;
   }
   const pullOnceRaw = async () => {
     const cfg = configured();
-    if (cfg.error) return { pulled: 0, closedTombstones: 0 };
-    if (Date.now() < backoffUntil) return { pulled: 0, closedTombstones: 0 };
+    if (cfg.error) return { pulled: 0, closedTombstones: 0, healed: 0 };
+    if (Date.now() < backoffUntil) return { pulled: 0, closedTombstones: 0, healed: 0 };
     const { token: tk, repo: rp } = cfg;
     const pullStartedAt = nowIso();
     let pulled = 0;
     let closedTombstones = 0;
+    let healed = 0;
     const threads = await store.listThreads();
     const remote = new Map((await listLabeledIssues(tk, rp, labelsOf())).map((i) => [i.number, i]));
     for (const t of threads) {
@@ -1238,6 +1258,23 @@ reopened in Storybook \u2014 thread #${t.number}.`;
           }
           throw err;
         }
+      }
+      try {
+        const heal = mirrorHealFields(t, issue);
+        if (heal) {
+          await editIssue(tk, rp, mir.issue, heal);
+          healed++;
+          console.warn(
+            `[storybook-annotakit] gh-sync: healed mirror issue #${mir.issue} (${[
+              heal.title ? "full title" : null,
+              heal.body ? "verbatim body" : null
+            ].filter(Boolean).join(" + ")}) \u2014 pre-v0.6.3 clip (issue #16)`
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[storybook-annotakit] gh-sync: mirror heal failed (issue #${mir.issue}): ${err instanceof Error ? err.message : String(err)}`
+        );
       }
       let statusChange = null;
       if (issue.state === "closed" && t.status !== "resolved") statusChange = "resolved";
@@ -1329,7 +1366,7 @@ thread deleted in Storybook \u2014 closing.`);
       for (const t of await stalledThreads()) enqueue(t.id);
     }
     lastPullAt = nowIso();
-    return { pulled, closedTombstones };
+    return { pulled, closedTombstones, healed };
   };
   const enqueue = (threadId) => {
     if (!opts.enabled) return;
@@ -1364,10 +1401,12 @@ thread deleted in Storybook \u2014 closing.`);
     }
     let pulled = 0;
     let closedTombstones = 0;
+    let healed = 0;
     try {
       const r = await pullOnceRaw();
       pulled = r.pulled;
       closedTombstones = r.closedTombstones;
+      healed = r.healed;
     } catch (err) {
       const e = err;
       if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
@@ -1375,14 +1414,14 @@ thread deleted in Storybook \u2014 closing.`);
     }
     if (pushError) lastError = pushError;
     const stalled = (await stalledThreads()).length;
-    return { ok: true, created, pushed, pulled, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled };
+    return { ok: true, created, pushed, pulled, healed, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled };
   };
   const syncAll = async () => {
     const cfg = configured();
     const threads = await store.listThreads();
     const issuesTotal = threads.filter((t) => t.gh).length;
     if (cfg.error) {
-      return { ok: true, noop: true, reason: cfg.error, created: 0, pushed: 0, pulled: 0, closedTombstones: 0, issuesTotal };
+      return { ok: true, noop: true, reason: cfg.error, created: 0, pushed: 0, pulled: 0, healed: 0, closedTombstones: 0, issuesTotal };
     }
     return run(syncAllRaw);
   };
@@ -2091,7 +2130,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.3";
+var VERSION = "0.6.4";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2842,5 +2881,6 @@ function devServerHook(app, options) {
 
 exports.createMiddleware = createMiddleware;
 exports.devServerHook = devServerHook;
+exports.renderDigest = renderDigest;
 exports.serverChannelHook = serverChannelHook;
 exports.setChannelEmitter = setChannelEmitter;
