@@ -109,8 +109,20 @@ function ago(iso: string): string {
 
 /* ------------------------------------ panel ----------------------------------- */
 
+/** SB theme palette fields are NESTED (theme.color.positive) in current
+ *  Storybook builds — the historical top-level names (theme.colorPositive…)
+ *  are undefined at runtime, which silently blanked every status dot and
+ *  error-box tint since v0.6.1 (found live in the v0.6.4 E2E). Resolve both
+ *  shapes; the literals are Storybook's defaults. */
+const positiveOf = (t: ReturnType<typeof useTheme>): string =>
+  (t as { colorPositive?: string }).colorPositive ?? (t as { color?: { positive?: string } }).color?.positive ?? '#66BF3C';
+const negativeOf = (t: ReturnType<typeof useTheme>): string =>
+  (t as { colorNegative?: string }).colorNegative ?? (t as { color?: { negative?: string } }).color?.negative ?? '#FF4400';
+
 function ReviewPanel(): React.ReactElement {
   const theme = useTheme();
+  const positiveColor = positiveOf(theme);
+  const negativeColor = negativeOf(theme);
   const storybookApi = useStorybookApi();
   const state = useStorybookState();
   const storyId = state.storyId as string | undefined;
@@ -553,8 +565,8 @@ function ReviewPanel(): React.ReactElement {
           <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
             <SyncIcon width={12} height={12} /> GitHub
             {/* honest indicator: green ONLY when auto AND healthy; red on lastError; amber otherwise */}
-            {sync && sync.mode === 'auto' && !sync.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: theme.colorPositive, display: 'inline-block' }} />}
-            {sync?.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: theme.colorNegative, display: 'inline-block' }} title="sync error — open for details" />}
+            {sync && sync.mode === 'auto' && !sync.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: positiveColor, display: 'inline-block' }} />}
+            {sync?.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: negativeColor, display: 'inline-block' }} title="sync error — open for details" />}
             {sync && sync.mode !== 'auto' && !sync.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: '#f59e0b', display: 'inline-block' }} title={sync.mode === 'unconfigured' ? 'local mode — GitHub mirror not configured' : 'mirror disabled'} />}
           </span>
         </button>
@@ -593,8 +605,8 @@ function ReviewPanel(): React.ReactElement {
               .join('\n')}
           >
             <SyncIcon width={12} height={12} /> GitHub
-            {ghStat?.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: theme.colorNegative, display: 'inline-block' }} title="publishing error — open for details" />}
-            {!ghStat?.lastError && ghStat?.configured && !ghStat.suppressed && <span style={{ width: 6, height: 6, borderRadius: 999, background: theme.colorPositive, display: 'inline-block' }} title="client publishing live — feedback lands on GitHub from this browser" />}
+            {ghStat?.lastError && <span style={{ width: 6, height: 6, borderRadius: 999, background: negativeColor, display: 'inline-block' }} title="publishing error — open for details" />}
+            {!ghStat?.lastError && ghStat?.configured && !ghStat.suppressed && <span style={{ width: 6, height: 6, borderRadius: 999, background: positiveColor, display: 'inline-block' }} title="client publishing live — feedback lands on GitHub from this browser" />}
             {!ghStat?.lastError && ghStat?.configured && ghStat.suppressed && <span style={{ width: 6, height: 6, borderRadius: 999, background: '#f59e0b', display: 'inline-block' }} title={ghStat.queue > 0 ? `client GH off — ${ghStat.queue} queued (holds until re-enabled)` : 'client GH off (local-only)'} />}
           </button>
         )}
@@ -606,7 +618,7 @@ function ReviewPanel(): React.ReactElement {
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
             {sync ? (
               <>
-                <span style={{ ...chip(sync.mode === 'auto' ? `${theme.colorPositive}22` : '#f59e0b22', sync.mode === 'auto' ? theme.colorPositive : '#b45309') }}>
+                <span style={{ ...chip(sync.mode === 'auto' ? `${positiveColor}22` : '#f59e0b22', sync.mode === 'auto' ? positiveColor : '#b45309') }}>
                   {sync.mode === 'auto' ? 'auto-sync' : sync.mode === 'unconfigured' ? 'local mode' : 'mirror off'}
                 </span>
                 <span style={{ color: theme.textMutedColor }}>
@@ -628,7 +640,7 @@ function ReviewPanel(): React.ReactElement {
             </button>
           </div>
           {sync?.lastError && (
-            <div style={{ padding: '4px 8px', borderRadius: 6, background: `${theme.colorNegative}18`, color: theme.colorNegative, whiteSpace: 'pre-wrap' }}>
+            <div style={{ padding: '4px 8px', borderRadius: 6, background: `${negativeColor}18`, color: negativeColor, whiteSpace: 'pre-wrap' }}>
               last sync error: {sync.lastError}
             </div>
           )}
@@ -667,7 +679,7 @@ function ReviewPanel(): React.ReactElement {
             )}
           </div>
           {ghStat?.lastError && (
-            <div style={{ padding: '4px 8px', borderRadius: 6, background: `${theme.colorNegative}18`, color: theme.colorNegative, whiteSpace: 'pre-wrap' }}>
+            <div style={{ padding: '4px 8px', borderRadius: 6, background: `${negativeColor}18`, color: negativeColor, whiteSpace: 'pre-wrap' }}>
               {ghStat.lastError}
             </div>
           )}
@@ -743,12 +755,12 @@ function ReviewPanel(): React.ReactElement {
       )}
 
       {error && (
-        <div style={{ margin: '6px 0', padding: '5px 8px', fontSize: 11, borderRadius: 6, background: `${theme.colorNegative}22`, color: theme.colorNegative, whiteSpace: 'pre-wrap' }}>
+        <div style={{ margin: '6px 0', padding: '5px 8px', fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: 'pre-wrap' }}>
           {error}
         </div>
       )}
       {notice && (
-        <div style={{ margin: '6px 0', padding: '5px 8px', fontSize: 11, borderRadius: 6, background: `${theme.colorPositive}22`, color: theme.colorPositive }}>
+        <div style={{ margin: '6px 0', padding: '5px 8px', fontSize: 11, borderRadius: 6, background: `${positiveColor}22`, color: positiveColor }}>
           {notice}
         </div>
       )}
