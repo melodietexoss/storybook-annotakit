@@ -49,7 +49,7 @@ globalThis.fetch = async (url) => {
 };
 
 const store = await import('../dist/staticStore.mjs');
-const { getStaticStore, resetStaticStoreForTests, renderStaticDigest, staticScope } = store;
+const { getStaticStore, resetStaticStoreForTests, renderStaticDigest, staticScope, probeSeed } = store;
 
 const thread = (id, over = {}) => ({
   id,
@@ -87,6 +87,22 @@ seedData.threads = [thread('th_seed1'), thread('th_seed2', { number: 2, status: 
   ok('persisted under scope key', storageShim._dump()[key] !== undefined && storageShim._dump()[key].includes('th_seed1'));
   ok('info reports seeded', s.info().seeded === true);
 }
+
+/* 2b — probeSeed must NOT memoize failure: a transient miss (static deploy
+ *   mid atomic-swap, a slow static server still booting) has to be
+ *   re-probeable — preview/layer.tsx retries probeMode up to 5× with
+ *   backoff precisely so "a transient boot failure must not permanently
+ *   hide pins"; a cached null turns every retry into dead code. */
+resetStaticStoreForTests();
+{
+  pageUrl = 'https://site.test/just-swapped/index.html'; // scope with NO seed served (404)
+  const miss = await probeSeed();
+  ok('probeSeed miss returns null (transient 404)', miss === null);
+  pageUrl = 'https://site.test/stories/index.html'; // the bake lands (atomic swap completes)
+  const late = await probeSeed();
+  ok('re-probe after the seed lands RESOLVES (null not memoized)', Array.isArray(late) && late.some((t) => t.id === 'th_seed1'));
+}
+resetStaticStoreForTests();
 
 /* 3 — create: id/number assignment, persistence, reload survival */
 {
