@@ -77,6 +77,12 @@ export interface GhClientSettings {
   pollMs?: number;
   /** Escape hatch: kill client GH even when a baked config exists. */
   disabled?: boolean;
+  /** Set by the 401 self-heal (see flushOnce) when a SAVED token was dropped
+   *   in favor of the deployment's baked one — informational: the settings
+   *   panel reads it to explain what happened. A later fresh-token Save
+   *   simply overwrites the token and leaves a stale stamp behind (harmless:
+   *   the panel hint renders only while no override token exists). */
+  tokenDroppedAt?: string;
 }
 
 export interface GhClientConfig {
@@ -109,6 +115,12 @@ export interface GhClientStatus {
    *  truncated bodies re-pushed verbatim) — the panel surfaces the headline
    *  v0.6.4 feature instead of reporting zero work. */
   lastHealedCount?: number;
+  /** When a saved (override) token was rejected (401) and dropped in favor
+   *  of the baked config — null when no heal ever fired. Durable on purpose:
+   *  state.lastError is wiped by the next SUCCESSFUL op, so this status
+   *  field (read straight off the override record) is the only trace that
+   *  survives the heal actually working. */
+  tokenDroppedAt: string | null;
   pollMs: number;
 }
 
@@ -927,6 +939,67 @@ async function flushOnce(base: StaticStore): Promise<void> {
             }
           }
         }
+        // 401 SELF-HEAL: a SAVED (override) token that GitHub rejected is a
+        // dead credential, not user intent — when this deployment bakes a
+        // working token, the user's real intent (publish the feedback) is
+        // better served by falling back to it. Left alone this state is
+        // terminal: 401 is non-transient, so bumpOp's backoff grows to max
+        // and the queue parks until a manual panel Reset or a fresh PAT
+        // paste — nothing ever questions an override that rejects (the
+        // module's own header principle, "delivery beats PAT secrecy",
+        // applied to a rejected credential). Guards, each load-bearing:
+        //   - the 401 must be attributable to the OVERRIDE's token: an
+        //     override without a truthy-trimmed token cannot produce one
+        //     (resolveGhConfig nulls out before any call), and the equality
+        //     with cfg.token closes the cross-tab re-save race (a FRESH
+        //     token saved by another tab between our resolve and this catch
+        //     must never be dropped — it never produced a 401).
+        //   - the baked config must carry a truthy-trimmed token (else the
+        //     post-heal resolveGhConfig nulls out: queue parked forever AND
+        //     the user's token already dropped — strictly worse than stuck),
+        //     a DIFFERENT one than the override's (an equal string is the same
+        //     credential — "falling back" to it is a guaranteed-wasted retry),
+        //     AND the same apiBase (an override that redirected the endpoint
+        //     owns its 401s: pairing the baked token with a foreign GHES/
+        //     proxy would just 401 again and burn a possibly-good token).
+        //   - writeOverride must SUCCEED (H-H-05 quota/privacy-mode false →
+        //     the override still carries the dead token, so continuing would
+        //     loop real 401s forever — fall through to bumpOp/return instead).
+        // Idempotent by construction: the patch below removes the token KEY
+        // (an explicit undefined wins the merge over the stored value, and
+        // JSON.stringify drops undefined-valued keys), so a second 401 — the
+        // baked token dead too — finds the first condition false and takes
+        // the normal bumpOp path. No counter needed.
+        if ((err as { status?: number })?.status === 401) {
+          const ov = readOverride();
+          if (ov && typeof ov.token === 'string' && ov.token.trim() && ov.token.trim() === cfg.token) {
+            const bk = await probeBakedGhConfig(); // memoized per document — one microtask here
+            if (
+              bk &&
+              typeof bk.token === 'string' &&
+              bk.token.trim() &&
+              bk.token.trim() !== ov.token.trim() &&
+              (ov.apiBase ?? '').trim() === (bk.apiBase ?? '').trim()
+            ) {
+              if (writeOverride({ token: undefined, tokenDroppedAt: new Date().toISOString() })) {
+                // repo/labels/pollMs/disabled survive via writeOverride's
+                // merge; the durable user-visible trace is tokenDroppedAt on
+                // the override record (status() → settings panel) because
+                // state.lastError is wiped by the next SUCCESSFUL op — the
+                // line below only stays visible while the retry keeps
+                // failing. Notice text is ASCII-only on purpose (em-dashes
+                // do not survive every dist/patch pipeline byte-for-byte).
+                if (state) state.lastError = "saved GitHub token was rejected (401) - publishing with this deployment's built-in token; your other settings were kept";
+                // Same semantics as a settings Save: the user's situation
+                // just changed, so OTHER ops carrying 401 backoff from
+                // earlier sweeps retry now (this also wipes their transient
+                // retry-after discipline — accepted, exactly as Save does).
+                clearOpBackoff();
+                continue; // this op was never bumped — still eligible, retry NOW on the baked token
+              }
+            }
+          }
+        }
         const { transient } = bumpOp(op.id, err);
         if (state) state.lastError = err instanceof Error ? err.message : String(err);
         if (!transient) return; // 401/404/422-parked — needs a settings/body fix, stop hammering
@@ -1240,6 +1313,9 @@ function buildStatus(): GhClientStatus {
     lastPullAt: state?.lastPullAt,
     lastPullCount: state?.lastPullCount,
     lastHealedCount: state?.lastHealedCount,
+    // read off the override record (NOT state): a 401 heal's lastError notice
+    // is wiped by the next successful op — this is the durable trace
+    tokenDroppedAt: override?.tokenDroppedAt ?? null,
     pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS,
   };
 }
