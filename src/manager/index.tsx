@@ -744,6 +744,14 @@ function ReviewPanel(): React.ReactElement {
               autoComplete="off"
             />
           </label>
+          {/* 401 self-heal trace: a rejected saved token was dropped in favor of
+           *  the baked one (status.tokenDroppedAt survives the success-path
+           *  lastError wipe) — one quiet line so the drop is never silent. */}
+          {ghStat?.tokenDroppedAt && !ghForm.token && (
+            <div style={{ fontSize: 10, color: theme.textMutedColor }}>
+              the previously saved token was rejected (401) — publishing with this deployment's built-in token; paste a fresh PAT to override again
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
             <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <span style={{ color: theme.textMutedColor }}>poll (s)</span>

@@ -10,7 +10,7 @@ import {
 import {
   getGhLinkedStaticStore,
   ghClientStatus
-} from "./chunk-Y3KBXHJT.mjs";
+} from "./chunk-SOXXBC3V.mjs";
 import {
   MAX_BODY_CHARS,
   renderStaticDigest
@@ -501,7 +501,7 @@ function ReviewPanel() {
       spellCheck: false,
       autoComplete: "off"
     }
-  )), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "poll (s)"), /* @__PURE__ */ React.createElement(
+  )), ghStat?.tokenDroppedAt && !ghForm.token && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: theme.textMutedColor } }, "the previously saved token was rejected (401) \u2014 publishing with this deployment's built-in token; paste a fresh PAT to override again"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "poll (s)"), /* @__PURE__ */ React.createElement(
     "input",
     {
       style: { width: 60, padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor },

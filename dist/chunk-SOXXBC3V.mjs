@@ -685,6 +685,19 @@ async function flushOnce(base) {
             }
           }
         }
+        if (err?.status === 401) {
+          const ov = readOverride();
+          if (ov && typeof ov.token === "string" && ov.token.trim() && ov.token.trim() === cfg.token) {
+            const bk = await probeBakedGhConfig();
+            if (bk && typeof bk.token === "string" && bk.token.trim() && bk.token.trim() !== ov.token.trim() && (ov.apiBase ?? "").trim() === (bk.apiBase ?? "").trim()) {
+              if (writeOverride({ token: void 0, tokenDroppedAt: (/* @__PURE__ */ new Date()).toISOString() })) {
+                if (state) state.lastError = "saved GitHub token was rejected (401) - publishing with this deployment's built-in token; your other settings were kept";
+                clearOpBackoff();
+                continue;
+              }
+            }
+          }
+        }
         const { transient } = bumpOp(op.id, err);
         if (state) state.lastError = err instanceof Error ? err.message : String(err);
         if (!transient) return;
@@ -919,6 +932,9 @@ function buildStatus() {
     lastPullAt: state?.lastPullAt,
     lastPullCount: state?.lastPullCount,
     lastHealedCount: state?.lastHealedCount,
+    // read off the override record (NOT state): a 401 heal's lastError notice
+    // is wiped by the next successful op — this is the durable trace
+    tokenDroppedAt: override?.tokenDroppedAt ?? null,
     pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS
   };
 }

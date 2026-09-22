@@ -11,7 +11,7 @@ import {
   probeBakedGhConfig,
   probeGhConfig,
   resolveGhConfig
-} from "./chunk-Y3KBXHJT.mjs";
+} from "./chunk-SOXXBC3V.mjs";
 import {
   ISSUE_BODY_LIMIT
 } from "./chunk-LNF6XYUQ.mjs";
