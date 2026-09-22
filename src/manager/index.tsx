@@ -385,14 +385,17 @@ function ReviewPanel(): React.ReactElement {
   };
 
   /* exports — dev: server digest route; static: built client-side from the
-   *  local store (hand-carry mechanism back to a dev-server store). */
+   *  local store (hand-carry mechanism back to a dev-server store). The md
+   *  export is VERBATIM (fullText) — it is the hand-off artifact and often
+   *  the only durable copy while the mirror is down; lean clips at 200
+   *  chars and a long note would arrive shortened (issue #16 rationale). */
   const exportAny = async (format: 'md' | 'json'): Promise<string> => {
     const list = staticMode
       ? (await getGhLinkedStaticStore()).list(scope === 'story' ? storyId : undefined)
       : null;
     if (list !== null) {
       return format === 'md'
-        ? renderStaticDigest(list, { storageNote: ghStat?.configured ? `mirrored to GitHub (${ghStat.repo}) by this browser` : undefined })
+        ? renderStaticDigest(list, { storageNote: ghStat?.configured ? `mirrored to GitHub (${ghStat.repo}) by this browser` : undefined, fullText: true })
         : JSON.stringify({ generatedAt: new Date().toISOString(), mode: 'static', threads: list }, null, 2);
     }
     return getExport(format, scope === 'story' ? storyId : undefined);

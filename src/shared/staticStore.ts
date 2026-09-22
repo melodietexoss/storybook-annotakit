@@ -486,8 +486,16 @@ function groupStories(threads: Thread[]): ExportedStory[] {
 }
 
 /** Markdown digest — mirrors the server's lean format (digest.ts), minus
- *  server-only bits (repo-relative paths, snapshot pointers). */
-export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: string }): string {
+ *  server-only bits (repo-relative paths, snapshot pointers). `fullText`
+ *  (issue #16 parity): verbatim comment bodies with newlines preserved.
+ *  The manager's md EXPORT uses it — in a static deployment the export is
+ *  the hand-off artifact (the reviewer carries the markdown to the agent /
+ *  another machine), and it is the ONLY channel exactly when the mirror
+ *  is down (unconfigured / 401 / offline: threads live in localStorage
+ *  until someone reloads with a working config). A reviewer's long note
+ *  must never arrive shortened on that path — same rationale as the
+ *  ghClient issue-body builder. */
+export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: string; fullText?: boolean }): string {
   const stories = groupStories(threads);
   const open = stories.reduce((n, s) => n + (Number(s.counts.open) || 0), 0);
   const fixed = stories.reduce((n, s) => n + (Number(s.counts.fixed) || 0), 0);
@@ -512,9 +520,9 @@ export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: str
       out.push('');
       continue;
     }
-    for (const t of s.threads.filter((x) => x.status !== 'fixed' && x.status !== 'resolved')) out.push(...threadBlock(t, opts?.storageNote));
-    for (const t of s.threads.filter((x) => x.status === 'fixed')) out.push(...threadBlock(t, opts?.storageNote));
-    for (const t of s.threads.filter((x) => x.status === 'resolved')) out.push(...threadBlock(t, opts?.storageNote));
+    for (const t of s.threads.filter((x) => x.status !== 'fixed' && x.status !== 'resolved')) out.push(...threadBlock(t, opts?.storageNote, opts?.fullText));
+    for (const t of s.threads.filter((x) => x.status === 'fixed')) out.push(...threadBlock(t, opts?.storageNote, opts?.fullText));
+    for (const t of s.threads.filter((x) => x.status === 'resolved')) out.push(...threadBlock(t, opts?.storageNote, opts?.fullText));
   }
   return out.join('\n');
 }
