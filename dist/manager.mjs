@@ -6,15 +6,15 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-XM4L6WNP.mjs";
+} from "./chunk-YWGFQGYU.mjs";
 import {
   getGhLinkedStaticStore,
   ghClientStatus
-} from "./chunk-Y3KBXHJT.mjs";
+} from "./chunk-H74PTPYO.mjs";
 import {
   MAX_BODY_CHARS,
   renderStaticDigest
-} from "./chunk-LNF6XYUQ.mjs";
+} from "./chunk-WQQXS7RA.mjs";
 
 // src/manager/index.tsx
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -296,7 +296,7 @@ function ReviewPanel() {
   const exportAny = async (format) => {
     const list = staticMode ? (await getGhLinkedStaticStore()).list(scope === "story" ? storyId : void 0) : null;
     if (list !== null) {
-      return format === "md" ? renderStaticDigest(list, { storageNote: ghStat?.configured ? `mirrored to GitHub (${ghStat.repo}) by this browser` : void 0 }) : JSON.stringify({ generatedAt: (/* @__PURE__ */ new Date()).toISOString(), mode: "static", threads: list }, null, 2);
+      return format === "md" ? renderStaticDigest(list, { storageNote: ghStat?.configured ? `mirrored to GitHub (${ghStat.repo}) by this browser` : void 0, fullText: true }) : JSON.stringify({ generatedAt: (/* @__PURE__ */ new Date()).toISOString(), mode: "static", threads: list }, null, 2);
     }
     return getExport(format, scope === "story" ? storyId : void 0);
   };

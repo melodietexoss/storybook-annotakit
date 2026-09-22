@@ -308,4 +308,31 @@ resetStaticStoreForTests(); // scope switched in test 7 — drop the cached stor
   ok('C07: unlinkGh keeps the comment history', unlinked.comments.some((c) => c.body === 'landed after the stale copy was built'));
 }
 
+/* 13 — export parity (issue #16, ghClient-builder parity): renderStaticDigest
+ * gains `fullText` — the md EXPORT must carry verbatim comment bodies. In a
+ * static deployment the export is the hand-off artifact (the reviewer carries
+ * the markdown to the agent / another machine) and it is the ONLY channel
+ * exactly while the mirror is down (unconfigured / 401 / offline): a long
+ * note arriving clipped at 200 chars there is the same "you truncate the
+ * summary??" the full-mode issue bodies already fixed. Lean stays the
+ * default for display contexts. */
+{
+  const s = await getStaticStore();
+  // the tail sits BEYOND the 200-char clip so lean/full assertions are
+  // unambiguous; the newlines prove verbatim (lean one-lines everything)
+  const noteBody = 'A'.repeat(250) + '\n\nSECOND_PARAGRAPH_THE_HANDOFF_TAIL';
+  const replyBody = 'B'.repeat(2000);
+  const t = await s.create({ id: 'th_exportfull', storyId: 's1', target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null }, comments: [{ id: 'c_ef1', author: 'reviewer', body: noteBody, createdAt: new Date().toISOString() }] });
+  await s.addComment(t.id, replyBody, 'reviewer-2');
+  const md = renderStaticDigest(s.list(), { fullText: true });
+  ok('fullText export: long note arrives WHOLE', md.includes('SECOND_PARAGRAPH_THE_HANDOFF_TAIL'));
+  ok('fullText export: newlines preserved (verbatim, not one-lined)', md.includes(`${'A'.repeat(250)}\n\nSECOND_PARAGRAPH_THE_HANDOFF_TAIL`));
+  ok('fullText export: 2000-char reply arrives whole', md.includes(replyBody));
+  ok('fullText export: verbatim labels present', md.includes('(verbatim):'));
+  const lean = renderStaticDigest(s.list());
+  ok('lean default still clips the note (display parity)', !lean.includes('SECOND_PARAGRAPH_THE_HANDOFF_TAIL') && lean.includes('…'));
+  ok('lean default still clips the reply', !lean.includes(replyBody));
+  await s.deleteThread(t.id);
+}
+
 console.log(`\n${passed} passed, 0 failed (static-store suite)`);

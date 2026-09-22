@@ -450,9 +450,9 @@ function renderStaticDigest(threads, opts) {
       out.push("");
       continue;
     }
-    for (const t of s.threads.filter((x) => x.status !== "fixed" && x.status !== "resolved")) out.push(...threadBlock(t, opts?.storageNote));
-    for (const t of s.threads.filter((x) => x.status === "fixed")) out.push(...threadBlock(t, opts?.storageNote));
-    for (const t of s.threads.filter((x) => x.status === "resolved")) out.push(...threadBlock(t, opts?.storageNote));
+    for (const t of s.threads.filter((x) => x.status !== "fixed" && x.status !== "resolved")) out.push(...threadBlock(t, opts?.storageNote, opts?.fullText));
+    for (const t of s.threads.filter((x) => x.status === "fixed")) out.push(...threadBlock(t, opts?.storageNote, opts?.fullText));
+    for (const t of s.threads.filter((x) => x.status === "resolved")) out.push(...threadBlock(t, opts?.storageNote, opts?.fullText));
   }
   return out.join("\n");
 }

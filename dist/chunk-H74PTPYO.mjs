@@ -6,7 +6,7 @@ import {
   mirrorStateOf,
   renderThreadBlock,
   staticScope
-} from "./chunk-LNF6XYUQ.mjs";
+} from "./chunk-WQQXS7RA.mjs";
 
 // src/shared/legacyMirror.ts
 function fmtDate(iso) {
