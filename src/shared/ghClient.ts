@@ -54,6 +54,13 @@ const DEFAULT_LABEL = 'annotakit';
 const DEFAULT_POLL_MS = 60_000;
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_BACKOFF_MS = 15 * 60_000;
+/** v0.6.6 (F11): a definitive 401 on the pull path backs off 5 minutes —
+ *  pollMs (60s) would be no backoff at all, and hammering a dead token
+ *  every minute is pure noise. A manual Sync or a settings save clears it. */
+const PULL_401_BACKOFF_MS = 5 * 60_000;
+/** v0.6.6 (F12): a syncedAt stamp ahead of the wall clock by more than this
+ *  is a legacy skewed stamp — repaired on sight (see pullOnce). */
+const SKEW_REPAIR_MS = 5 * 60_000;
 const GH_SENTINEL = '<!-- annotakit -->';
 const SENTINEL_RE = /<!--\s*annotakit:c_(\S+?)\s*-->/;
 const DEFAULT_API = 'https://api.github.com';
@@ -94,6 +101,11 @@ export interface GhClientStatus {
   repo: string | null;
   labels: string[];
   leader: boolean;
+  /** v0.6.6 (F1): a token override is saved in THIS browser (localStorage)
+   *  and shadows the baked annotakit-gh.json — including an EMPTY-string
+   *  override (which disarms publishing). The settings UI uses this to stop
+   *  lying with "empty keeps the baked token". */
+  tokenOverridden: boolean;
   /** Ops waiting to flush (excludes parked — see `parked`). */
   queue: number;
   /** Ops terminally parked after a non-retryable rejection (422: GitHub
@@ -118,6 +130,9 @@ export interface GhLinkFacet {
    *  flusher immediately — settings changes take effect without reload. */
   saveSettings(patch: GhClientSettings): void;
   clearSettings(): void;
+  /** v0.6.6 (F1): drop ONLY the override token — the baked token applies
+   *  again without nuking repo/labels/pollMs overrides. */
+  clearTokenOverride(): void;
   /** Flush the queue + one pull, now (button in the settings panel). */
   syncNow(): Promise<void>;
 }
@@ -305,20 +320,33 @@ async function ghJsonPaged<T>(cfg: GhClientConfig, pathname: string, maxPages = 
       }
     }
   }
-  if (truncated && url && state) {
-    state.lastError = `GitHub pagination cap hit (${maxPages} pages) on ${pathname} — results truncated`;
+  if (truncated && url) {
+    // v0.6.6 (F10): a pull-scoped WARNING, not the engine error — success
+    // clears must not clobber it (it describes the last pull's remote state
+    // and survives until the next pull refreshes it)
+    pullWarning = `GitHub pagination cap hit (${maxPages} pages) on ${pathname} — results truncated`;
   }
   return out;
 }
 
+/** v0.6.6 (F10): pull-scoped warnings (pagination truncation, malformed
+ * remote comments) — surfaced through status().lastError by the pull callers
+ * but NEVER clobbered by a success clear (they describe remote state that
+ * only the next pull refreshes). */
+let pullWarning: string | null = null;
+
 function createIssueRemote(
   cfg: GhClientConfig,
   input: { title: string; body: string },
-): Promise<{ number: number; html_url: string; state: 'open' | 'closed' }> {
+): Promise<{ number: number; html_url: string; state: 'open' | 'closed'; updated_at?: string }> {
   return ghJson(cfg, 'POST', `/repos/${cfg.repo}/issues`, { title: input.title, body: input.body, labels: cfg.labels });
 }
 
-function addIssueCommentRemote(cfg: GhClientConfig, issue: number, body: string): Promise<{ id: number; html_url: string }> {
+function addIssueCommentRemote(
+  cfg: GhClientConfig,
+  issue: number,
+  body: string,
+): Promise<{ id: number; html_url: string; updated_at?: string; created_at?: string }> {
   return ghJson(cfg, 'POST', `/repos/${cfg.repo}/issues/${issue}/comments`, { body });
 }
 
@@ -379,6 +407,22 @@ function queueKey(): string {
 let bakedPromise: Promise<GhClientSettings | null> | null = null;
 /** Baked config once resolved (for the synchronous status snapshot). */
 let resolvedBaked: GhClientSettings | null = null;
+/** v0.6.6 (F2/SR-A N3 + SR-W2): did the CURRENT cached probe resolve null?
+ *  A resolved-null probe re-arms after BAKED_NULL_RETRY_MS; the old guard
+ *  short-circuited on a stale-truthy resolvedBaked (left over from the
+ *  PREVIOUS successful probe) and latched the null FOREVER after a 401
+ *  invalidation landed mid-deploy — the engine went dead until reload. */
+let bakedLandedNull = false;
+/** v0.6.6 (F2/SR-A N3): a resolved-null probe (unconfigured / transient
+ *  deploy blip) is retried after this cooldown — failure is no longer
+ *  memoized for the document's lifetime. */
+let bakedNullRetryAt = 0;
+let bakedNullRetryMs = 60_000;
+/** @internal test hook: shrink the null-probe cooldown so tests can exercise
+ *  the re-arm path (SR-W2 P2#1 regression coverage). */
+export function __setBakedNullRetryMsForTests(ms: number): void {
+  bakedNullRetryMs = ms;
+}
 
 async function tryFetchGhFile(url: string): Promise<GhClientSettings | null> {
   try {
@@ -394,9 +438,18 @@ async function tryFetchGhFile(url: string): Promise<GhClientSettings | null> {
 }
 
 /** Fetch the baked `annotakit-gh.json` (cached per document). Candidates
- *  mirror the seed probe: own doc dir → manager (parent) dir → origin root. */
+ *  mirror the seed probe: own doc dir → manager (parent) dir → origin root.
+ *  v0.6.6 (F2): a SUCCESS is cached for the document's lifetime; a null
+ *  result re-probes every BAKED_NULL_RETRY_MS (a transient 404/5xx during a
+ *  partial re-deploy used to latch "unconfigured" forever — SR-A N3). */
 export function probeBakedGhConfig(): Promise<GhClientSettings | null> {
-  if (bakedPromise) return bakedPromise;
+  // SR-W2 fix: the cache-hit test must consider whether the CURRENT promise
+  // landed null — resolvedBaked alone is stale after an invalidation whose
+  // re-probe missed (mid-deploy 404). A landed-null probe re-fires after the
+  // cooldown; a landed-SUCCESS (or an in-flight/cooling null) serves cached.
+  if (bakedPromise && (!bakedLandedNull || Date.now() < bakedNullRetryAt)) return bakedPromise;
+  bakedLandedNull = false;
+  bakedNullRetryAt = Date.now() + bakedNullRetryMs; // provisional — cleared on success
   bakedPromise = (async (): Promise<GhClientSettings | null> => {
     const candidates: string[] = [new URL(GH_FILE, document.baseURI).href];
     try {
@@ -410,12 +463,28 @@ export function probeBakedGhConfig(): Promise<GhClientSettings | null> {
       const body = await tryFetchGhFile(url);
       if (body) {
         resolvedBaked = body;
+        bakedLandedNull = false;
+        bakedNullRetryAt = 0;
         return body;
       }
     }
+    bakedLandedNull = true; // SR-W2: re-arms the cooldown path above
     return null;
   })();
   return bakedPromise;
+}
+
+/** v0.6.6 (F2/V3/V4): a definitive auth rejection means the config we are
+ *  using may be stale — drop the baked-config cache and re-probe (one
+ *  no-store fetch per 401, backoff-paced). This is what lets a LIVE tab
+ *  pick up a re-baked token (the stale-leader poison case) without a
+ *  reload. `resolvedBaked` is kept until the fresh probe lands so status()
+ *  never flickers "unconfigured" mid-recovery. */
+function invalidateBakedConfig(): void {
+  bakedPromise = null;
+  bakedLandedNull = false;
+  bakedNullRetryAt = 0;
+  void probeBakedGhConfig().catch(() => undefined);
 }
 
 function readOverride(): GhClientSettings | null {
@@ -450,6 +519,13 @@ function writeOverride(patch: GhClientSettings): boolean {
 export function resolveGhConfig(baked: GhClientSettings | null, override: GhClientSettings | null): GhClientConfig | null {
   const merged: GhClientSettings = { ...(baked ?? {}), ...(override ?? {}) };
   if (merged.disabled) return null;
+  // v0.6.6 (SR-A N1): a legacy empty/whitespace override token (a v0.6.5
+  // whitespace-paste saved `token:""`) must NOT disarm the baked config —
+  // an empty token means "no token here", so the baked one applies.
+  if (typeof merged.token === 'string' && !merged.token.trim()) {
+    if (typeof baked?.token === 'string' && baked.token.trim()) merged.token = baked.token;
+    else delete merged.token;
+  }
   const token = (merged.token ?? '').trim();
   const repo = (merged.repo ?? '').trim();
   if (!token || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return null;
@@ -637,7 +713,7 @@ function clearOpBackoff(): void {
   writeQueue(ops.map((o) => (o.parked ? o : { ...o, notBefore: 0, lastError: undefined })));
 }
 
-function bumpOp(id: string, err: unknown): { transient: boolean } {
+function bumpOp(id: string, err: unknown): { transient: boolean; parked?: boolean } {
   const ops = readQueue();
   const idx = ops.findIndex((o) => o.id === id);
   const transient = Boolean((err as { transient?: boolean })?.transient) || [429, 502, 503, 504].includes(Number((err as { status?: number })?.status));
@@ -651,7 +727,10 @@ function bumpOp(id: string, err: unknown): { transient: boolean } {
       const ref = op.kind === 'sync' ? `thread ${op.threadId}` : `issue #${op.issue}`;
       ops[idx] = { ...op, parked: true, lastError: `parked (422 — GitHub rejected the body, ${ref}): ${err instanceof Error ? err.message.slice(0, 200) : String(err)}` };
       writeQueue(ops);
-      return { transient: false };
+      // v0.6.6 (F10): surface the THREAD-NAMING parked message as the engine
+      // error too — the raw 422 text does not say which thread to fix
+      if (state) state.lastError = ops[idx].lastError;
+      return { transient: false, parked: true };
     }
     const attempts = (op.attempts ?? 0) + 1;
     const retryMs = Number((err as { retryMs?: number })?.retryMs) || Math.min(15_000 * 2 ** Math.min(attempts, 5), MAX_BACKOFF_MS);
@@ -677,6 +756,13 @@ interface RuntimeState {
    *  "leader" and concurrently flush the same op → duplicate issues. */
   leader: boolean;
   flushing: boolean;
+  /** v0.6.6 (WAKE-LOSS): a wake (enqueue / settings save / storage event)
+   *  that arrived while a flush was already in-flight used to be swallowed
+   *  by the flushing guard — when the in-flight pass was a cfg-null no-op
+   * (engine disabled mid-flight), the re-enabling save's flush was LOST and
+   *  the queue sat dead until the 30s sweep. A wake that cannot run is
+   *  latched here and honored exactly once by the finishing pass. */
+  wakePending?: boolean;
   lastError?: string;
   /** H-H-04: heal failures persist here — the next successful pull used to
    *  wipe lastError and hide a permanently failing heal. */
@@ -712,6 +798,12 @@ function isLeaderDoc(): boolean {
  *  while a genuinely different tab gets a different id and is blocked. Falls
  *  back to an in-memory id when sessionStorage is unavailable. */
 let docId: string | null = null;
+/** Per-DOCUMENT nonce (in-memory, never persisted): a duplicated tab /
+ *  session-restore copy shares the sessionStorage tabId but evaluates a
+ *  fresh nonce — so two live documents can never both treat the lease as
+ *  "mine" (SR-B W3, v0.6.6). A page RELOAD also gets a fresh nonce, but the
+ *  pagehide release below frees its predecessor's lease instantly. */
+let docNonce = `n_${Math.random().toString(36).slice(2, 10)}`;
 function tabId(): string {
   if (docId) return docId;
   let id = '';
@@ -735,6 +827,19 @@ function leaderKey(): string {
 }
 const LEADER_TTL_MS = 45_000;
 const LEADER_RENEW_MS = 20_000;
+/** v0.6.6 (F5): a lease is "mine" only when BOTH the tab id and the
+ *  per-document nonce match. A same-id-different-nonce lease is a duplicated
+ *  tab or a reloaded predecessor — foreign-healthy while fresh (the reload
+ *  case is freed by the pagehide release; the duplicate-tab case is the W3
+ *  guard). A v0.6.5-format lease (no nonce) is treated as EXPIRED so a
+ *  rolling upgrade takes over within one TTL (the old writer demotes on a
+ *  foreign id — no duel). */
+function leaseIsForeignHealthy(cur: { id?: string; nonce?: string; at?: number }): boolean {
+  const fresh = Number.isFinite(Number(cur.at)) && Date.now() - Number(cur.at) < LEADER_TTL_MS;
+  if (!fresh) return false;
+  if (cur.id !== tabId()) return true; // a different tab, any format
+  return typeof cur.nonce === 'string' && cur.nonce !== docNonce; // my id, not my document
+}
 /** Claim (or renew) the leadership lease. A healthy foreign lease blocks us;
  *  a stale one (> TTL) is taken over. Storage failures degrade to the old
  *  top-level-document heuristic (single-window setups are unaffected). */
@@ -744,15 +849,12 @@ function claimLeadership(): boolean {
   try {
     const raw = store.getItem(leaderKey());
     if (raw) {
-      const cur = JSON.parse(raw) as { id?: string; at?: number };
-      if (
-        cur && typeof cur === 'object' && cur.id && cur.id !== tabId() &&
-        Number.isFinite(Number(cur.at)) && Date.now() - Number(cur.at) < LEADER_TTL_MS
-      ) {
-        return false; // a healthy leader in another tab
+      const cur = JSON.parse(raw) as { id?: string; nonce?: string; at?: number };
+      if (cur && typeof cur === 'object' && cur.id && leaseIsForeignHealthy(cur)) {
+        return false; // a healthy leader in another tab (or a duplicate of this one)
       }
     }
-    store.setItem(leaderKey(), JSON.stringify({ id: tabId(), at: Date.now() }));
+    store.setItem(leaderKey(), JSON.stringify({ id: tabId(), nonce: docNonce, at: Date.now() }));
     return true;
   } catch {
     return isLeaderDoc();
@@ -764,6 +866,20 @@ function renewLeadership(st: RuntimeState): void {
   if (st.lastLeadershipRenew && Date.now() - st.lastLeadershipRenew < LEADER_RENEW_MS) return;
   st.lastLeadershipRenew = Date.now();
   if (!claimLeadership()) st.leader = false; // another tab took over — demote
+}
+
+/** v0.6.6 (F3): honest, ghost-aware wording for a failed lease claim. */
+function leaseHeldMessage(): string {
+  let age = -1;
+  try {
+    const raw = ls()?.getItem(leaderKey());
+    const cur = raw ? (JSON.parse(raw) as { at?: number }) : null;
+    if (cur && Number.isFinite(Number(cur.at))) age = Math.max(0, Math.round((Date.now() - Number(cur.at)) / 1000));
+  } catch {
+    /* unreadable — generic message below */
+  }
+  const fresh = age >= 0 && age < 60 ? ` (renewed ${age}s ago)` : '';
+  return `sync skipped — the sync lease is held by another tab${fresh}, or by this tab's own reloaded predecessor. If no other tab is syncing, this tab takes over within 45s — click Sync again shortly.`;
 }
 
 /** The freshest thread by id, reloaded from localStorage first (cross-doc
@@ -778,6 +894,25 @@ function freshThread(base: StaticStore, id: string): Thread | undefined {
  *  remote state is about to change). */
 function threadPending(id: string): boolean {
   return readQueue().some((o) => o.kind === 'sync' && o.threadId === id);
+}
+
+/** v0.6.6 (F4/SR-B W1): re-claim the lease at every remote-write boundary.
+ *  The flush loop's entry check alone left a >45s drain window where an
+ *  expired-then-reclaimed lease produced TWO concurrent flushers (duplicate
+ *  issues/comments). Claiming here both RENEWS the lease (a long drain can
+ *  never expire it) and DEMOTES us the moment another tab owns it. */
+function stillLeading(): boolean {
+  if (!claimLeadership()) {
+    if (state) state.leader = false;
+    return false;
+  }
+  return true;
+}
+function lostLeaseError(): Error & { status: number; transient: boolean } {
+  return Object.assign(new Error('sync lease lost to another tab — op re-queued for the new leader'), {
+    status: 503,
+    transient: true,
+  });
 }
 
 async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): Promise<void> {
@@ -801,7 +936,9 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
       if (orphan) {
         const stampedOrphan: Thread = {
           ...t,
-          gh: { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: new Date().toISOString() },
+          // v0.6.6 (F12): server-clock high-water mark — a local-clock stamp
+          // re-opened the clock-skew permanent-miss window at every seam
+          gh: { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: orphan.updated_at ?? new Date().toISOString() },
         };
         await base.patch(stampedOrphan);
         if (state) state.lastPushAt = new Date().toISOString();
@@ -810,6 +947,7 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
     } catch {
       /* listing failed — proceed to a normal create (best effort) */
     }
+    if (!stillLeading()) throw lostLeaseError();
     const created = await createIssueRemote(cfg, { title: mirrorIssueTitle(t), body: mirrorIssueBody(t, cfg) });
     // ORPHAN GUARD (engine parity): the thread may have been deleted while
     // the create was in flight — close the just-created issue, no orphans.
@@ -822,7 +960,7 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
     // stamp mapping + mark every existing comment as mirrored (issue body)
     const stamped: Thread = {
       ...cur,
-      gh: { issue: created.number, url: created.html_url, state: 'open', syncedAt: new Date().toISOString() },
+      gh: { issue: created.number, url: created.html_url, state: 'open', syncedAt: created.updated_at ?? new Date().toISOString() },
       comments: cur.comments.map((c) => (c.ghId || c.source === 'github' ? c : { ...c, ghId: 'issue-body' })),
     };
     await base.patch(stamped); // original method — no re-enqueue
@@ -838,12 +976,17 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
   }
 
   let pushed = 0;
+  let remoteStamp: string | undefined; // v0.6.6 (F12): last REST-response server timestamp
 
   // 1. un-mirrored local replies → issue comments (sentinel-marked, exact
   //    ghId stamp right after each push — re-reading fresh in between)
   for (const c of t.comments) {
     if (c.ghId || c.source === 'github') continue;
+    // F4: renew before EVERY remote comment write — a >45s comment drain
+    // must never outlive the lease (duplicate-comment window)
+    if (!stillLeading()) throw lostLeaseError();
     const gh = await addIssueCommentRemote(cfg, t.gh.issue, mirrorBody(c));
+    remoteStamp = gh.updated_at ?? gh.created_at ?? remoteStamp;
     const cur = freshThread(base, t.id);
     if (!cur) return; // deleted mid-push; the close op takes over
     const idx = cur.comments.findIndex((x) => x.id === c.id);
@@ -860,20 +1003,23 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
   const curGh = t.gh;
   const want = mirrorStateOf(t.status);
   if (curGh.state !== want) {
+    if (!stillLeading()) throw lostLeaseError();
     await addIssueCommentRemote(cfg, curGh.issue, want === 'closed' ? resolutionNotice(t) : reopenNotice(t));
-    await setIssueStateRemote(cfg, curGh.issue, want);
+    const flipped = await setIssueStateRemote(cfg, curGh.issue, want);
+    remoteStamp = flipped.updated_at ?? remoteStamp;
     const fresh = freshThread(base, t.id);
-    if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, state: want, syncedAt: new Date().toISOString() } });
+    if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, state: want, syncedAt: flipped.updated_at ?? new Date().toISOString() } });
     pushed++;
   } else if (pushed > 0) {
     const fresh = freshThread(base, t.id);
-    if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, syncedAt: new Date().toISOString() } });
+    if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, syncedAt: remoteStamp ?? new Date().toISOString() } });
   }
   if (pushed > 0 && state) state.lastPushAt = new Date().toISOString();
 }
 
 async function processCloseOp(cfg: GhClientConfig, op: GhOp): Promise<void> {
   if (!op.issue) return; // thread was never mirrored — nothing to close
+  if (!stillLeading()) throw lostLeaseError();
   await addIssueCommentRemote(cfg, op.issue, `${GH_SENTINEL}\nthread deleted in Storybook (static) — closing.`);
   await setIssueStateRemote(cfg, op.issue, 'closed');
 }
@@ -883,11 +1029,22 @@ async function flushOnce(base: StaticStore): Promise<void> {
   // wake/syncNow paths must never double-flush alongside the real leader
   // (duplicate-issue window). Followers enqueue; the leader's storage-event
   // wake drains their ops.
-  if (!state || state.flushing || !state.leader) return;
+  if (!state) return;
+  if (state.flushing) {
+    state.wakePending = true; // v0.6.6 (WAKE-LOSS): never drop a mid-flight wake
+    return;
+  }
+  if (!state.leader) return;
   state.flushing = true;
   let ranWork = false; // did this invocation actually process an op?
   try {
     for (;;) {
+      // v0.6.6 (F4/SR-B W1+W2): re-verify the lease EVERY iteration — an
+      // entry-only check left a whole-drain window where a reclaimed lease
+      // meant two concurrent flushers. This also renews the lease per op, so
+      // a long drain can never expire it, and demotes a stale-true follower
+      // (wake path) before it touches the queue.
+      if (!stillLeading()) return;
       const cfg = await probeGhConfig(); // re-resolved every cycle — settings changes apply live
       if (!cfg) return; // disabled/unconfigured — ops stay queued for a real wake (P0: the finally-gate below must NOT re-arm)
       const ops = readQueue().filter((o) => !o.parked && (o.notBefore ?? 0) <= Date.now());
@@ -898,7 +1055,10 @@ async function flushOnce(base: StaticStore): Promise<void> {
         if (op.kind === 'sync') await processSyncOp(base, cfg, op);
         else await processCloseOp(cfg, op);
         removeOp(op.id);
-        if (state) state.lastError = undefined;
+        // v0.6.6 (F10): clear the engine error on op success, but a pull
+        // warning (pagination truncation, malformed skips) describes remote
+        // state — it survives until the next pull
+        if (state) state.lastError = pullWarning ?? undefined;
       } catch (err) {
         // Hardening C07 (H-C-03): a 404 on a mapped thread's op means the
         // issue was DELETED on GitHub. Left alone, the op retried forever
@@ -927,8 +1087,13 @@ async function flushOnce(base: StaticStore): Promise<void> {
             }
           }
         }
-        const { transient } = bumpOp(op.id, err);
-        if (state) state.lastError = err instanceof Error ? err.message : String(err);
+        const { transient, parked } = bumpOp(op.id, err);
+        // v0.6.6 (F10): a parked op already set the thread-naming engine
+        // error inside bumpOp — do not clobber it with the raw message
+        if (state && !parked) state.lastError = err instanceof Error ? err.message : String(err);
+        // v0.6.6 (F2/V4): a definitive auth rejection — the baked config may
+        // have been rotated server-side; re-probe it on the next cycle
+        if ((err as { status?: number })?.status === 401) invalidateBakedConfig();
         if (!transient) return; // 401/404/422-parked — needs a settings/body fix, stop hammering
         return; // backoff applied — the sweep timer retries later
       }
@@ -936,6 +1101,18 @@ async function flushOnce(base: StaticStore): Promise<void> {
   } finally {
     if (state) {
       state.flushing = false;
+      // v0.6.6 (WAKE-LOSS): a wake arrived MID-flush and was latched above —
+      // honor it with exactly one more pass (the new pass no-ops harmlessly
+      // when there is still nothing to do; it cannot spin because a no-op
+      // pass does not latch another wake). This is what makes an engine
+      // RE-ENABLE (saveSettings) reliably drain a queue that piled up while
+      // disabled, even when the save's own flush collided with an in-flight
+      // cfg-null pass.
+      if (state.wakePending) {
+        state.wakePending = false;
+        void flushOnce(base);
+        return;
+      }
       // A wake that arrived MID-flush was swallowed by the guard above while
       // the in-flight loop had already read the queue — if anything is still
       // eligible, run another cycle immediately (failed ops carry notBefore,
@@ -964,10 +1141,11 @@ function systemComment(ghId: string, author: string, body: string): Comment {
 
 /** Import remote changes for mapped threads (engine pull parity): state flips
  *  and third-party comments. Sentinel-marked mirrors are never re-imported. */
-async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: number }> {
+async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: number; warning?: string }> {
   if (!state) return { pulled: 0, healed: 0 };
   const cfg = await probeGhConfig();
   if (!cfg) return { pulled: 0, healed: 0 };
+  pullWarning = null; // refreshed by this pull
   const pullStartedAt = new Date().toISOString();
   let pulled = 0;
   let healed = 0;
@@ -1027,10 +1205,16 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
     else if (issue.state === 'open' && t.status === 'resolved') statusChange = 'reopen';
 
     const since = mir.syncedAt;
-    const issueActive = !since || !issue.updated_at || issue.updated_at > since;
+    // v0.6.6 (F12): a syncedAt stamp in the FUTURE (a legacy skewed client
+    // wrote it with a local clock ahead of GitHub — v0.6.5 and earlier) gates
+    // the listing off until wall-clock time passes the stamp, which can take
+    // the full skew duration. Repair on sight: treat the thread as active
+    // and re-list WITHOUT a since filter (dedupe by ghId absorbs the overlap).
+    const futureStamp = Boolean(since) && Date.parse(String(since)) > Date.now() + SKEW_REPAIR_MS;
+    const issueActive = futureStamp || !since || !issue.updated_at || issue.updated_at > since;
     let fresh: GhCommentRemote[] = [];
     if (issueActive) {
-      const ghComments = await listIssueCommentsRemote(cfg, mir.issue, since);
+      const ghComments = await listIssueCommentsRemote(cfg, mir.issue, futureStamp ? undefined : since);
       const known = new Set(t.comments.map((c) => c.ghId).filter((x): x is string => Boolean(x)));
       // v0.6.1 hostile-input hardening (Track A, client edition): one
       // malformed remote comment (body/created_at not strings) used to
@@ -1043,8 +1227,10 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
         }
         if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
       }
-      if (malformed > 0 && state) {
-        state.lastError = `pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at)`;
+      if (malformed > 0) {
+        // v0.6.6 (F10): warning-scoped (see pullWarning) — the next success
+        // clear used to hide it
+        pullWarning = `pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at)`;
       }
       fresh.sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')));
     }
@@ -1096,8 +1282,11 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
         next.gh = {
           ...gh,
           state: issue.state,
-          // idle threads cost zero requests later (engine parity)
-          ...(issueActive ? { syncedAt: pullStartedAt } : {}),
+          // idle threads cost zero requests later (engine parity).
+          // v0.6.6 (F12): the high-water mark is the REMOTE updated_at
+          // (server clock) — a local-clock stamp made a skewed client miss
+          // third-party replies in the skew window FOREVER (SR-B P2-1).
+          ...(issueActive ? { syncedAt: issue.updated_at ?? pullStartedAt } : {}),
         };
       }
       await base.patch(next);
@@ -1106,7 +1295,8 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
   }
   // C30/H-E-02: persist the healed count for status()/syncNow notices
   if (state) state.lastHealedCount = healed;
-  return { pulled, healed };
+  if (state && pullWarning) state.lastError = pullWarning; // immediate visibility
+  return { pulled, healed, warning: pullWarning ?? undefined };
 }
 
 function startRuntime(base: StaticStore): void {
@@ -1138,6 +1328,25 @@ function startRuntime(base: StaticStore): void {
   // C08: claim the cross-tab leadership lease BEFORE the boot drain — a
   // second manager window with a healthy foreign lease stays follower here.
   state.leader = claimLeadership();
+  // v0.6.6 (F5): release the lease on pagehide (reload / tab close) so our
+  // reloaded successor — same sessionStorage tabId but a fresh nonce — is
+  // NOT blocked by its own ghost lease for a full TTL. Only OUR lease is
+  // released (id+nonce match); a duplicate tab's pagehide can't free the
+  // original's lease. Crashes (no pagehide) fall back to the TTL takeover.
+  window.addEventListener('pagehide', () => {
+    try {
+      const store = ls();
+      if (!store) return;
+      const raw = store.getItem(leaderKey());
+      if (!raw) return;
+      const cur = JSON.parse(raw) as { id?: string; nonce?: string };
+      if (cur && typeof cur === 'object' && cur.id === tabId() && cur.nonce === docNonce) {
+        store.removeItem(leaderKey());
+      }
+    } catch {
+      /* best effort — the TTL takeover covers us */
+    }
+  });
   // NEW-3 (wave-4): followers install the SAME tick — a follower whose
   // leader tab died re-claims the stale lease and PROMOTES itself (closing
   // the last manager tab used to silently stall mirroring in every
@@ -1159,6 +1368,9 @@ function startRuntime(base: StaticStore): void {
     }
     renewLeadership(st); // keep the lease alive; demote if another tab won
     void (async () => {
+      // v0.6.6 (F4/SR-B P3-1): renewLeadership may have JUST demoted this
+      // tab — do not pull as a follower (the next tick re-claims first)
+      if (!st.leader) return;
       const cfg = await probeGhConfig();
       if (!cfg || cfg.pollMs <= 0) return;
       // H-B-10: honor a rate-limit backoff (Retry-After / x-ratelimit-reset)
@@ -1170,12 +1382,21 @@ function startRuntime(base: StaticStore): void {
         const pulled = await pullOnce(base);
         st.lastPullAt = new Date().toISOString();
         st.lastPullCount = pulled.pulled;
-        st.lastError = undefined;
+        // v0.6.6 (F10/SR-D N1): success clears the ENGINE error but keeps a
+        // pull-scoped warning alive (it describes remote state)
+        st.lastError = pulled.warning;
         st.pullBackoffUntil = 0;
       } catch (err) {
         st.lastError = err instanceof Error ? err.message : String(err);
         const retryMs = Number((err as { retryMs?: number })?.retryMs);
         if (retryMs > 0) st.pullBackoffUntil = Date.now() + retryMs;
+        // v0.6.6 (F11/F2): a definitive 401 backs the pull off (it re-hammers
+        // every pollMs today) AND invalidates the baked-config cache — the
+        // token may have been rotated server-side in a re-bake
+        if ((err as { status?: number })?.status === 401) {
+          st.pullBackoffUntil = Date.now() + PULL_401_BACKOFF_MS;
+          invalidateBakedConfig();
+        }
       }
     })();
   }, 5_000);
@@ -1220,21 +1441,27 @@ function buildStatus(): GhClientStatus {
   const resolved = resolveGhConfig(resolvedBaked, override);
   const ops = readQueue();
   const suppressed = Boolean(override?.disabled);
+  // v0.6.6 (F1): a NON-EMPTY saved token shadows the baked config (an
+  // empty/whitespace one is treated as absent by resolveGhConfig — legacy
+  // v0.6.5 state self-heals to the baked token instead of disarming it).
+  const tokenOverridden = typeof override?.token === 'string' && override.token.trim().length > 0;
   return {
     configured: Boolean(resolved) || suppressed,
     suppressed,
     repo: resolved?.repo ?? override?.repo ?? null,
     labels: resolved?.labels ?? override?.labels ?? [],
     leader: state?.leader ?? false,
+    tokenOverridden,
     queue: ops.filter((o) => !o.parked).length,
     parked: ops.filter((o) => Boolean(o.parked)).length,
     flushing: state?.flushing ?? false,
-    // parked errors FIRST (terminal + name the thread), then persistent
-    // mirror-heal failures (H-H-04), then the transient engine error.
+    // v0.6.6 (F10): the LIVE engine error leads — a fresh 401 must never be
+    // masked by a terminal parked op or a persistent (but stale) mirror-heal
+    // error; those persist below (parked stays visible via status().parked).
     lastError:
+      state?.lastError ||
       ops.find((o) => o.parked && o.lastError)?.lastError ||
       state?.lastMirrorError ||
-      state?.lastError ||
       ops.find((o) => o.lastError)?.lastError,
     lastPushAt: state?.lastPushAt,
     lastPullAt: state?.lastPullAt,
@@ -1305,24 +1532,67 @@ export async function getGhLinkedStaticStore(): Promise<LinkedStaticStore> {
         return;
       }
       clearOpBackoff(); // the user just changed the config — retry NOW, not after the old backoff
+      if (state) state.pullBackoffUntil = 0; // v0.6.6 (F11): a config change also clears a 401 pull backoff
       if (state?.leader) void flushOnce(base);
     },
     clearSettings() {
       const store = ls();
       if (store) store.removeItem(cfgKey());
       clearOpBackoff();
+      if (state) state.pullBackoffUntil = 0;
+      if (state?.leader) void flushOnce(base);
+    },
+    /** v0.6.6 (F1/V1): remove ONLY the token from the localStorage override —
+     *  the baked annotakit-gh.json token applies again (repo/labels/pollMs
+     *  overrides survive). The recovery path for "an old saved token shadows
+     *  every re-bake" that does not require nuking all overrides. */
+    clearTokenOverride() {
+      const store = ls();
+      const cur = readOverride();
+      if (!store || !cur || !('token' in cur)) return;
+      const rest = { ...cur } as Partial<GhClientSettings>;
+      delete rest.token;
+      try {
+        if (Object.keys(rest).length === 0) store.removeItem(cfgKey());
+        else store.setItem(cfgKey(), JSON.stringify(rest));
+      } catch {
+        return; // quota/privacy — nothing changed, keep the old override
+      }
+      clearOpBackoff();
+      if (state) state.pullBackoffUntil = 0;
       if (state?.leader) void flushOnce(base);
     },
     async syncNow() {
-      if (state?.leader) {
-        state.pullBackoffUntil = 0; // a manual sync overrides rate-limit backoff
-        await flushOnce(base);
-        const r = await pullOnce(base);
-        if (state) {
-          state.lastPullAt = new Date().toISOString();
-          state.lastPullCount = r.pulled;
-          state.lastHealedCount = r.healed;
+      // v0.6.6 (F3/V5): a follower's manual sync used to be a SILENT no-op —
+      // the button fabricated success while zero network happened. Claim the
+      // lease (manual intent); if a healthy holder (another tab, or this
+      // tab's own reloaded predecessor's ghost) keeps it, say so honestly.
+      if (!state?.leader) {
+        if (!claimLeadership()) {
+          if (state) state.lastError = leaseHeldMessage();
+          return;
         }
+        if (state) state.leader = true;
+        else return; // runtime torn down mid-call — nothing to do
+      }
+      if (state) state.pullBackoffUntil = 0; // a manual sync overrides rate-limit/401 backoff
+      clearOpBackoff(); // v0.6.6: …and op backoff too — "Sync now" means retry NOW
+      await flushOnce(base);
+      let r: { pulled: number; healed: number; warning?: string };
+      try {
+        r = await pullOnce(base);
+      } catch (err) {
+        if ((err as { status?: number })?.status === 401) invalidateBakedConfig();
+        throw err;
+      }
+      if (state) {
+        state.lastPullAt = new Date().toISOString();
+        state.lastPullCount = r.pulled;
+        state.lastHealedCount = r.healed;
+        // v0.6.6 (SR-D N1): a successful manual sync clears the stale engine
+        // error (tick parity) — the old error used to linger up to a minute
+        // after recovery, contradicting the green dot. A pull warning stays.
+        state.lastError = r.warning;
       }
     },
   };
@@ -1340,7 +1610,11 @@ export function __ghResetForTests(): void {
   state?.tickTimer && clearInterval(state.tickTimer);
   state = null;
   bakedPromise = null;
+  bakedLandedNull = false;
+  bakedNullRetryAt = 0;
+  pullWarning = null; // SR-W2 P3: cross-scenario pollution vector
   resolvedBaked = null;
   docId = null;
+  docNonce = `n_${Math.random().toString(36).slice(2, 10)}`; // v0.6.6 (F5): fresh nonce per "document"
   setWake(() => undefined);
 }

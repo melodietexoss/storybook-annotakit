@@ -47,10 +47,20 @@ globalThis.sessionStorage = sessionShim;
 let pageUrl = 'https://site.test/stories/index.html';
 let parentOverride = undefined; // undefined → self-parent (leader doc)
 
+/** v0.6.6: real listener capture — the module's pagehide lease-release
+ *  (F5) must actually fire in reload(), like a browser does. */
+const windowListeners = new Map();
+
+let bakedFetchCount = 0;
+
 globalThis.localStorage = storageShim;
 globalThis.document = { get baseURI() { return new URL('iframe.html', pageUrl).href; } };
 globalThis.window = {
-  addEventListener() {},
+  addEventListener(type, fn) {
+    if (!windowListeners.has(type)) windowListeners.set(type, []);
+    windowListeners.get(type).push(fn);
+  },
+  removeEventListener() {},
   get location() { return new URL(pageUrl); },
   get parent() { return parentOverride ?? globalThis.window; },
 };
@@ -62,6 +72,7 @@ let bakedConfig = null; // annotakit-gh.json body served by the fetch shim
 globalThis.fetch = async (url) => {
   const u = String(url);
   if (u.includes('annotakit-gh.json')) {
+    bakedFetchCount++;
     if (bakedConfig) return { ok: true, status: 200, json: async () => bakedConfig };
     return { ok: false, status: 404, json: async () => ({}) };
   }
@@ -78,8 +89,9 @@ function makeFakeGH() {
     issues: new Map(), // number → {number, state, title, body, labels, comments: [], updated_at, closed_at, closed_by}
     nextNumber: 101,
     nextCommentId: 9001,
-    calls: [], // {method, path, body}
+    calls: [], // {method, path, body, auth}
     failNext: null, // {match, status, body} — one-shot failure
+    stallNext: null, // v0.6.6 (F4): {match, promise} — hold a call in-flight (lease-loss mid-flush)
   };
   const issueOut = (i) => ({
     number: i.number, state: i.state, title: i.title, body: i.body, html_url: `https://github.com/fake/i/${i.number}`,
@@ -99,7 +111,12 @@ function makeFakeGH() {
       else gh.failNext = null;
       return { ok: false, status: f.status, text: async () => f.body ?? '', json: async () => ({}), headers };
     }
-    gh.calls.push({ method, path, query: u.search, body: init.body ? JSON.parse(init.body) : null }); if (process.env.GHDBG) console.error('[gh-transport]', method, path, init.body ? String(init.body).slice(0,80) : '');
+    if (gh.stallNext && gh.stallNext.match.test(path)) {
+      const s = gh.stallNext;
+      gh.stallNext = null;
+      await s.promise;
+    }
+    gh.calls.push({ method, path, query: u.search, body: init.body ? JSON.parse(init.body) : null, auth: (init.headers ?? {})['Authorization'] ?? null }); if (process.env.GHDBG) console.error('[gh-transport]', method, path, init.body ? String(init.body).slice(0,80) : '');
     const auth = (init.headers ?? {})['Authorization'];
     if (!auth || !auth.includes('tok_')) {
       return { ok: false, status: 401, text: async () => 'bad token', json: async () => ({}), headers };
@@ -111,7 +128,7 @@ function makeFakeGH() {
       const issue = gh.issues.get(Number(m[2]));
       if (!issue) return { ok: false, status: 404, text: async () => 'Not Found', json: async () => ({}), headers };
       const body = JSON.parse(init.body);
-      const comment = { id: gh.nextCommentId++, body: body.body, created_at: new Date().toISOString(), user: { login: 'storybook-annotakit' }, html_url: `https://github.com/fake/c/${gh.nextCommentId}` };
+      const comment = { id: gh.nextCommentId++, body: body.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), user: { login: 'storybook-annotakit' }, html_url: `https://github.com/fake/c/${gh.nextCommentId}` };
       issue.comments.push(comment);
       issue.updated_at = new Date().toISOString();
       return { ok: true, status: 201, json: async () => comment, headers };
@@ -209,17 +226,23 @@ async function fresh(baked) {
   ghc.__ghSetTransportForTests(gh.transport);
   bakedConfig = baked;
   storageShim.clear();
+  windowListeners.clear(); // a fresh scenario is a NEW TAB — its document has no listeners
   sessionShim.clear(); // a fresh scenario is a NEW TAB — new leadership identity
   gh.calls.length = 0;
   return ghc;
 }
 
-/** Simulate a full page RELOAD: module caches dropped, localStorage contents
- *  survive exactly as a browser would keep them — and sessionStorage (the
- *  per-tab id behind the C08 leadership lease) survives too, so the reloaded
- *  document re-claims its own predecessor's lease instead of waiting for the
- *  TTL (the regression the reload-durability test caught). */
+/** Simulate a full page RELOAD: the browser fires `pagehide` on the OLD
+ *  document (releasing the F5 leadership lease — id+nonce match), module
+ *  caches drop, localStorage contents survive exactly as a browser would
+ *  keep them — and sessionStorage (the per-tab id behind the C08 lease)
+ *  survives too, so the reloaded document re-claims its own predecessor's
+ *  lease instantly instead of waiting for the TTL. */
 async function reload(baked, { zeroBackoff = false } = {}) {
+  for (const fn of windowListeners.get('pagehide') ?? []) {
+    try { fn(); } catch { /* best effort */ }
+  }
+  windowListeners.clear(); // the old document's listeners are gone
   const dump = storageShim._dump();
   const sessionDump = sessionShim._dump();
   if (zeroBackoff) {
@@ -241,6 +264,14 @@ async function reload(baked, { zeroBackoff = false } = {}) {
 const queueOps = (ghc) => {
   const raw = storageShim._dump()[`annotakit:ghq:https://site.test/stories/`];
   return raw ? JSON.parse(raw).ops : [];
+};
+
+/** Fire the captured pagehide listeners (what a browser does on reload/tab
+ *  close) without dropping module state — the F5 lease-release path. */
+const firePagehide = () => {
+  for (const fn of windowListeners.get('pagehide') ?? []) {
+    try { fn(); } catch { /* best effort */ }
+  }
 };
 
 /* ------------------------------- scenarios ---------------------------------- */
@@ -825,6 +856,206 @@ let createdThread;
   const serverCands = serverExports.legacyServerBodyCandidates(serverFixtureThread, { origin: 'http://localhost:6006', relPath: (p) => p });
   const serverWantB = "# UI review — Button\n\n1 open / 0 resolved · 2026-09-21 20:57\nstorybook: http://localhost:6006\n\n## Button / primary\n\nstory id: `s1`\nstory file: src/Button.stories.tsx\nopen: http://localhost:6006/?path=/story/s1\n\n### #3 OPEN — first note line one and a second line that is quite long indeed yes\n\n- story: Button/primary (src/Button.stories.tsx)\n- thread id: th_fixture\n- component: KpiCard\n- jsx: src/KpiCard.tsx:12\n- chain: Dashboard > KpiCard\n- element: <span \"Revenue\">\n- selector: span.value\n\n---\n\nAgent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then resolve the thread — close this issue (the Storybook review thread mirrors it automatically). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.\n";
   ok('FIXTURE: server variant-B body byte-exact after dateNorm (YYYY-MM-DD status line + "Storybook" footer)', dateNorm(serverCands[1]) === dateNorm(serverWantB), JSON.stringify(dateNorm(serverCands[1])?.slice(0, 160)));
+}
+
+/* 23 — v0.6.6 (V1/F1): sticky override token — the live incident. An old
+ * saved token shadows every re-bake; status must SAY so (tokenOverridden),
+ * and clearTokenOverride() restores the baked token surgically. */
+{
+  const ghc23 = await fresh({ token: 'tok_BAKE', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc23.getGhLinkedStaticStore();
+  await store.create(threadInput('th_sticky'));
+  await until(() => queueOps(ghc23).length === 0, 'baked create drains');
+  ok('baked token created the issue', [...gh.issues.values()].some((i) => i.body.includes('th_sticky')));
+  // an old PAT saved in THIS browser (the fake rejects it — no 'tok_')
+  store.gh?.saveSettings({ token: 'ghp_old_dead', labels: ['ws-x'] });
+  await store.addComment('th_sticky', 'reply under a dead override', 'reviewer');
+  await until(() => queueOps(ghc23).some((o) => o.lastError), 'reply fails with 401');
+  const st = store.gh?.status();
+  ok('override token flagged (tokenOverridden)', st?.tokenOverridden === true);
+  ok('401 surfaced in status', String(st?.lastError ?? '').includes('401'));
+  ok('op kept queued (feedback never dropped)', queueOps(ghc23).some((o) => o.kind === 'sync' && o.threadId === 'th_sticky'));
+  // surgical recovery: drop ONLY the token — the labels override survives
+  store.gh?.clearTokenOverride();
+  await until(() => queueOps(ghc23).length === 0, 'drains under the baked token again');
+  ok('tokenOverridden cleared', store.gh?.status()?.tokenOverridden === false);
+  const cfgRaw = JSON.parse(storageShim._dump()['annotakit:ghcfg:https://site.test/stories/'] ?? '{}');
+  ok('labels override survived the token clear', Array.isArray(cfgRaw.labels) && cfgRaw.labels.includes('ws-x') && !('token' in cfgRaw));
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_sticky'));
+  ok('reply mirrored under the baked token', Boolean(issue?.comments.some((c) => c.body.includes('reply under a dead override'))));
+}
+
+/* 24 — v0.6.6 (F2/V3/V4): a 401 invalidates the baked-config cache — a LIVE
+ * tab picks up a re-baked token WITHOUT a reload (stale-leader poison fix). */
+{
+  const ghc24 = await fresh({ token: 'ghp_dead_at_bake', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc24.getGhLinkedStaticStore();
+  await store.create(threadInput('th_rebake'));
+  await until(() => queueOps(ghc24).some((o) => o.lastError), 'dead baked token 401s');
+  ok('no issue while the baked token is dead', ![...gh.issues.values()].some((i) => i.body.includes('th_rebake')));
+  // the operator re-bakes annotakit-gh.json with a GOOD token
+  bakedConfig = { token: 'tok_REBAKED', repo: 'acme/web', pollMs: 600_000 };
+  const before = bakedFetchCount;
+  store.gh?.saveSettings({}); // flush → 401 → invalidate → async re-probe
+  await until(() => bakedFetchCount > before, 'baked config re-probed after the 401');
+  store.gh?.saveSettings({}); // next flush resolves the FRESH baked config
+  await until(() => queueOps(ghc24).length === 0, 'drains under the re-baked token');
+  const createCall = gh.calls.find((c) => c.method === 'POST' && c.path === '/repos/acme/web/issues' && c.auth?.includes('tok_REBAKED'));
+  ok('create used the re-baked token', Boolean(createCall));
+  ok('exactly one issue after the re-bake', [...gh.issues.values()].filter((i) => i.body.includes('th_rebake')).length === 1);
+}
+
+/* 25 — v0.6.6 (F2/SR-A N3): a null baked probe (404 during a partial deploy)
+ * is cached WITH a cooldown — no refetch storm, no eternal misdiagnosis. */
+{
+  bakedConfig = null;
+  const ghc25 = await fresh(null);
+  const store = await ghc25.getGhLinkedStaticStore();
+  await ghc25.ghClientStatus(); // let the initial probe's candidate fetches settle
+  const st = store.gh?.status();
+  ok('unconfigured when the baked file 404s', st?.configured === false && st?.tokenOverridden === false);
+  const n = bakedFetchCount;
+  await ghc25.ghClientStatus();
+  await ghc25.ghClientStatus();
+  await store.gh?.syncNow();
+  ok('null probe cached within the cooldown (no fetch storm)', bakedFetchCount === n);
+}
+
+/* 26 — v0.6.6 (F5/F3): lease nonce — a duplicated tab (same tabId, different
+ * nonce) can never treat the lease as its own; a v0.6.5-format lease is
+ * takeover-eligible (rolling upgrade); pagehide releases ONLY our lease. */
+{
+  const ghc26 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const LEASE = 'annotakit:ghleader:https://site.test/stories/';
+  sessionShim.setItem('annotakit:tabid', 'tab_known'); // this doc's tab id
+  storageShim.setItem(LEASE, JSON.stringify({ id: 'tab_known', nonce: 'n_evil_duplicate', at: Date.now() }));
+  const store = await ghc26.getGhLinkedStaticStore(); // claims → BLOCKED (duplicate-tab shape)
+  ok('duplicated-tab lease blocks leadership', store.gh?.status()?.leader === false);
+  const callsBefore = gh.calls.length;
+  await store.gh?.syncNow();
+  ok('follower syncNow: zero network + honest lease error', gh.calls.length === callsBefore && String(store.gh?.status()?.lastError ?? '').includes('lease'));
+  // v0.6.5-format foreign lease (no nonce): healthy → still blocks
+  storageShim.setItem(LEASE, JSON.stringify({ id: 'tab_v065', at: Date.now() }));
+  await store.gh?.syncNow();
+  ok('v0.6.5 foreign lease still blocks (no regression)', store.gh?.status()?.leader === false && gh.calls.length === callsBefore);
+  // v0.6.5-format lease from OUR tab id: takeover-eligible (upgrade heals ≤1 TTL)
+  storageShim.setItem(LEASE, JSON.stringify({ id: 'tab_known', at: Date.now() }));
+  await store.gh?.syncNow();
+  ok('v0.6.5 same-id nonceless lease is takeover-eligible', store.gh?.status()?.leader === true && gh.calls.length > callsBefore);
+  const mine = JSON.parse(storageShim._dump()[LEASE] ?? '{}');
+  ok('re-claim wrote the v0.6.6 nonce format', typeof mine.nonce === 'string' && mine.nonce.length > 0);
+  // pagehide releases ONLY our own lease
+  storageShim.setItem(LEASE, JSON.stringify({ id: 'tab_known', nonce: 'n_not_ours', at: Date.now() }));
+  firePagehide();
+  ok('pagehide does NOT release a lease that is not ours', storageShim._dump()[LEASE] !== undefined);
+  storageShim.setItem(LEASE, JSON.stringify(mine));
+  firePagehide();
+  ok('pagehide releases OUR lease (reload reclaims instantly)', storageShim._dump()[LEASE] === undefined);
+}
+
+/* 27 — v0.6.6 (F4/SR-B W1): comment-drain lease loss — the per-comment renew
+ * aborts with a transient error (op re-queued; the new leader continues the
+ * delta from the ghId stamps — NO duplicate writes). The engine is paused
+ * (disabled) while both replies enqueue so the op's snapshot has both. */
+{
+  const ghc27 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc27.getGhLinkedStaticStore();
+  await store.create(threadInput('th_midflush'));
+  await until(() => queueOps(ghc27).length === 0, 'created');
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_midflush'));
+  store.gh?.saveSettings({ disabled: true }); // pause: enqueue without flushing
+  await store.addComment('th_midflush', 'first reply', 'reviewer');
+  await store.addComment('th_midflush', 'second reply', 'reviewer');
+  ok('both replies queued while paused', queueOps(ghc27).some((o) => o.kind === 'sync' && o.threadId === 'th_midflush'));
+  // stall the FIRST comment POST; while in-flight another tab takes the lease
+  let release;
+  gh.stallNext = { match: /\/comments$/, promise: new Promise((r) => (release = r)) };
+  store.gh?.saveSettings({ disabled: false }); // resume → flush → POST stalls
+  await sleep(120); // let the flush reach the stalled call
+  storageShim.setItem('annotakit:ghleader:https://site.test/stories/', JSON.stringify({ id: 'tab_other', nonce: 'n_other', at: Date.now() }));
+  release(); // the stalled comment lands; the NEXT comment's renew aborts
+  await until(() => queueOps(ghc27).some((o) => o.lastError), 'op re-queued with the lease-lost error');
+  ok('only ONE comment landed (no duplicate writes)', (issue?.comments ?? []).length === 1);
+  ok('op re-queued after the transient lease loss', queueOps(ghc27).some((o) => o.kind === 'sync' && o.threadId === 'th_midflush' && (o.attempts ?? 0) >= 1));
+  ok('this doc demoted', store.gh?.status()?.leader === false);
+  // reclaim (expired foreign lease) + manual sync finishes the drain
+  storageShim.setItem('annotakit:ghleader:https://site.test/stories/', JSON.stringify({ id: 'tab_other', nonce: 'n_other', at: Date.now() - 46_000 }));
+  await store.gh?.syncNow();
+  await until(() => queueOps(ghc27).length === 0, 'drain completes after reclaim');
+  const bodies = (issue?.comments ?? []).map((c) => c.body);
+  ok('both replies mirrored exactly once each', bodies.filter((b) => b.includes('first reply')).length === 1 && bodies.filter((b) => b.includes('second reply')).length === 1);
+}
+
+/* 28 — v0.6.6 (F12): server-clock high-water marks — create stamps from the
+ * REMOTE updated_at; a legacy FUTURE-dated syncedAt (skewed v0.6.5 client)
+ * is repaired on sight instead of missing replies for the skew duration. */
+{
+  const ghc28 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc28.getGhLinkedStaticStore();
+  await store.create(threadInput('th_clock'));
+  await until(() => queueOps(ghc28).length === 0, 'created');
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_clock'));
+  const t = store.list().find((x) => x.id === 'th_clock');
+  ok('create stamped syncedAt from the REMOTE updated_at (server clock)', t?.gh?.syncedAt === issue?.updated_at);
+  // legacy skewed state: syncedAt 10 minutes in the FUTURE
+  const future = new Date(Date.now() + 10 * 60_000).toISOString();
+  await store.patch({ ...t, gh: { ...t.gh, syncedAt: future } });
+  issue.comments.push({ id: 424242, body: 'third-party reply during skew', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), user: { login: 'human' } });
+  issue.updated_at = new Date().toISOString();
+  await store.gh?.syncNow();
+  const t2 = store.list().find((x) => x.id === 'th_clock');
+  ok('skewed-window reply imported (future-stamp repair)', Boolean(t2?.comments.some((c) => c.body.includes('third-party reply during skew'))));
+  ok('syncedAt reset to the server clock', t2?.gh?.syncedAt === issue.updated_at);
+}
+
+/* 29 — v0.6.6 (F10/SR-D N1): a LIVE 401 leads the status line over a stale
+ * parked error; a successful manual sync clears the stale engine error (the
+ * parked error becomes visible again — not masked, not permanent). */
+{
+  const ghc29 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc29.getGhLinkedStaticStore();
+  gh.failNext = { match: /\/issues$/, status: 422, body: 'Validation Failed', count: 2 }; // listing + create
+  await store.create(threadInput('th_parked29'));
+  await until(() => (store.gh?.status()?.parked ?? 0) === 1, 'op parked (422)');
+  gh.failNext = null;
+  store.gh?.saveSettings({ token: 'ghp_dead29' });
+  await store.create(threadInput('th_auth29'));
+  await until(() => String(store.gh?.status()?.lastError ?? '').includes('401'), 'live 401 state error');
+  const st = store.gh?.status();
+  ok('live 401 leads over the stale parked error', String(st?.lastError ?? '').includes('401') && !String(st?.lastError ?? '').includes('parked'));
+  // recovery: baked token applies again + manual sync succeeds
+  store.gh?.clearTokenOverride();
+  await store.gh?.syncNow();
+  await until(() => queueOps(ghc29).filter((o) => !o.parked).length === 0, 'auth thread drained');
+  const st2 = store.gh?.status();
+  ok('stale 401 cleared after the successful manual sync', !String(st2?.lastError ?? '').includes('401'));
+  ok('parked error visible again (not masked, not lost)', String(st2?.lastError ?? '').includes('parked') && (st2?.parked ?? 0) === 1);
+}
+
+/* 30 — v0.6.6 (SR-W2 P2#1): a 401 invalidation whose re-probe lands NULL
+ * (mid-deploy 404) must NOT latch forever — after the cooldown the probe
+ * re-fetches and the tab picks up the restored baked config WITHOUT reload. */
+{
+  const ghc30 = await fresh({ token: 'ghp_dead30', repo: 'acme/web', pollMs: 600_000 });
+  ghc30.__setBakedNullRetryMsForTests(80); // shrink the cooldown for the test
+  const store = await ghc30.getGhLinkedStaticStore();
+  await store.create(threadInput('th_latch'));
+  bakedConfig = null; // the re-deploy window: the baked file 404s RIGHT NOW
+  await until(() => queueOps(ghc30).some((o) => o.lastError), '401 fired');
+  await sleep(30); // let the invalidation re-probe land NULL
+  const n = bakedFetchCount;
+  await ghc30.ghClientStatus();
+  ok('landed-null probe cached within the cooldown', bakedFetchCount === n);
+  await sleep(90); // cooldown (80ms) expires
+  bakedConfig = { token: 'tok_RESTORED', repo: 'acme/web', pollMs: 600_000 }; // the deploy completes
+  const st30 = await ghc30.ghClientStatus();
+  ok('probe re-fetched after the cooldown (no forever-latch)', st30.configured === true && st30.tokenOverridden === false, `configured=${st30.configured}`);
+  store.gh?.saveSettings({}); // clear op backoff → flush with the restored config
+  await until(() => queueOps(ghc30).length === 0, 'drains under the restored baked token');
+  const createCall = gh.calls.find((c) => c.method === 'POST' && c.path === '/repos/acme/web/issues' && c.auth?.includes('tok_RESTORED'));
+  ok('create used the RESTORED baked token (self-healed, no reload)', Boolean(createCall));
+  ok('exactly one issue', [...gh.issues.values()].filter((i) => i.body.includes('th_latch')).length === 1);
+  ghc30.__setBakedNullRetryMsForTests(60_000);
 }
 
 /* cleanup + summary */

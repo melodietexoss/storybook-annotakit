@@ -101,6 +101,12 @@ export interface GhSyncOptions {
 const RETRY_LIMIT = 4;
 const RETRY_MAX_DELAY_MS = 30_000;
 const STALLED_SWEEP_MS = 10 * 60_000;
+/** v0.6.6 (F11): a definitive 401 on the poll path backs off 5 minutes —
+ *  pollSec (60s) would be no backoff at all. */
+const PULL_401_BACKOFF_MS = 5 * 60_000;
+/** v0.6.6 (F12): a syncedAt stamp ahead of the wall clock by more than this
+ *  is a legacy skewed stamp — repaired on sight (see pullOnceRaw). */
+const SKEW_REPAIR_MS = 5 * 60_000;
 
 export function createGhSync(opts: GhSyncOptions): GhSync {
   const { store, repo, token, configPath } = opts;
@@ -127,6 +133,39 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
   let lastPullAt: string | null = null;
   let lastError: string | null = null;
   let backoffUntil = 0;
+  // v0.6.6 (F7/SR-C-02): machine-readable auth state — /health consumers
+  // could never tell "token rejected" from "never exercised" from "healthy"
+  // (agentSurfaces.github stays true through a total auth outage).
+  let tokenState: 'missing' | 'unexercised' | 'ok' | 'rejected' = token() ? 'unexercised' : 'missing';
+  let lastAuthError: string | null = null;
+  let lastTokenSeen: string | undefined = token();
+  const noteAuthFailure = (err: unknown): void => {
+    if ((err as { status?: number })?.status === 401) {
+      tokenState = 'rejected';
+      lastAuthError = err instanceof Error ? err.message.slice(0, 300) : String(err);
+    }
+  };
+  /** A rotated token (via POST /annotakit/api/gh/reload) resets a rejected
+   *  state so /health reports the fresh attempt honestly — and clears a
+   *  401-driven backoff: the new token deserves an immediate chance, not a
+   *  5-minute silent wait. */
+  const noteTokenRotation = (): void => {
+    const tk = token();
+    if (tk !== lastTokenSeen) {
+      const wasRejected = tokenState === 'rejected';
+      lastTokenSeen = tk;
+      // SR-W2: 'missing' was a one-way latch — a token APPEARING (unconfigured
+      // boot + reload) left /health reporting 'missing' forever while the
+      // mirror worked. Transition BOTH directions on any value change.
+      if (tk) {
+        if (tokenState === 'rejected' || tokenState === 'missing') tokenState = 'unexercised';
+      } else {
+        tokenState = 'missing';
+        lastAuthError = null;
+      }
+      if (wasRejected) backoffUntil = 0;
+    }
+  };
   // sweep anchor = engine creation (boot), NOT epoch 0 — /health must never
   // report "next sweep at 1970" before the first sweep has run
   let lastStalledSweep = Date.now();
@@ -151,6 +190,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     const n = (retries.get(id) ?? 0) + 1;
     const message = err instanceof Error ? err.message : String(err);
     if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
+    noteAuthFailure(err); // v0.6.6 (F7): a 401 is an AUTH-STATE event, not just a task failure
     if (n <= RETRY_LIMIT && (e.status ?? 0) !== 401 && (e.status ?? 0) !== 404) {
       retries.set(id, n);
       notBefore.set(id, Date.now() + Math.min(intervalMs * 2 ** (n - 1), RETRY_MAX_DELAY_MS));
@@ -283,7 +323,8 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       if (orphan) {
         const adopted = await store.mutateThread(id, (cur) => {
           if (cur.gh) return; // raced — keep the existing mapping
-          cur.gh = { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: nowIso() };
+          // v0.6.6 (F12): server-clock high-water mark (engine parity with ghClient)
+          cur.gh = { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: orphan.updated_at ?? nowIso() };
         });
         if (adopted) {
           opts.onEngineMutation(adopted, 'updated');
@@ -297,7 +338,8 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       // in flight (1–3s). Persist the mapping atomically; if the thread is
       // gone, close the just-created issue immediately — no orphan mirrors.
       const still = await store.mutateThread(id, (cur) => {
-        cur.gh = { issue: created.number, url: created.html_url, state: 'open', syncedAt: nowIso() };
+        // v0.6.6 (F12): stamp from the REST response (server clock)
+        cur.gh = { issue: created.number, url: created.html_url, state: 'open', syncedAt: created.updated_at ?? nowIso() };
         // every comment so far is part of the issue body — mark as mirrored so
         // later pushes only send NEW replies as comments
         for (const c of cur.comments) {
@@ -324,11 +366,13 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     }
 
     let pushed = 0;
+    let remoteStamp: string | undefined; // v0.6.6 (F12): last REST-response server timestamp
 
     // 1. new local replies → issue comments (exact dedupe via ghId)
     for (const c of t.comments) {
       if (c.ghId || c.source === 'github') continue;
       const gh = await addIssueComment(tk, rp, t.gh.issue, mirrorBody(c));
+      remoteStamp = gh.updated_at ?? gh.created_at ?? remoteStamp;
       // merge-by-comment-id: a concurrent user edit to the same thread is safe
       const after = await store.mutateThread(id, (cur) => {
         const target = cur.comments.find((x) => x.id === c.id);
@@ -343,18 +387,19 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     const want = mirrorStateOf(t.status);
     if (t.gh.state !== want) {
       await addIssueComment(tk, rp, t.gh.issue, want === 'closed' ? resolutionNotice(t) : reopenNotice(t));
-      await setIssueState(tk, rp, t.gh.issue, want);
+      const flipped = await setIssueState(tk, rp, t.gh.issue, want);
+      remoteStamp = flipped.updated_at ?? remoteStamp;
       const after = await store.mutateThread(id, (cur) => {
         if (cur.gh) {
           cur.gh.state = want;
-          cur.gh.syncedAt = nowIso();
+          cur.gh.syncedAt = flipped.updated_at ?? nowIso();
         }
       });
       if (after) opts.onEngineMutation(after, 'updated');
       pushed++;
     } else if (pushed > 0) {
       const after = await store.mutateThread(id, (cur) => {
-        if (cur.gh) cur.gh.syncedAt = nowIso();
+        if (cur.gh) cur.gh.syncedAt = remoteStamp ?? nowIso();
       });
       if (after) opts.onEngineMutation(after, 'updated');
     }
@@ -529,10 +574,15 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       else if (issue.state === 'open' && t.status === 'resolved') statusChange = 'reopen';
 
       const since = mir.syncedAt;
-      const issueActive = !since || !issue.updated_at || issue.updated_at > since;
+      // v0.6.6 (F12, engine parity with ghClient): a syncedAt stamp in the
+      // FUTURE (legacy skewed writer) gates the listing off until wall-clock
+      // passes the stamp — repair on sight: treat as active, re-list WITHOUT
+      // a since filter (ghId dedupe absorbs the overlap).
+      const futureStamp = Boolean(since) && Date.parse(String(since)) > Date.now() + SKEW_REPAIR_MS;
+      const issueActive = futureStamp || !since || !issue.updated_at || issue.updated_at > since;
       let fresh: Awaited<ReturnType<typeof listIssueComments>> = [];
       if (issueActive) {
-        const ghComments = await listIssueComments(tk, rp, mir.issue, since);
+        const ghComments = await listIssueComments(tk, rp, mir.issue, futureStamp ? undefined : since);
         const known = new Set(t.comments.map((c) => c.ghId).filter((x): x is string => Boolean(x)));
         // v0.6.1 hostile-input hardening (Track A): GitHub issue comments are
         // ATTACKER-CONTROLLABLE data — one malformed comment (body not a
@@ -598,7 +648,9 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
             // (we consumed a listing that postdates it) — this is what makes
             // idle threads cost ZERO requests on later polls. Inactive threads
             // must NOT be rewritten every cycle (db churn / updatedAt noise).
-            if (issueActive) cur.gh.syncedAt = pullStartedAt;
+            // v0.6.6 (F12): the marker is the REMOTE updated_at (server clock)
+            // — a local-clock marker re-opened the skew permanent-miss class.
+            if (issueActive) cur.gh.syncedAt = issue.updated_at ?? pullStartedAt;
           }
         });
         if (after && reason) {
@@ -628,7 +680,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       if (!victim || queued.has(victim.id) || inflight.has(victim.id)) continue;
       const after = await store.mutateThread(victim.id, (cur) => {
         if (cur.gh) return; // raced — a mapping landed meanwhile; never steal
-        cur.gh = { issue: issue.number, url: issue.html_url, state: issue.state, syncedAt: pullStartedAt };
+        cur.gh = { issue: issue.number, url: issue.html_url, state: issue.state, syncedAt: issue.updated_at ?? pullStartedAt };
       });
       if (after) {
         opts.onEngineMutation(after, 'updated');
@@ -693,7 +745,12 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     void store.tombstone(issue).then(() => {
       // close promptly in auto mode; otherwise the next POST /sync does it
       if (opts.enabled && token() && repo) {
-        void run(pullOnceRaw).catch(() => undefined);
+        void run(pullOnceRaw).catch((err: unknown) => {
+          // v0.6.6 (F11/SR-C): this kick used to swallow 401s without even
+          // setting lastError — a dead token was invisible here
+          noteAuthFailure(err);
+          lastError = err instanceof Error ? err.message : String(err);
+        });
       }
     });
   };
@@ -740,11 +797,16 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       pulled = r.pulled;
       closedTombstones = r.closedTombstones;
       healed = r.healed;
+      if (tokenState === 'unexercised') tokenState = 'ok'; // v0.6.6 (F7): a successful pull proves the token
     } catch (err) {
       // pull failures (rate limit, transient) must not fail the whole sync —
       // pushes already landed; surface the pull problem via lastError/backoff.
-      const e = err as { retryMs?: number };
+      const e = err as { retryMs?: number; status?: number };
       if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
+      // v0.6.6 (F11): a definitive 401 re-hammered every pollSec — back the
+      // pull off 5 minutes (a reload/restart clears it via the token change)
+      noteAuthFailure(err);
+      if (e.status === 401) backoffUntil = Math.max(backoffUntil, Date.now() + PULL_401_BACKOFF_MS);
       lastError = err instanceof Error ? err.message : String(err);
     }
     // hard push failures outrank the pull's informational notes
@@ -789,6 +851,11 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       lastPullAt,
       lastError: Date.now() < backoffUntil ? (lastError ?? 'rate-limit backoff active') : lastError,
       backoffUntil: backoffUntil && Date.now() < backoffUntil ? new Date(backoffUntil).toISOString() : null,
+      // v0.6.6 (F7/SR-C-02): machine-readable auth state + the last 401 —
+      // /health consumers can finally tell "rejected" from "unexercised"
+      // from "healthy" without string-matching free-text lastError.
+      tokenState,
+      lastAuthError,
       // dogfood #4: recovery semantics must be observable — when will the
       // periodic sweep retry stalled threads (also: POST /sync, next mutation,
       // restart — the sweep is just the unattended one)
@@ -801,21 +868,33 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     if (started) return;
     started = true;
     if (!opts.enabled) {
-      console.warn('[storybook-annotakit] GH mirror: off (auto disabled by config/env) — local mode; POST /sync reconciles when configured');
+      console.warn('[storybook-annotakit] GH mirror: off (auto disabled by config/env) — local mode; POST /sync reconciles when configured (enable needs a restart)');
       return;
     }
+    // v0.6.6 (F8/SR-C-03): timers are installed even when UNCONFIGURED — the
+    // tick no-ops on an empty queue and pullOnceRaw early-returns on
+    // cfg.error with zero requests, so a token dropped into .env + POST
+    // /annotakit/api/gh/reload goes live WITHOUT a restart (the token is a
+    // lazy per-cycle getter). The unconfigured boot log stays honest about
+    // local mode.
     if (!token() || !repo) {
-      console.warn('[storybook-annotakit] GH mirror: unconfigured — local mode (threads + digests fully work). To mirror to GitHub, configure token+repo and restart.');
-      return;
+      console.warn('[storybook-annotakit] GH mirror: unconfigured — local mode (threads + digests fully work). To mirror to GitHub: set token+repo, then POST /annotakit/api/gh/reload (no restart needed) or restart.');
     }
-    workerTimer = setInterval(tick, intervalMs);
+    workerTimer = setInterval(() => {
+      noteTokenRotation(); // v0.6.6 (F7): a rotated token resets a rejected state
+      tick();
+    }, intervalMs);
     workerTimer.unref?.();
     if (opts.pollSec > 0) {
       pollTimer = setInterval(
         () => {
+          noteTokenRotation();
           void run(pullOnceRaw).catch((err) => {
-            const e = err as { retryMs?: number };
+            const e = err as { retryMs?: number; status?: number };
             if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
+            // v0.6.6 (F11): pull 401s back off instead of re-hammering
+            noteAuthFailure(err);
+            if (e.status === 401) backoffUntil = Math.max(backoffUntil, Date.now() + PULL_401_BACKOFF_MS);
             lastError = err instanceof Error ? err.message : String(err);
           });
         },
@@ -823,13 +902,15 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       );
       pollTimer.unref?.();
     }
-    console.warn(
-      `[storybook-annotakit] GH mirror: auto — every thread gets ONE issue; lifecycle (open/fixed/resolved, replies) syncs both ways${opts.pollSec > 0 ? `, pull every ${opts.pollSec}s` : ', pull on POST /sync'}`,
-    );
-    // initial backfill: unmapped threads get their issue; remote changes land
-    void run(syncAllRaw).catch((err) => {
-      lastError = err instanceof Error ? err.message : String(err);
-    });
+    if (token() && repo) {
+      console.warn(
+        `[storybook-annotakit] GH mirror: auto — every thread gets ONE issue; lifecycle (open/fixed/resolved, replies) syncs both ways${opts.pollSec > 0 ? `, pull every ${opts.pollSec}s` : ', pull on POST /sync'}`,
+      );
+      // initial backfill: unmapped threads get their issue; remote changes land
+      void run(syncAllRaw).catch((err) => {
+        lastError = err instanceof Error ? err.message : String(err);
+      });
+    }
   };
 
   const stop = async (): Promise<void> => {

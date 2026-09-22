@@ -480,6 +480,20 @@ async function main() {
     check('C31: client-supplied gh on unmirrored thread dropped', ghInject.status === 200 && !ghInject.json?.gh, JSON.stringify(ghInject.json?.gh));
   }
 
+  /* v0.6.6: gh/reload endpoint + route registration */
+  {
+    const rel = await j('POST', `${API}/gh/reload`);
+    check('F8: POST /gh/reload → 200 {ok}', rel.status === 200 && rel.json?.ok === true, `status=${rel.status}`);
+    check('F8: reload reports the restart-vs-live contract', Array.isArray(rel.json?.requiresRestart) && typeof rel.json?.tokenChanged === 'boolean' && typeof rel.json?.tokenState === 'string', JSON.stringify(rel.json).slice(0, 120));
+    check('F8: reload never echoes the PAT', !JSON.stringify(rel.json ?? {}).match(/ghp_|gho_|fake-token/), JSON.stringify(rel.json).slice(0, 160));
+    const relGet = await j('GET', `${API}/gh/reload`);
+    check('F8: GET /gh/reload → 405 with Allow hint (route registered)', relGet.status === 405 && /POST/.test(String(relGet.headers?.get?.('allow') ?? relGet.json?.allow ?? '')), `status=${relGet.status}`);
+    const schemaReload = await j('GET', `${API}/schema`);
+    check('F8: /schema documents the reload route', (schemaReload.json?.endpoints ?? []).some((e) => Array.isArray(e) && String(e[1] ?? '').includes('/gh/reload')));
+    const health = await j('GET', `${API}/health`);
+    check('F7: /health exposes gh.tokenState + agentSurfaces.githubAuth', typeof health.json?.gh?.tokenState === 'string' && typeof health.json?.agentSurfaces?.githubAuth === 'string', `gh=${JSON.stringify(health.json?.gh?.tokenState)} surfaces=${JSON.stringify(health.json?.agentSurfaces?.githubAuth)}`);
+  }
+
   /* cleanup: remove ONLY threads this test created (live sessions may own others) */
   for (const tid of ownIds.filter(Boolean)) {
     await fetch(`${API}/threads?id=${tid}`, { method: 'DELETE' });

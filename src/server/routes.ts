@@ -28,13 +28,14 @@ import {
   loadDotEnv,
   pathIsIgnored,
   projectRoot,
+  reloadDotEnv,
   storeLocation,
 } from './env';
 import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared/events';
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.5';
+const VERSION = '0.6.6';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -233,9 +234,14 @@ async function sendMutationJson(rt: Runtime, res: ServerResponse, status: number
   try {
     const s = await rt.ghsync.status();
     if (s.mode === 'auto' && (s.stalled > 0 || s.lastError)) {
+      // v0.6.6 (F6/SR-C-01): header values must be printable ASCII — the old
+      // em dash made Node's setHeader THROW (ERR_INVALID_CHAR) and the empty
+      // catch swallowed it, so this mirror-health signal NEVER shipped.
+      // Dynamic lastError text (remote-influenced) is sanitized too.
+      const ascii = (v: string): string => v.replace(/[^\x20-\x7E]/g, '?');
       res.setHeader(
         'X-Annotakit-Mirror',
-        `unhealthy (stalled=${s.stalled}${s.lastError ? `; lastError=${String(s.lastError).slice(0, 140)}` : ''}) — see /annotakit/api/health ghSync`,
+        ascii(`unhealthy (stalled=${s.stalled}${s.lastError ? `; lastError=${String(s.lastError).slice(0, 140)}` : ''}) -- see /annotakit/api/health ghSync`),
       );
     }
   } catch {
@@ -600,6 +606,7 @@ async function handleApi(
         ['GET|PUT', `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence — GET → JSON, GET ?format=html → human view; PUT replaces (idempotent, 96KB cap)'],
         ['GET', `${API_BASE}/export?format=md|json`, 'digest — md clips comment bodies at 200 chars for display; json keeps FULL bodies. NOTE the json envelope is {generatedAt, stories:[...]} (story-grouped), NOT the {threads:[...]} shape of GET /threads'],
         ['GET|POST', `${API_BASE}/sync`, 'mirror status / force reconcile — POST also forces one git store cycle first (v0.6.1)'],
+        ['POST', `${API_BASE}/gh/reload`, 're-read .env and apply token changes WITHOUT a restart (v0.6.6) — response lists applied/requiresRestart; the PAT is never echoed'],
       ],
       POST: {
         url: `${API_BASE}/threads`,
@@ -635,6 +642,10 @@ async function handleApi(
       rest: true,
       digests: ['md', 'json'],
       github: ghSync.mode === 'auto',
+      // v0.6.6 (F7/SR-C-02): 'github' above is presence-based (mode); this is
+      // the OUTCOME-based signal — agents can stop committing to a mirror
+      // whose token is rejected instead of waiting forever.
+      githubAuth: ghSync.tokenState ?? (hasToken ? 'unexercised' : 'missing'),
       githubLabel: GH_LABEL,
       githubLabels: rt.ghLabels,
       ...(ghSync.mode !== 'auto'
@@ -655,6 +666,8 @@ async function handleApi(
       gh: {
         repo: rt.repo,
         hasToken,
+        tokenState: ghSync.tokenState ?? (hasToken ? 'unexercised' : 'missing'),
+        lastAuthError: ghSync.lastAuthError ?? null,
         autoSync: rt.sync.describe(),
         ghSync,
         labels: rt.ghLabels,
@@ -1009,6 +1022,29 @@ async function handleApi(
     }
   }
 
+  /* gh reload (v0.6.6, F8/SR-C-03) ------------------------------------------ */
+  if (p === `${API_BASE}/gh/reload` && method === 'POST') {
+    // Rotate ANNOTAKIT_GH_TOKEN without restarting the dev server: re-read
+    // .env, apply CHANGES to process.env (only keys boot-applied from .env —
+    // shell vars keep precedence), and report what is live vs restart-only.
+    // The ghsync engine reads the token through a lazy per-cycle getter, so
+    // the very next poll uses it. Never echoes the PAT (names + booleans).
+    const r = reloadDotEnv(configDir);
+    const st = await rt.ghsync.status();
+    sendJson(res, 200, {
+      ok: true,
+      file: r.file,
+      applied: r.changed, // keys whose NEW value is now live in process.env
+      removed: r.removed,
+      tokenChanged: r.tokenChanged,
+      // repo/labels/poll/interval/auto are boot-captured — a change needs a restart
+      requiresRestart: r.requiresRestart,
+      tokenState: st.tokenState,
+      mode: st.mode,
+    });
+    return true;
+  }
+
   /* github (legacy digest publish → now a sync alias) ----------------------- */
   if (p === `${API_BASE}/gh` && method === 'POST') {
     const summary = await rt.ghsync.syncAll();
@@ -1033,6 +1069,7 @@ const KNOWN_API_ROUTES: [RegExp, string][] = [
   [new RegExp(`^${API_BASE}/export$`), 'GET, OPTIONS'],
   [new RegExp(`^${API_BASE}/sync$`), 'GET, POST, OPTIONS'],
   [new RegExp(`^${API_BASE}/gh$`), 'POST, OPTIONS'],
+  [new RegExp(`^${API_BASE}/gh/reload$`), 'POST, OPTIONS'],
 ];
 
 function resolveNotHandled(res: ServerResponse, pathname: string): void {

@@ -65,6 +65,13 @@ const dbPath = arg('db');
 const seedPath = arg('seed');
 const labels = (arg('labels') ?? 'annotakit').split(',').map((l) => l.trim()).filter(Boolean);
 const origin = (arg('origin') ?? 'http://localhost:6006/').replace(/\/?$/, '/');
+/** v0.6.6 (F13): the DEV-format builders need the BARE origin — history's
+ *  `storybook: http://host` line carries NO trailing slash (that is what the
+ *  real dev servers passed to the digest). Forcing the slash made the
+ *  dev-format heal structurally dead: the rebuilt candidate could never
+ *  byte-match, so decideMirrorHeal always missed (SR-C-07). The STATIC
+ *  format keeps the slashed dir-scoped origin. */
+const originBare = origin.replace(/\/+$/, '');
 const apply = has('apply');
 const token = arg('token') ?? process.env.ANNOTAKIT_GH_TOKEN;
 
@@ -183,7 +190,7 @@ function devIssueBody(t) {
         threads: [t],
       },
     ],
-    { origin, mirror: true, fullText: true },
+    { origin: originBare, mirror: true, fullText: true },
   );
   if (body.length > ISSUE_BODY_LIMIT) {
     return (
@@ -236,7 +243,7 @@ for (const issue of issues) {
     legacyTitle: legacyMirrorTitle(t),
     legacyBodies: isStaticFormat
       ? legacyClientBodyCandidates(t, { origin: origin.replace(/\/?$/, '/'), repo, labels, sentinel: '<!-- annotakit -->' })
-      : legacyServerBodyCandidates(t, { origin, relPath: (p) => p }),
+      : legacyServerBodyCandidates(t, { origin: originBare, relPath: (p) => p }),
   }) ?? {};
   if (!fields.title && !fields.body) {
     skip.clean.push(issue.number);

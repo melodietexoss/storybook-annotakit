@@ -135,7 +135,9 @@ function ghHandler(req, res) {
           updated_at: new Date().toISOString(),
         });
         gh.comments[n] = gh.comments[n] ?? [];
-        json(201, { number: n, html_url: issueUrl(n), state: 'open' });
+        // v0.6.6 (F12): real GitHub returns updated_at on create/comment/PATCH —
+        // the server-clock stamp tests depend on it
+        json(201, { number: n, html_url: issueUrl(n), state: 'open', updated_at: gh.issues[gh.issues.length - 1]?.updated_at });
       });
     });
     return;
@@ -152,7 +154,7 @@ function ghHandler(req, res) {
       const issue = gh.issues.find((i) => i.number === n);
       if (issue) issue.comments++;
       touchIssue(n);
-      json(201, { id, html_url: `${issueUrl(n)}#issuecomment-${id}` });
+      json(201, { id, html_url: `${issueUrl(n)}#issuecomment-${id}`, updated_at: issue?.updated_at, created_at: (gh.comments[n] ?? []).at(-1)?.created_at });
     });
     return;
   }
@@ -177,7 +179,7 @@ function ghHandler(req, res) {
         issue.edits = (issue.edits ?? 0) + 1; // heal idempotence probe (v0.6.4)
       }
       touchIssue(issue.number);
-      json(200, { number: issue.number, state: issue.state, html_url: issueUrl(issue.number) });
+      json(200, { number: issue.number, state: issue.state, html_url: issueUrl(issue.number), updated_at: issue.updated_at });
     });
     return;
   }
@@ -542,8 +544,99 @@ async function main() {
   check('C14: orphan ADOPTED (thread mapped to the stamped issue)', c14Thread?.gh?.issue === c14Number, JSON.stringify(c14Thread?.gh));
   check('C14: NO duplicate issue minted', c14Stamped.length === 1, `stamped=${c14Stamped.length} numbers=${JSON.stringify(c14Stamped.map((i) => i.number))}`);
 
-  api.close();
-  console.log(`\n${passed} passed, ${failed} failed (in-process)`);
+  console.log('== 15c. v0.6.6 sync robustness: server-clock stamps, auth state, pull-401 backoff, mirror header, hot token rotation ==');
+  // (a) F12: a fresh create stamps syncedAt from the REMOTE updated_at
+  const c15cInput = threadInput(31);
+  const c15cCreate = await j('POST', '/annotakit/api/threads', c15cInput);
+  check('F12: thread created → 201', c15cCreate.status === 201);
+  await waitFor(async () => {
+    const all = (await j('GET', '/annotakit/api/threads')).body.threads;
+    return Boolean(all.find((x) => x.id === c15cCreate.body?.id && x.gh));
+  }, 8000, 'fresh issue created');
+  const c15cThread = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === c15cCreate.body?.id);
+  const c15cIssue = gh.issues.find((i) => i.number === c15cThread?.gh?.issue);
+  check('F12: create stamped syncedAt from the REMOTE updated_at (server clock)', c15cThread?.gh?.syncedAt === c15cIssue?.updated_at, `${c15cThread?.gh?.syncedAt} vs ${c15cIssue?.updated_at}`);
+  // (b) F7/F11: a 401 storm → tokenState rejected + lastAuthError + ~5min backoff
+  gh.fail = { regex: /\/issues/, count: 5, status: 401 };
+  await j('POST', '/annotakit/api/sync');
+  const stA = (await j('GET', '/annotakit/api/sync')).body;
+  check('F7: tokenState rejected after a 401', stA.tokenState === 'rejected', stA.tokenState);
+  check('F7: lastAuthError surfaces the 401', String(stA.lastAuthError ?? '').includes('401') || String(stA.lastError ?? '').includes('401'), JSON.stringify(stA.lastAuthError));
+  check('F11: pull 401 set a multi-minute backoff (no re-hammering)', Boolean(stA.backoffUntil && Date.parse(stA.backoffUntil) > Date.now() + 240_000), stA.backoffUntil);
+  gh.fail = null;
+  // (c) F6: the mutation-response mirror-health header actually SHIPS now
+  // (the em dash used to make setHeader throw ERR_INVALID_CHAR silently)
+  const mutHdr = await j('POST', '/annotakit/api/threads', threadInput(32));
+  const mirrorHdr = mutHdr.headers.get('x-annotakit-mirror');
+  check('F6: X-Annotakit-Mirror header present while unhealthy', Boolean(mirrorHdr), '(missing)');
+  check('F6: header value is printable ASCII', Boolean(mirrorHdr) && !/[^\x20-\x7E]/.test(mirrorHdr), JSON.stringify(mirrorHdr));
+  // (d) F7/F8: rotating the token (what POST /annotakit/api/gh/reload does to
+  // process.env) is picked up WITHOUT a restart — the lazy getter reads it
+  // every cycle and the tick resets the rejected state.
+  process.env.ANNOTAKIT_GH_TOKEN = 'fake-token-rotated';
+  await sleep(350); // ≥ one worker tick (100ms) → noteTokenRotation
+  const stB = (await j('GET', '/annotakit/api/sync')).body;
+  check('F7: rotation reset the rejected state', stB.tokenState === 'unexercised' || stB.tokenState === 'ok', stB.tokenState);
+  const callsBeforeRotation = gh.calls.length;
+  const syncB = await j('POST', '/annotakit/api/sync');
+  check('F8: engine used the rotated token (live getter, no restart)', gh.calls.length > callsBeforeRotation && badAuth.length > 0, `calls=${gh.calls.length - callsBeforeRotation} badAuth=${badAuth.length}`);
+  check('F8: the rotated token WORKED (sync completed, no new failures)', syncB.status === 200 && syncB.body?.ok === true && !String(syncB.body?.lastError ?? '').includes('401'), JSON.stringify(syncB.body).slice(0, 120));
+  // (d2) SR-W2 P2#3: a token APPEARING after a 'missing' state transitions to
+  // 'unexercised' (was a one-way latch) — prove it by deleting + re-adding.
+  delete process.env.ANNOTAKIT_GH_TOKEN;
+  await sleep(250); // ≥ one tick → noteTokenRotation sees the removal
+  const stMissing = (await j('GET', '/annotakit/api/sync')).body;
+  check('F7: token removed → tokenState missing', stMissing.tokenState === 'missing', stMissing.tokenState);
+  process.env.ANNOTAKIT_GH_TOKEN = 'fake-token';
+  await sleep(250);
+  const stBack = (await j('GET', '/annotakit/api/sync')).body;
+  check('F7: token re-added → tokenState unexercised (no one-way latch)', stBack.tokenState === 'unexercised' || stBack.tokenState === 'ok', stBack.tokenState);
+  await j('POST', '/annotakit/api/sync'); // settle back to ok
+  // restore the original token for any code that follows + clean the tracker
+  process.env.ANNOTAKIT_GH_TOKEN = 'fake-token';
+  badAuth.length = 0;
+  await sleep(150);
+  // (e2) SR-W2 P2#2: the reloadDotEnv ROTATION flow end-to-end — a token
+  // appearing for the first time AND a second rotation both apply (the
+  // appeared-branch used to be one-shot).
+  delete process.env.ANNOTAKIT_GH_TOKEN;
+  await sleep(150); // let the tick see the removal
+  fs.writeFileSync(path.join(tmp, '.env'), 'ANNOTAKIT_GH_TOKEN=fake-token-env\n');
+  const relE1 = await j('POST', '/annotakit/api/gh/reload');
+  check('F8: reload applies a FIRST-TIME token from .env', (relE1.body?.applied ?? []).includes('ANNOTAKIT_GH_TOKEN') && relE1.body?.tokenChanged === true, JSON.stringify(relE1.body));
+  fs.writeFileSync(path.join(tmp, '.env'), 'ANNOTAKIT_GH_TOKEN=fake-token-env2\n');
+  const relE2 = await j('POST', '/annotakit/api/gh/reload');
+  check('F8: reload applies a SECOND rotation (no one-shot latch)', (relE2.body?.applied ?? []).includes('ANNOTAKIT_GH_TOKEN') && relE2.body?.tokenChanged === true, JSON.stringify(relE2.body));
+  fs.unlinkSync(path.join(tmp, '.env'));
+  process.env.ANNOTAKIT_GH_TOKEN = 'fake-token';
+  await sleep(150);
+  await j('POST', '/annotakit/api/sync'); // settle: engine back on fake-token
+
+  // (e) F8: the reload endpoint contract — never echoes the PAT
+  const rel = await j('POST', '/annotakit/api/gh/reload');
+  check('F8: POST /annotakit/api/gh/reload responds ok', rel.status === 200 && rel.body?.ok === true, JSON.stringify(rel.body));
+  check('F8: reload response never echoes the PAT', !JSON.stringify(rel.body ?? {}).includes('fake-token'));
+  check('F8: reload response carries the auth-state contract', 'tokenState' in (rel.body ?? {}) && Array.isArray(rel.body?.requiresRestart));
+
+  console.log('== 15d. v0.6.6 F13: heal-mirrors origin convention (dev-format bodies use the BARE origin) ==');
+  {
+    // the exact convention scripts/heal-mirrors.mjs must follow: history's
+    // dev-format `storybook:` line has NO trailing slash; a forced slash made
+    // the dev-format heal structurally dead (SR-C-07).
+    const tF13 = {
+      id: 'th_f13', number: 3, status: 'open', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      storyId: 's1', story: { storyId: 's1', title: 'Button', name: 'primary', importPath: 'src/Button.stories.tsx' },
+      target: { kind: 'pin', selector: { cssSelector: 'button' }, context: { tag: 'button', text: 'Click' }, bbox: { x: 10, y: 10, w: 40, h: 20 }, captureViewportWidth: 800 },
+      comments: [{ id: 'c_1', author: 'reviewer', body: 'badge clips', createdAt: new Date().toISOString() }],
+    };
+    const digest = serverExports.renderDigest(
+      [{ story: { ...tF13.story }, counts: { open: 1, fixed: 0, resolved: 0 }, threads: [tF13] }],
+      { origin: 'http://localhost:6006', mirror: true, fullText: true },
+    );
+    check('F13: dev digest storybook line is BARE (no trailing slash)', /^storybook: http:\/\/localhost:6006$/m.test(digest), digest.split('\n').find((l) => l.startsWith('storybook:')));
+    const candsF13 = serverExports.legacyServerBodyCandidates(tF13, { origin: 'http://localhost:6006', relPath: (p) => p });
+    check('F13: legacy server candidates carry the bare origin', candsF13.length > 0 && candsF13.every((c) => /\nstorybook: http:\/\/localhost:6006\n/.test(c)), candsF13[0]?.split('\n').find((l) => l.startsWith('storybook:')));
+  }
 
   api.close();
   console.log(`\n${passed} passed, ${failed} failed (in-process)`);

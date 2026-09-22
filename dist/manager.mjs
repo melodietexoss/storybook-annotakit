@@ -10,7 +10,7 @@ import {
 import {
   getGhLinkedStaticStore,
   ghClientStatus
-} from "./chunk-Y3KBXHJT.mjs";
+} from "./chunk-BKSLU7VF.mjs";
 import {
   MAX_BODY_CHARS,
   renderStaticDigest
@@ -361,20 +361,26 @@ function ReviewPanel() {
     if (!store.gh) return;
     setGhBusy(true);
     try {
+      const freshStat = await ghClientStatus();
       const labels = String(ghForm.labels ?? "").split(/[,\s]+/).map((l) => l.trim()).filter(Boolean);
       const patch = {};
-      if (ghForm.repo) patch.repo = ghForm.repo.trim();
-      if (ghForm.token) patch.token = ghForm.token.trim();
-      if (labels.length) patch.labels = labels;
-      if (ghForm.pollMs !== void 0) patch.pollMs = ghForm.pollMs;
+      const repo = (ghForm.repo ?? "").trim();
+      if (repo && repo !== freshStat.repo) patch.repo = repo;
+      const tok = (ghForm.token ?? "").trim();
+      if (tok) patch.token = tok;
+      if (labels.length && labels.join(",") !== (freshStat.labels ?? []).join(",")) patch.labels = labels;
+      if (ghForm.pollMs !== void 0 && ghForm.pollMs !== freshStat.pollMs) patch.pollMs = ghForm.pollMs;
       patch.disabled = ghForm.disabled ? true : void 0;
+      const tokIgnored = Boolean(ghForm.token) && !tok;
       store.gh.saveSettings(patch);
       const s = await ghClientStatus();
       setGhStat(s);
       if (!s.configured && !patch.disabled) {
         setNotice("saved \u2014 but NOT publishing yet: repo must be owner/name and a token must be present (check GitHub settings below)");
+      } else if (tokIgnored) {
+        setNotice('saved \u2014 token unchanged (whitespace-only input ignored; use "use baked" to drop a saved override)');
       } else {
-        setNotice(`saved \u2014 publishing${patch.disabled ? " disabled" : ` \u2192 ${patch.repo ?? ghStat?.repo ?? "(baked repo)"}`}${labels.length ? ` \xB7 labels: ${labels.join(", ")}` : ""}`);
+        setNotice(`saved \u2014 publishing${patch.disabled ? " disabled" : ` \u2192 ${patch.repo ?? freshStat.repo ?? "(baked repo)"}`}${labels.length ? ` \xB7 labels: ${labels.join(", ")}` : ""}`);
       }
       window.setTimeout(() => setNotice(null), 5e3);
       await store.gh.syncNow();
@@ -385,6 +391,17 @@ function ReviewPanel() {
     } finally {
       setGhBusy(false);
     }
+  };
+  const useBakedToken = async () => {
+    const store = await getGhLinkedStaticStore();
+    store.gh?.clearTokenOverride();
+    setGhForm((f) => ({ ...f, token: "" }));
+    const s = await ghClientStatus();
+    setGhStat(s);
+    setNotice(
+      s.configured ? "token override removed \u2014 the baked annotakit-gh.json token applies again (repo/labels/poll overrides survive)" : "token override removed \u2014 but NO baked config exists for this deployment: paste a token above (or in GitHub settings) to publish"
+    );
+    window.setTimeout(() => setNotice(null), 5e3);
   };
   const clearGhSettings = async () => {
     const store = await getGhLinkedStaticStore();
@@ -472,7 +489,7 @@ function ReviewPanel() {
     /* @__PURE__ */ React.createElement(SyncIcon, { width: 11, height: 11 }),
     " ",
     syncing ? "syncing\u2026" : "Sync now"
-  )), sync?.lastError && /* @__PURE__ */ React.createElement("div", { style: { padding: "4px 8px", borderRadius: 6, background: `${negativeColor}18`, color: negativeColor, whiteSpace: "pre-wrap" } }, "last sync error: ", sync.lastError), sync?.note && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor, whiteSpace: "pre-wrap" } }, sync.note), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, health?.agentSurfaces?.github ? /* @__PURE__ */ React.createElement(React.Fragment, null, "repo: ", /* @__PURE__ */ React.createElement("b", null, health.gh?.repo), " \xB7 durability: ", health.agentSurfaces.durability, " \xB7 store: ", health.gh?.autoSync) : health?.agentSurfaces ? /* @__PURE__ */ React.createElement(React.Fragment, null, "local mode \u2014 reviews live here (REST + digests); GitHub mirror: ", health.agentSurfaces.githubReason ?? "off", health.agentSurfaces.durability ? ` \xB7 durability: ${health.agentSurfaces.durability}` : "") : "set ANNOTAKIT_GH_TOKEN in .env (auto-loaded) \xB7 repo auto-detected from git remote"), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, "Every thread mirrors to exactly ONE issue \u2014 status (open/resolved), replies and fix evidence sync both ways automatically. \u201CSync now\u201D only reconciles; it never creates a duplicate issue.")), ghSettingsOpen && staticMode && /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 0", borderBottom: `1px solid ${theme.appBorderColor}`, fontSize: 11, display: "flex", flexDirection: "column", gap: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", { style: { ...chip(ghStat?.configured && !ghStat.suppressed ? "#16a34a22" : "#f59e0b22", ghStat?.configured && !ghStat.suppressed ? "#15803d" : "#b45309") } }, ghStat?.configured ? ghStat.suppressed ? "client GH disabled" : `client publish \u2192 ${ghStat.repo ?? "(not set)"}` : "client GH unconfigured"), ghStat?.configured && !ghStat.suppressed && /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "queue ", ghStat.queue, ghStat.flushing ? " (flushing)" : "", ghStat.parked ? ` \xB7 parked ${ghStat.parked}` : "", ghStat.lastPushAt ? ` \xB7 pushed ${ago(ghStat.lastPushAt)}` : "", ghStat.lastPullAt ? ` \xB7 pulled ${ago(ghStat.lastPullAt)}` : "", ghStat.pollMs > 0 ? ` \xB7 polls every ${Math.round(ghStat.pollMs / 1e3)}s` : " \xB7 polling off")), ghStat?.lastError && /* @__PURE__ */ React.createElement("div", { style: { padding: "4px 8px", borderRadius: 6, background: `${negativeColor}18`, color: negativeColor, whiteSpace: "pre-wrap" } }, ghStat.lastError), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { width: 88, color: theme.textMutedColor } }, "issue repo"), /* @__PURE__ */ React.createElement(
+  )), sync?.lastError && /* @__PURE__ */ React.createElement("div", { style: { padding: "4px 8px", borderRadius: 6, background: `${negativeColor}18`, color: negativeColor, whiteSpace: "pre-wrap" } }, "last sync error: ", sync.lastError), sync?.note && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor, whiteSpace: "pre-wrap" } }, sync.note), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, health?.agentSurfaces?.github ? /* @__PURE__ */ React.createElement(React.Fragment, null, "repo: ", /* @__PURE__ */ React.createElement("b", null, health.gh?.repo), " \xB7 durability: ", health.agentSurfaces.durability, " \xB7 store: ", health.gh?.autoSync) : health?.agentSurfaces ? /* @__PURE__ */ React.createElement(React.Fragment, null, "local mode \u2014 reviews live here (REST + digests); GitHub mirror: ", health.agentSurfaces.githubReason ?? "off", health.agentSurfaces.durability ? ` \xB7 durability: ${health.agentSurfaces.durability}` : "") : "set ANNOTAKIT_GH_TOKEN in .env (auto-loaded) \xB7 repo auto-detected from git remote"), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, "Every thread mirrors to exactly ONE issue \u2014 status (open/resolved), replies and fix evidence sync both ways automatically. \u201CSync now\u201D only reconciles; it never creates a duplicate issue.")), ghSettingsOpen && staticMode && /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 0", borderBottom: `1px solid ${theme.appBorderColor}`, fontSize: 11, display: "flex", flexDirection: "column", gap: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", { style: { ...chip(ghStat?.configured && !ghStat.suppressed ? "#16a34a22" : "#f59e0b22", ghStat?.configured && !ghStat.suppressed ? "#15803d" : "#b45309") } }, ghStat?.configured ? ghStat.suppressed ? "client GH disabled" : `client publish \u2192 ${ghStat.repo ?? "(not set)"}` : "client GH unconfigured"), ghStat?.configured && !ghStat.suppressed && /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "queue ", ghStat.queue, ghStat.flushing ? " (flushing)" : "", ghStat.parked ? ` \xB7 parked ${ghStat.parked}` : "", ghStat.lastPushAt ? ` \xB7 pushed ${ago(ghStat.lastPushAt)}` : "", ghStat.lastPullAt ? ` \xB7 pulled ${ago(ghStat.lastPullAt)}` : "", ghStat.pollMs > 0 ? ` \xB7 polls every ${Math.round(ghStat.pollMs / 1e3)}s` : " \xB7 polling off", !ghStat.leader ? " \xB7 follower tab \u2014 another tab holds the sync lease" : "")), ghStat?.lastError && /* @__PURE__ */ React.createElement("div", { style: { padding: "4px 8px", borderRadius: 6, background: `${negativeColor}18`, color: negativeColor, whiteSpace: "pre-wrap" } }, ghStat.lastError), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { width: 88, color: theme.textMutedColor } }, "issue repo"), /* @__PURE__ */ React.createElement(
     "input",
     {
       style: { flex: 1, padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor },
@@ -497,11 +514,19 @@ function ReviewPanel() {
       style: { flex: 1, padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor },
       value: String(ghForm.token ?? ""),
       onChange: (e) => setGhForm((f) => ({ ...f, token: e.target.value })),
-      placeholder: "classic PAT with repo scope \u2014 empty keeps the baked token",
+      placeholder: ghStat?.tokenOverridden ? "a token saved in THIS browser OVERRIDES the baked one \u2014 empty keeps the OVERRIDE" : "classic PAT with repo scope \u2014 empty keeps the baked token",
       spellCheck: false,
       autoComplete: "off"
     }
-  )), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "poll (s)"), /* @__PURE__ */ React.createElement(
+  ), ghStat?.tokenOverridden && /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      style: { padding: "3px 8px", fontSize: 10, fontWeight: 600, cursor: "pointer", borderRadius: 6, border: `1px solid ${theme.appBorderColor}`, background: "transparent", color: theme.textColor, whiteSpace: "nowrap" },
+      onClick: () => void useBakedToken(),
+      title: "Remove ONLY the saved token override \u2014 the baked annotakit-gh.json token applies again (repo/labels/poll overrides survive). Recovery path for an old PAT that shadows every re-bake."
+    },
+    "use baked"
+  )), ghStat?.tokenOverridden && /* @__PURE__ */ React.createElement("div", { style: { padding: "3px 8px", borderRadius: 6, background: "#f59e0b18", color: "#b45309", fontSize: 10 } }, '\u26A0 a token override is saved in this browser \u2014 it overrides the baked annotakit-gh.json on every deploy. If syncing fails with 401, paste a fresh PAT or click "use baked".'), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "poll (s)"), /* @__PURE__ */ React.createElement(
     "input",
     {
       style: { width: 60, padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor },

@@ -1,6 +1,6 @@
 {
   "name": "storybook-annotakit",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "description": "AnnotaKit, reborn inside Storybook: zero-setup pin comments on live stories with React component awareness. Dev-server-embedded store, lean agent digests, GitHub issue publishing.",
   "license": "MIT",
   "author": "melodietexoss",

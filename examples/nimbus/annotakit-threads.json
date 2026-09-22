@@ -1,0 +1,617 @@
+{
+  "threads": [
+    {
+      "id": "th_mtlbo5yt_yp7z7zzu",
+      "number": 1,
+      "storyId": "nimbus-components--status-badge-story",
+      "status": "resolved",
+      "createdAt": "2026-09-03T09:28:10.805Z",
+      "updatedAt": "2026-09-21T12:45:56.210Z",
+      "author": "reviewer",
+      "story": {
+        "storyId": "nimbus-components--status-badge-story",
+        "title": "Nimbus/Components",
+        "name": "Status Badge",
+        "url": "http://localhost:6006/?path=/story/nimbus-components--status-badge-story",
+        "importPath": "./src/stories/leaf.stories.tsx"
+      },
+      "component": {
+        "name": "StatusBadge",
+        "chain": [
+          "StatusBadge"
+        ],
+        "source": {
+          "file": "src/components/nimbus/StatusBadge.tsx",
+          "line": 12,
+          "column": 25
+        },
+        "props": {
+          "status": "\"pending\""
+        }
+      },
+      "target": {
+        "kind": "pin",
+        "selector": {
+          "cssSelector": ".bg-amber-50",
+          "textQuote": {
+            "exact": "pending",
+            "prefix": "delivered",
+            "suffix": "refunded",
+            "occurrenceIndex": 0
+          },
+          "fragment": {
+            "x": 206.8,
+            "y": 24,
+            "w": 76,
+            "h": 20
+          }
+        },
+        "fingerprint": {
+          "tag": "span",
+          "attrs": [],
+          "neighborText": "delivered"
+        },
+        "context": {
+          "tag": "span",
+          "text": "Pending",
+          "outerHTML": "<span class=\"inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium bg-amber-50 text-amber-700\"><span class=\"h-1.5 w-1.5 rounded-full bg-current opacity-70\" aria-hidden=\"true…"
+        },
+        "bbox": {
+          "x": 206.8,
+          "y": 24,
+          "w": 76,
+          "h": 20
+        },
+        "captureViewportWidth": 980
+      },
+      "comments": [
+        {
+          "id": "c_mtlbo5yp_c3cgwx",
+          "author": "reviewer",
+          "body": "TEST: first comment visibility bug check",
+          "createdAt": "2026-09-03T09:28:10.801Z",
+          "ghId": "issue-body"
+        }
+      ],
+      "resolvedAt": "2026-09-03T09:47:55.938Z",
+      "gh": {
+        "issue": 10,
+        "url": "https://github.com/melodietexoss/storybook-annotakit/issues/10",
+        "state": "closed",
+        "syncedAt": "2026-09-21T12:45:51.683Z"
+      }
+    },
+    {
+      "id": "th_mtlbpjkz_96ro750n",
+      "number": 1,
+      "storyId": "nimbus-components--kpi-card-story",
+      "status": "resolved",
+      "createdAt": "2026-09-03T09:29:15.107Z",
+      "updatedAt": "2026-09-21T12:45:52.948Z",
+      "author": "reviewer",
+      "story": {
+        "storyId": "nimbus-components--kpi-card-story",
+        "title": "Nimbus/Components",
+        "name": "KPI Card",
+        "url": "http://localhost:6006/?path=/story/nimbus-components--kpi-card-story",
+        "importPath": "./src/stories/leaf.stories.tsx"
+      },
+      "component": {
+        "name": "KpiCard",
+        "chain": [
+          "KpiCard"
+        ],
+        "source": {
+          "file": "src/components/nimbus/KpiCard.tsx",
+          "line": 25,
+          "column": 20
+        }
+      },
+      "target": {
+        "kind": "pin",
+        "selector": {
+          "cssSelector": ".text-sm",
+          "textQuote": {
+            "exact": "total revenue",
+            "suffix": "$84,254",
+            "occurrenceIndex": 0
+          },
+          "fragment": {
+            "x": 45,
+            "y": 45,
+            "w": 190,
+            "h": 20
+          }
+        },
+        "fingerprint": {
+          "tag": "p",
+          "attrs": [],
+          "neighborText": "$84,254"
+        },
+        "context": {
+          "tag": "p",
+          "text": "Total revenue",
+          "outerHTML": "<p class=\"text-sm text-slate-500\">Total revenue</p>"
+        },
+        "bbox": {
+          "x": 45,
+          "y": 45,
+          "w": 190,
+          "h": 20
+        },
+        "captureViewportWidth": 980
+      },
+      "comments": [
+        {
+          "id": "c_mtlbpjku_5bu293",
+          "author": "reviewer",
+          "body": "TEST: second story first comment",
+          "createdAt": "2026-09-03T09:29:15.103Z",
+          "ghId": "issue-body"
+        },
+        {
+          "id": "c_mtlckl7t_bhbwl7",
+          "author": "agent",
+          "body": "Looking into this — inspecting KpiCard.tsx (src/components/nimbus/KpiCard.tsx:25) for the Total revenue label issue.",
+          "createdAt": "2026-09-03T09:53:23.561Z",
+          "ghId": "issue-body"
+        },
+        {
+          "id": "c_mtlckr81_n6073v",
+          "author": "agent",
+          "body": "fixed (simulated)",
+          "createdAt": "2026-09-03T09:53:31.345Z",
+          "ghId": "issue-body"
+        },
+        {
+          "id": "c_mub8nqus_qjdl8gdi",
+          "author": "melodietexoss",
+          "body": "**reviewer:** 12-b error-chip probe: reply with invalid token — expect error chip + queue count",
+          "createdAt": "2026-09-07T00:57:33Z",
+          "ghId": "5563545157",
+          "source": "github"
+        },
+        {
+          "id": "c_mub8nqus_2wey4wju",
+          "author": "melodietexoss",
+          "body": "Demo artifact from dogfooding (the public demo pins this repo as its issue target) — closed by the v0.6.1 release cleanup. Not a real user report.",
+          "createdAt": "2026-09-07T01:05:31Z",
+          "ghId": "5563591654",
+          "source": "github"
+        }
+      ],
+      "gh": {
+        "issue": 6,
+        "url": "https://github.com/melodietexoss/storybook-annotakit/issues/6",
+        "state": "closed",
+        "syncedAt": "2026-09-21T12:45:51.683Z"
+      }
+    },
+    {
+      "id": "th_mtlbumfp_ra9uwqmi",
+      "number": 2,
+      "storyId": "nimbus-components--kpi-card-story",
+      "status": "resolved",
+      "createdAt": "2026-09-03T09:33:12.085Z",
+      "updatedAt": "2026-09-21T12:45:53.301Z",
+      "author": "reviewer",
+      "story": {
+        "storyId": "nimbus-components--kpi-card-story",
+        "title": "Nimbus/Components",
+        "name": "KPI Card"
+      },
+      "component": null,
+      "target": {
+        "kind": "pin",
+        "selector": {
+          "cssSelector": ".kpi"
+        },
+        "context": {
+          "tag": "div",
+          "text": "extra 3"
+        },
+        "bbox": {
+          "x": 10,
+          "y": 10,
+          "w": 50,
+          "h": 20
+        },
+        "captureViewportWidth": 1000
+      },
+      "comments": [
+        {
+          "id": "c3",
+          "author": "reviewer",
+          "body": "API test thread 3",
+          "createdAt": "2026-09-03T01:00:00.000Z",
+          "ghId": "issue-body"
+        }
+      ],
+      "resolvedAt": "2026-09-03T09:59:07.860Z",
+      "gh": {
+        "issue": 7,
+        "url": "https://github.com/melodietexoss/storybook-annotakit/issues/7",
+        "state": "closed",
+        "syncedAt": "2026-09-21T12:45:51.683Z"
+      }
+    },
+    {
+      "id": "th_mtlbumgi_pilzegfs",
+      "number": 3,
+      "storyId": "nimbus-components--kpi-card-story",
+      "status": "resolved",
+      "createdAt": "2026-09-03T09:33:12.114Z",
+      "updatedAt": "2026-09-21T12:45:53.650Z",
+      "author": "reviewer",
+      "story": {
+        "storyId": "nimbus-components--kpi-card-story",
+        "title": "Nimbus/Components",
+        "name": "KPI Card"
+      },
+      "component": null,
+      "target": {
+        "kind": "pin",
+        "selector": {
+          "cssSelector": ".kpi"
+        },
+        "context": {
+          "tag": "div",
+          "text": "extra 4"
+        },
+        "bbox": {
+          "x": 10,
+          "y": 10,
+          "w": 50,
+          "h": 20
+        },
+        "captureViewportWidth": 1000
+      },
+      "comments": [
+        {
+          "id": "c4",
+          "author": "reviewer",
+          "body": "API test thread 4",
+          "createdAt": "2026-09-03T01:00:00.000Z",
+          "ghId": "issue-body"
+        },
+        {
+          "id": "c_mub8nrea_8y5np4f6",
+          "author": "melodietexoss",
+          "body": "**reviewer:** Happy-path reply from TrackC audit",
+          "createdAt": "2026-09-06T23:06:41Z",
+          "ghId": "5562819265",
+          "source": "github"
+        },
+        {
+          "id": "c_mub8nrea_er0v4buh",
+          "author": "melodietexoss",
+          "body": "**reviewer:** Panel reply from TrackC a11y check",
+          "createdAt": "2026-09-06T23:19:40Z",
+          "ghId": "5562928646",
+          "source": "github"
+        },
+        {
+          "id": "c_mub8nrea_v8xy94lx",
+          "author": "melodietexoss",
+          "body": "closed on GitHub",
+          "createdAt": "2026-09-21T12:45:53.650Z",
+          "ghId": "gh-close-8",
+          "source": "github"
+        }
+      ],
+      "gh": {
+        "issue": 8,
+        "url": "https://github.com/melodietexoss/storybook-annotakit/issues/8",
+        "state": "closed",
+        "syncedAt": "2026-09-21T12:45:51.683Z"
+      },
+      "resolvedAt": "2026-09-06T23:06:51Z"
+    },
+    {
+      "id": "th_mtldgpyt_jshwrcbi",
+      "number": 9,
+      "storyId": "nimbus-components--kpi-card-story",
+      "status": "resolved",
+      "createdAt": "2026-09-03T10:18:22.709Z",
+      "updatedAt": "2026-09-21T12:45:53.972Z",
+      "author": "reviewer",
+      "story": {
+        "storyId": "nimbus-components--kpi-card-story",
+        "title": "Nimbus/Components",
+        "name": "KPI Card",
+        "url": "http://localhost:6006/?path=/story/nimbus-components--kpi-card-story",
+        "importPath": "./src/stories/leaf.stories.tsx"
+      },
+      "component": {
+        "name": "KpiCard",
+        "chain": [
+          "KpiCard"
+        ],
+        "source": {
+          "file": "src/components/nimbus/KpiCard.tsx",
+          "line": 33,
+          "column": 20
+        }
+      },
+      "target": {
+        "kind": "pin",
+        "selector": {
+          "cssSelector": ".mt-2",
+          "textQuote": {
+            "exact": "$84,254",
+            "prefix": "total revenue",
+            "suffix": "+12.4%",
+            "occurrenceIndex": 0
+          },
+          "fragment": {
+            "x": 45,
+            "y": 73,
+            "w": 190,
+            "h": 32
+          }
+        },
+        "fingerprint": {
+          "tag": "p",
+          "attrs": [],
+          "neighborText": "total revenue"
+        },
+        "context": {
+          "tag": "p",
+          "text": "$84,254",
+          "outerHTML": "<p class=\"mt-2 text-2xl font-semibold tracking-tight text-slate-900\">$84,254</p>"
+        },
+        "bbox": {
+          "x": 45,
+          "y": 73,
+          "w": 190,
+          "h": 32
+        },
+        "captureViewportWidth": 980
+      },
+      "comments": [
+        {
+          "id": "c_mtldgpyp_g0ft5i",
+          "author": "reviewer",
+          "body": "KPI: consider tabular-nums for the big figure",
+          "createdAt": "2026-09-03T10:18:22.706Z",
+          "ghId": "issue-body"
+        },
+        {
+          "id": "c_mtlhabh4_lx177ir3",
+          "author": "melodietexoss",
+          "body": "**Fixed** in commit `542e7b0867ebe3bb1db117d3cb2e473d99ac7775` (pushed to `main`).\n\n**What changed** — `examples/nimbus/src/components/nimbus/KpiCard.tsx` (reported path `src/components/nimbus/KpiCard.tsx`, resolved relative to the demo project `examples/nimbus/`): added the Tailwind `tabular-nums` utility (`font-variant-numeric: tabular-nums`) to the big-figure `<p>` that renders `stat.value` (the `.mt-2` / `\"$84,254\"` element from the review thread).\n\n**Why** — the KPI figure is a currency amount that gets re-rendered/updated; tabular numerals give every digit a fixed advance width so the number doesn't jitter horizontally as values change, and columns of figures align cleanly.\n\n```diff\n--- a/examples/nimbus/src/components/nimbus/KpiCard.tsx\n+++ b/examples/nimbus/src/components/nimbus/KpiCard.tsx\n@@ -24,7 +24,7 @@\n   return (\n     <article className=\"rounded-xl border border-slate-200 bg-white p-5 shadow-sm\">\n       <p className=\"text-sm text-slate-500\">{stat.label}</p>\n-      <p className=\"mt-2 text-2xl font-semibold tracking-tight text-slate-900\">{stat.value}</p>\n+      <p className=\"mt-2 text-2xl font-semibold tabular-nums tracking-tight text-slate-900\">{stat.value}</p>\n       <div className=\"mt-3 flex items-center gap-2\">\n```\n\nSingle-line, demo-component-only change; no other styling or logic touched. Closing this review issue as resolved.\n",
+          "createdAt": "2026-09-03T12:05:03Z",
+          "ghId": "5525456004",
+          "source": "github"
+        },
+        {
+          "id": "c_mtlhab4d_242tgyyy",
+          "author": "melodietexoss",
+          "body": "closed on GitHub",
+          "createdAt": "2026-09-03T12:05:21.997Z",
+          "ghId": "gh-close-9",
+          "source": "github"
+        },
+        {
+          "id": "c_mub8nrn8_am4adjuh",
+          "author": "github",
+          "body": "reopened on GitHub",
+          "createdAt": "2026-09-21T12:45:53.972Z",
+          "ghId": "gh-reopen-9",
+          "source": "github"
+        }
+      ],
+      "gh": {
+        "issue": 9,
+        "url": "https://github.com/melodietexoss/storybook-annotakit/issues/9",
+        "state": "open",
+        "syncedAt": "2026-09-21T12:45:51.683Z"
+      },
+      "resolvedAt": "2026-09-03T12:05:09Z"
+    },
+    {
+      "id": "th_mtlfbdcy_cknhsqde",
+      "number": 1,
+      "storyId": "nimbus-components-kpicard--danger",
+      "status": "resolved",
+      "createdAt": "2026-09-03T11:10:12.322Z",
+      "updatedAt": "2026-09-21T12:45:56.604Z",
+      "author": "melodietexoss",
+      "story": {
+        "storyId": "nimbus-components-kpicard--danger",
+        "title": "Nimbus Components/KPI Card",
+        "name": "Danger",
+        "importPath": "src/components/nimbus/KpiCard.stories.tsx"
+      },
+      "component": {
+        "name": "KpiCard",
+        "chain": [
+          "KpiCard"
+        ],
+        "source": {
+          "file": "src/components/nimbus/KpiCard.tsx",
+          "line": 18
+        }
+      },
+      "target": {
+        "kind": "pin",
+        "selector": {
+          "cssSelector": ".kpi-value"
+        },
+        "context": {
+          "tag": "div",
+          "text": "$12,480"
+        },
+        "bbox": {
+          "x": 20,
+          "y": 20,
+          "w": 80,
+          "h": 24
+        },
+        "captureViewportWidth": 800
+      },
+      "comments": [
+        {
+          "id": "c_mtlfc427_gn0iao1b",
+          "author": "melodietexoss",
+          "body": "agent: fixed in KpiCard.tsx — pulse now triggers once via a keyed animation (commit 4f2a91c). Reopening so the reviewer can verify on the story.",
+          "createdAt": "2026-09-03T11:10:39Z",
+          "ghId": "5524809210",
+          "source": "github"
+        },
+        {
+          "id": "c_mtlfc3sb_oncjldpu",
+          "author": "github",
+          "body": "reopened on GitHub",
+          "createdAt": "2026-09-03T11:10:46.571Z",
+          "ghId": "gh-reopen-11",
+          "source": "github"
+        },
+        {
+          "id": "c_e2e_1",
+          "author": "melodietexoss",
+          "body": "LIFECYCLE E2E: danger KPI should pulse once when value drops, not forever",
+          "createdAt": "2026-09-03T11:30:00.000Z",
+          "ghId": "issue-body"
+        }
+      ],
+      "gh": {
+        "issue": 11,
+        "url": "https://github.com/melodietexoss/storybook-annotakit/issues/11",
+        "state": "closed",
+        "syncedAt": "2026-09-21T12:45:51.683Z"
+      },
+      "resolvedAt": "2026-09-03T11:11:58.135Z"
+    },
+    {
+      "id": "th_mtnpmj90_6k6k7tg3",
+      "number": 1,
+      "storyId": "nimbus-components--orders-table-story",
+      "status": "open",
+      "createdAt": "2026-09-05T01:34:21.684Z",
+      "updatedAt": "2026-09-21T12:45:55.429Z",
+      "author": "reviewer",
+      "story": {
+        "storyId": "nimbus-components--orders-table-story",
+        "title": "Nimbus/Components",
+        "name": "Orders Table",
+        "url": "http://localhost:6006/?path=/story/nimbus-components--orders-table-story",
+        "importPath": "./src/stories/leaf.stories.tsx"
+      },
+      "component": {
+        "name": "OrdersTable",
+        "chain": [
+          "OrdersTable"
+        ],
+        "source": {
+          "file": "src/components/nimbus/OrdersTable.tsx",
+          "line": 19,
+          "column": 9
+        }
+      },
+      "target": {
+        "kind": "pin",
+        "selector": {
+          "cssSelector": ".rounded-lg",
+          "textQuote": {
+            "exact": "export report",
+            "prefix": "recent orders",
+            "suffix": "order",
+            "occurrenceIndex": 0
+          },
+          "fragment": {
+            "x": 608.1,
+            "y": 41,
+            "w": 106.9,
+            "h": 34
+          }
+        },
+        "fingerprint": {
+          "tag": "button",
+          "attrs": [
+            {
+              "name": "type",
+              "value": "button"
+            }
+          ],
+          "neighborText": "recent orders"
+        },
+        "context": {
+          "tag": "button",
+          "text": "Export report",
+          "classes": "rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-400 hover:bg-slate-50",
+          "outerHTML": "<button type=\"button\" class=\"rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-400 hover:bg-slate-50\">Export report</button>"
+        },
+        "bbox": {
+          "x": 608.1,
+          "y": 41,
+          "w": 106.9,
+          "h": 34
+        },
+        "captureViewportWidth": 980
+      },
+      "comments": [
+        {
+          "id": "c_KU2ee4TpG5Oq",
+          "author": "reviewer",
+          "body": "live-verify: pin from agent-browser — checking snapshot capture + element identity",
+          "createdAt": "2026-09-05T01:34:21.680Z",
+          "ghId": "issue-body"
+        }
+      ],
+      "gh": {
+        "issue": 13,
+        "url": "https://github.com/melodietexoss/storybook-annotakit/issues/13",
+        "state": "open",
+        "syncedAt": "2026-09-21T12:45:51.683Z"
+      }
+    },
+    {
+      "id": "th_mtns2p9r_fy3iuv31",
+      "number": 1,
+      "storyId": "trackb-verify--live",
+      "status": "open",
+      "createdAt": "2026-09-05T02:42:55.215Z",
+      "updatedAt": "2026-09-21T12:45:56.967Z",
+      "author": "reviewer",
+      "story": {
+        "storyId": "trackb-verify--live",
+        "title": "TrackB",
+        "name": "Live"
+      },
+      "component": null,
+      "target": {
+        "kind": "pin",
+        "selector": {
+          "cssSelector": "div"
+        },
+        "context": {
+          "tag": "div",
+          "text": "track b live verify"
+        },
+        "bbox": {
+          "x": 1,
+          "y": 1,
+          "w": 10,
+          "h": 10
+        },
+        "captureViewportWidth": 800
+      },
+      "comments": [
+        {
+          "id": "c_RAdi4lUugs6B",
+          "author": "reviewer",
+          "body": "Track B live: orphan-branch durability check",
+          "createdAt": "2026-09-05T02:40:00Z",
+          "ghId": "issue-body"
+        }
+      ],
+      "gh": {
+        "issue": 15,
+        "url": "https://github.com/melodietexoss/storybook-annotakit/issues/15",
+        "state": "open",
+        "syncedAt": "2026-09-21T12:45:51.683Z"
+      }
+    }
+  ]
+}

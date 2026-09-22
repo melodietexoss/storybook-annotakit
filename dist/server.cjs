@@ -606,6 +606,8 @@ function loadDotEnv(configDir) {
       if (v && !process.env[key]) {
         process.env[key] = v;
         applied.push(key);
+        bootAppliedKeys.push(key);
+        envFileCache = file;
       }
     }
     if (applied.length) {
@@ -618,6 +620,48 @@ function loadDotEnv(configDir) {
 }
 function ghToken() {
   return process.env.ANNOTAKIT_GH_TOKEN || void 0;
+}
+var bootAppliedKeys = [];
+var envFileCache = null;
+function reloadDotEnv(configDir) {
+  const root = projectRoot(configDir);
+  const candidates = [
+    path2__default.default.join(root, ".env"),
+    path2__default.default.isAbsolute(configDir) ? path2__default.default.join(configDir, ".env") : path2__default.default.resolve(process.cwd(), configDir, ".env"),
+    path2__default.default.resolve(process.cwd(), ".env")
+  ];
+  const file = candidates.find((p) => fs.existsSync(p)) ?? null;
+  const out = { changed: [], removed: [], requiresRestart: [], file, tokenChanged: false };
+  if (!file) return out;
+  try {
+    const parsed = parseDotEnv(fs.readFileSync(file, "utf8"));
+    const prevFile = envFileCache;
+    envFileCache = file;
+    for (const key of bootAppliedKeys) {
+      const fresh = parsed[key];
+      const cur = process.env[key];
+      if (fresh && fresh !== cur) {
+        process.env[key] = fresh;
+        out.changed.push(key);
+        if (key !== "ANNOTAKIT_GH_TOKEN") out.requiresRestart.push(key);
+        else out.tokenChanged = true;
+      } else if (!fresh && cur !== void 0 && prevFile === file) {
+        delete process.env[key];
+        out.removed.push(key);
+        if (key !== "ANNOTAKIT_GH_TOKEN") out.requiresRestart.push(key);
+        else out.tokenChanged = true;
+      }
+    }
+    if (!bootAppliedKeys.includes("ANNOTAKIT_GH_TOKEN") && parsed.ANNOTAKIT_GH_TOKEN && !process.env.ANNOTAKIT_GH_TOKEN) {
+      process.env.ANNOTAKIT_GH_TOKEN = parsed.ANNOTAKIT_GH_TOKEN;
+      bootAppliedKeys.push("ANNOTAKIT_GH_TOKEN");
+      envFileCache = file;
+      out.changed.push("ANNOTAKIT_GH_TOKEN");
+      out.tokenChanged = true;
+    }
+  } catch {
+  }
+  return out;
 }
 function ghRepoEnv() {
   const v = process.env.ANNOTAKIT_GH_REPO;
@@ -886,7 +930,7 @@ function missingTokenMessage(configPath) {
     '  a) echo "ANNOTAKIT_GH_TOKEN=<your PAT>" >> .env   (dev server auto-loads it)',
     "  b) ANNOTAKIT_GH_TOKEN=<your PAT> bun run storybook  (env var at start)",
     `  c) {"ghToken": "<your PAT>"} in ${configPath}`,
-    "then RESTART storybook dev (.env is read once at boot).",
+    "then POST /annotakit/api/gh/reload (applies without restart \u2014 v0.6.6) or restart storybook dev.",
     "No token? The review loop still works 100% locally: REST + markdown digests on this server (see /annotakit/api/export)."
   ].join("\n");
 }
@@ -904,7 +948,7 @@ function invalidTokenMessage(detail) {
     `GitHub rejected the token (401: ${detail.slice(0, 160)}). Fix:`,
     "  a) regenerate the PAT at github.com/settings/tokens (classic: repo scope for private repos)",
     "  b) update .env \u2192 ANNOTAKIT_GH_TOKEN=<new PAT>",
-    "  c) RESTART storybook dev (.env is read once at boot).",
+    "  c) POST /annotakit/api/gh/reload (applies without restart \u2014 v0.6.6) or restart storybook dev.",
     "Until then: local review (threads/digests/resolve) keeps working; GH mirroring is paused."
   ].join("\n");
 }
@@ -1188,6 +1232,8 @@ function decideMirrorHeal(args) {
 var RETRY_LIMIT = 4;
 var RETRY_MAX_DELAY_MS = 3e4;
 var STALLED_SWEEP_MS = 10 * 6e4;
+var PULL_401_BACKOFF_MS = 5 * 6e4;
+var SKEW_REPAIR_MS = 5 * 6e4;
 function createGhSync(opts) {
   const { store, repo, token, configPath } = opts;
   const intervalMs = opts.intervalMs ?? 700;
@@ -1206,6 +1252,29 @@ function createGhSync(opts) {
   let lastPullAt = null;
   let lastError = null;
   let backoffUntil = 0;
+  let tokenState = token() ? "unexercised" : "missing";
+  let lastAuthError = null;
+  let lastTokenSeen = token();
+  const noteAuthFailure = (err) => {
+    if (err?.status === 401) {
+      tokenState = "rejected";
+      lastAuthError = err instanceof Error ? err.message.slice(0, 300) : String(err);
+    }
+  };
+  const noteTokenRotation = () => {
+    const tk = token();
+    if (tk !== lastTokenSeen) {
+      const wasRejected = tokenState === "rejected";
+      lastTokenSeen = tk;
+      if (tk) {
+        if (tokenState === "rejected" || tokenState === "missing") tokenState = "unexercised";
+      } else {
+        tokenState = "missing";
+        lastAuthError = null;
+      }
+      if (wasRejected) backoffUntil = 0;
+    }
+  };
   let lastStalledSweep = Date.now();
   const configured = () => {
     const t = token();
@@ -1224,6 +1293,7 @@ function createGhSync(opts) {
     const n = (retries.get(id) ?? 0) + 1;
     const message = err instanceof Error ? err.message : String(err);
     if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
+    noteAuthFailure(err);
     if (n <= RETRY_LIMIT && (e.status ?? 0) !== 401 && (e.status ?? 0) !== 404) {
       retries.set(id, n);
       notBefore.set(id, Date.now() + Math.min(intervalMs * 2 ** (n - 1), RETRY_MAX_DELAY_MS));
@@ -1303,7 +1373,7 @@ function createGhSync(opts) {
       if (orphan) {
         const adopted = await store.mutateThread(id, (cur) => {
           if (cur.gh) return;
-          cur.gh = { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: nowIso() };
+          cur.gh = { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: orphan.updated_at ?? nowIso() };
         });
         if (adopted) {
           opts.onEngineMutation(adopted, "updated");
@@ -1314,7 +1384,7 @@ function createGhSync(opts) {
       }
       const created = await createIssue(tk, rp, { title: issueTitle(t), body: issueBody(t), labels: labelsOf() });
       const still = await store.mutateThread(id, (cur) => {
-        cur.gh = { issue: created.number, url: created.html_url, state: "open", syncedAt: nowIso() };
+        cur.gh = { issue: created.number, url: created.html_url, state: "open", syncedAt: created.updated_at ?? nowIso() };
         for (const c of cur.comments) {
           if (!c.ghId && c.source !== "github") c.ghId = "issue-body";
         }
@@ -1338,9 +1408,11 @@ thread deleted in Storybook \u2014 closing.`);
       return "created";
     }
     let pushed = 0;
+    let remoteStamp;
     for (const c of t.comments) {
       if (c.ghId || c.source === "github") continue;
       const gh = await addIssueComment(tk, rp, t.gh.issue, mirrorBody(c));
+      remoteStamp = gh.updated_at ?? gh.created_at ?? remoteStamp;
       const after = await store.mutateThread(id, (cur) => {
         const target = cur.comments.find((x) => x.id === c.id);
         if (target && !target.ghId) target.ghId = String(gh.id);
@@ -1351,18 +1423,19 @@ thread deleted in Storybook \u2014 closing.`);
     const want = mirrorStateOf(t.status);
     if (t.gh.state !== want) {
       await addIssueComment(tk, rp, t.gh.issue, want === "closed" ? resolutionNotice(t) : reopenNotice(t));
-      await setIssueState(tk, rp, t.gh.issue, want);
+      const flipped = await setIssueState(tk, rp, t.gh.issue, want);
+      remoteStamp = flipped.updated_at ?? remoteStamp;
       const after = await store.mutateThread(id, (cur) => {
         if (cur.gh) {
           cur.gh.state = want;
-          cur.gh.syncedAt = nowIso();
+          cur.gh.syncedAt = flipped.updated_at ?? nowIso();
         }
       });
       if (after) opts.onEngineMutation(after, "updated");
       pushed++;
     } else if (pushed > 0) {
       const after = await store.mutateThread(id, (cur) => {
-        if (cur.gh) cur.gh.syncedAt = nowIso();
+        if (cur.gh) cur.gh.syncedAt = remoteStamp ?? nowIso();
       });
       if (after) opts.onEngineMutation(after, "updated");
     }
@@ -1492,10 +1565,11 @@ reopened in Storybook \u2014 thread #${t.number}.`;
       if (issue.state === "closed" && t.status !== "resolved") statusChange = "resolved";
       else if (issue.state === "open" && t.status === "resolved") statusChange = "reopen";
       const since = mir.syncedAt;
-      const issueActive = !since || !issue.updated_at || issue.updated_at > since;
+      const futureStamp = Boolean(since) && Date.parse(String(since)) > Date.now() + SKEW_REPAIR_MS;
+      const issueActive = futureStamp || !since || !issue.updated_at || issue.updated_at > since;
       let fresh = [];
       if (issueActive) {
-        const ghComments = await listIssueComments(tk, rp, mir.issue, since);
+        const ghComments = await listIssueComments(tk, rp, mir.issue, futureStamp ? void 0 : since);
         const known = new Set(t.comments.map((c) => c.ghId).filter((x) => Boolean(x)));
         let malformed = 0;
         for (const c of ghComments) {
@@ -1544,7 +1618,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
           }
           if (cur.gh) {
             cur.gh.state = issue.state;
-            if (issueActive) cur.gh.syncedAt = pullStartedAt;
+            if (issueActive) cur.gh.syncedAt = issue.updated_at ?? pullStartedAt;
           }
         });
         if (after && reason) {
@@ -1566,7 +1640,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
       if (!victim || queued.has(victim.id) || inflight.has(victim.id)) continue;
       const after = await store.mutateThread(victim.id, (cur) => {
         if (cur.gh) return;
-        cur.gh = { issue: issue.number, url: issue.html_url, state: issue.state, syncedAt: pullStartedAt };
+        cur.gh = { issue: issue.number, url: issue.html_url, state: issue.state, syncedAt: issue.updated_at ?? pullStartedAt };
       });
       if (after) {
         opts.onEngineMutation(after, "updated");
@@ -1616,7 +1690,10 @@ thread deleted in Storybook \u2014 closing.`);
   const enqueueDelete = (issue) => {
     void store.tombstone(issue).then(() => {
       if (opts.enabled && token() && repo) {
-        void run(pullOnceRaw).catch(() => void 0);
+        void run(pullOnceRaw).catch((err) => {
+          noteAuthFailure(err);
+          lastError = err instanceof Error ? err.message : String(err);
+        });
       }
     });
   };
@@ -1656,9 +1733,12 @@ thread deleted in Storybook \u2014 closing.`);
       pulled = r.pulled;
       closedTombstones = r.closedTombstones;
       healed = r.healed;
+      if (tokenState === "unexercised") tokenState = "ok";
     } catch (err) {
       const e = err;
       if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
+      noteAuthFailure(err);
+      if (e.status === 401) backoffUntil = Math.max(backoffUntil, Date.now() + PULL_401_BACKOFF_MS);
       lastError = err instanceof Error ? err.message : String(err);
     }
     if (pushError) lastError = pushError;
@@ -1693,6 +1773,11 @@ thread deleted in Storybook \u2014 closing.`);
       lastPullAt,
       lastError: Date.now() < backoffUntil ? lastError ?? "rate-limit backoff active" : lastError,
       backoffUntil: backoffUntil && Date.now() < backoffUntil ? new Date(backoffUntil).toISOString() : null,
+      // v0.6.6 (F7/SR-C-02): machine-readable auth state + the last 401 —
+      // /health consumers can finally tell "rejected" from "unexercised"
+      // from "healthy" without string-matching free-text lastError.
+      tokenState,
+      lastAuthError,
       // dogfood #4: recovery semantics must be observable — when will the
       // periodic sweep retry stalled threads (also: POST /sync, next mutation,
       // restart — the sweep is just the unattended one)
@@ -1704,21 +1789,26 @@ thread deleted in Storybook \u2014 closing.`);
     if (started) return;
     started = true;
     if (!opts.enabled) {
-      console.warn("[storybook-annotakit] GH mirror: off (auto disabled by config/env) \u2014 local mode; POST /sync reconciles when configured");
+      console.warn("[storybook-annotakit] GH mirror: off (auto disabled by config/env) \u2014 local mode; POST /sync reconciles when configured (enable needs a restart)");
       return;
     }
     if (!token() || !repo) {
-      console.warn("[storybook-annotakit] GH mirror: unconfigured \u2014 local mode (threads + digests fully work). To mirror to GitHub, configure token+repo and restart.");
-      return;
+      console.warn("[storybook-annotakit] GH mirror: unconfigured \u2014 local mode (threads + digests fully work). To mirror to GitHub: set token+repo, then POST /annotakit/api/gh/reload (no restart needed) or restart.");
     }
-    workerTimer = setInterval(tick, intervalMs);
+    workerTimer = setInterval(() => {
+      noteTokenRotation();
+      tick();
+    }, intervalMs);
     workerTimer.unref?.();
     if (opts.pollSec > 0) {
       pollTimer = setInterval(
         () => {
+          noteTokenRotation();
           void run(pullOnceRaw).catch((err) => {
             const e = err;
             if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
+            noteAuthFailure(err);
+            if (e.status === 401) backoffUntil = Math.max(backoffUntil, Date.now() + PULL_401_BACKOFF_MS);
             lastError = err instanceof Error ? err.message : String(err);
           });
         },
@@ -1726,12 +1816,14 @@ thread deleted in Storybook \u2014 closing.`);
       );
       pollTimer.unref?.();
     }
-    console.warn(
-      `[storybook-annotakit] GH mirror: auto \u2014 every thread gets ONE issue; lifecycle (open/fixed/resolved, replies) syncs both ways${opts.pollSec > 0 ? `, pull every ${opts.pollSec}s` : ", pull on POST /sync"}`
-    );
-    void run(syncAllRaw).catch((err) => {
-      lastError = err instanceof Error ? err.message : String(err);
-    });
+    if (token() && repo) {
+      console.warn(
+        `[storybook-annotakit] GH mirror: auto \u2014 every thread gets ONE issue; lifecycle (open/fixed/resolved, replies) syncs both ways${opts.pollSec > 0 ? `, pull every ${opts.pollSec}s` : ", pull on POST /sync"}`
+      );
+      void run(syncAllRaw).catch((err) => {
+        lastError = err instanceof Error ? err.message : String(err);
+      });
+    }
   };
   const stop = async () => {
     if (workerTimer) clearInterval(workerTimer);
@@ -2284,7 +2376,10 @@ function createAutoSync(opts) {
             consecutivePushFailures += 1;
             lastPushError = redact(push.out).slice(0, 200) || "git push failed";
             lastSyncAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
-            logOnce(`git push failed (${push.out})${ghToken() ? "" : " \u2014 no ANNOTAKIT_GH_TOKEN in .env?"}`);
+            const authRejected = /Authentication failed|could not read Username|terminal prompts disabled|403/.test(String(push.out));
+            logOnce(
+              `git push failed (${push.out})${ghToken() ? authRejected ? " \u2014 the token looks REJECTED or lacks scope: rotate ANNOTAKIT_GH_TOKEN in .env, then POST /annotakit/api/gh/reload (v0.6.6) or restart" : "" : " \u2014 no ANNOTAKIT_GH_TOKEN in .env?"}`
+            );
             state = "committed locally; push failed (retry on next mutation)";
           } else {
             state = "orphan branch updated locally (no remote to push)";
@@ -2444,7 +2539,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.5";
+var VERSION = "0.6.6";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2564,9 +2659,10 @@ async function sendMutationJson(rt, res, status, body, opts) {
   try {
     const s = await rt.ghsync.status();
     if (s.mode === "auto" && (s.stalled > 0 || s.lastError)) {
+      const ascii = (v) => v.replace(/[^\x20-\x7E]/g, "?");
       res.setHeader(
         "X-Annotakit-Mirror",
-        `unhealthy (stalled=${s.stalled}${s.lastError ? `; lastError=${String(s.lastError).slice(0, 140)}` : ""}) \u2014 see /annotakit/api/health ghSync`
+        ascii(`unhealthy (stalled=${s.stalled}${s.lastError ? `; lastError=${String(s.lastError).slice(0, 140)}` : ""}) -- see /annotakit/api/health ghSync`)
       );
     }
   } catch {
@@ -2833,7 +2929,8 @@ async function handleApi(req, res, url, configDir, origin) {
         ["DELETE", `${API_BASE}/threads/<id>`, "delete (path form; legacy DELETE /threads?id=<id> equivalent)"],
         ["GET|PUT", `${API_BASE}/threads/<id>/snapshot`, "plan-b DOM evidence \u2014 GET \u2192 JSON, GET ?format=html \u2192 human view; PUT replaces (idempotent, 96KB cap)"],
         ["GET", `${API_BASE}/export?format=md|json`, "digest \u2014 md clips comment bodies at 200 chars for display; json keeps FULL bodies. NOTE the json envelope is {generatedAt, stories:[...]} (story-grouped), NOT the {threads:[...]} shape of GET /threads"],
-        ["GET|POST", `${API_BASE}/sync`, "mirror status / force reconcile \u2014 POST also forces one git store cycle first (v0.6.1)"]
+        ["GET|POST", `${API_BASE}/sync`, "mirror status / force reconcile \u2014 POST also forces one git store cycle first (v0.6.1)"],
+        ["POST", `${API_BASE}/gh/reload`, "re-read .env and apply token changes WITHOUT a restart (v0.6.6) \u2014 response lists applied/requiresRestart; the PAT is never echoed"]
       ],
       POST: {
         url: `${API_BASE}/threads`,
@@ -2867,6 +2964,10 @@ async function handleApi(req, res, url, configDir, origin) {
       rest: true,
       digests: ["md", "json"],
       github: ghSync.mode === "auto",
+      // v0.6.6 (F7/SR-C-02): 'github' above is presence-based (mode); this is
+      // the OUTCOME-based signal — agents can stop committing to a mirror
+      // whose token is rejected instead of waiting forever.
+      githubAuth: ghSync.tokenState ?? (hasToken ? "unexercised" : "missing"),
       githubLabel: GH_LABEL,
       githubLabels: rt.ghLabels,
       ...ghSync.mode !== "auto" ? { githubReason: ghSync.mode === "off" ? "disabled (ANNOTAKIT_GH_AUTO=0 / ghAuto:false)" : !hasToken ? "no token" : "no repo" } : {},
@@ -2885,6 +2986,8 @@ async function handleApi(req, res, url, configDir, origin) {
       gh: {
         repo: rt.repo,
         hasToken,
+        tokenState: ghSync.tokenState ?? (hasToken ? "unexercised" : "missing"),
+        lastAuthError: ghSync.lastAuthError ?? null,
         autoSync: rt.sync.describe(),
         ghSync,
         labels: rt.ghLabels
@@ -3139,6 +3242,23 @@ async function handleApi(req, res, url, configDir, origin) {
       return true;
     }
   }
+  if (p === `${API_BASE}/gh/reload` && method === "POST") {
+    const r = reloadDotEnv(configDir);
+    const st = await rt.ghsync.status();
+    sendJson(res, 200, {
+      ok: true,
+      file: r.file,
+      applied: r.changed,
+      // keys whose NEW value is now live in process.env
+      removed: r.removed,
+      tokenChanged: r.tokenChanged,
+      // repo/labels/poll/interval/auto are boot-captured — a change needs a restart
+      requiresRestart: r.requiresRestart,
+      tokenState: st.tokenState,
+      mode: st.mode
+    });
+    return true;
+  }
   if (p === `${API_BASE}/gh` && method === "POST") {
     const summary = await rt.ghsync.syncAll();
     sendJson(res, 200, {
@@ -3157,7 +3277,8 @@ var KNOWN_API_ROUTES = [
   [new RegExp(`^${API_BASE}/threads/[^/]+/comments$`), "POST, OPTIONS"],
   [new RegExp(`^${API_BASE}/export$`), "GET, OPTIONS"],
   [new RegExp(`^${API_BASE}/sync$`), "GET, POST, OPTIONS"],
-  [new RegExp(`^${API_BASE}/gh$`), "POST, OPTIONS"]
+  [new RegExp(`^${API_BASE}/gh$`), "POST, OPTIONS"],
+  [new RegExp(`^${API_BASE}/gh/reload$`), "POST, OPTIONS"]
 ];
 function resolveNotHandled(res, pathname) {
   for (const [re, allow] of KNOWN_API_ROUTES) {

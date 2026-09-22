@@ -35,8 +35,8 @@ python3 scripts/serve-static.py examples/nimbus/dist-storybook 3000
 | client GH config | bake ALSO writes `annotakit-gh.json` (PAT+repo+labels+pollMs) when token+repo resolve (flags `--gh-token/--gh-repo/--gh-labels/--gh-poll-sec` / `ANNOTAKIT_*` env / project .env) |
 | browser mirror | the BROWSER mirrors threads to GitHub issues — full lifecycle incl. pull-back of agent replies/state flips; no server (api.github.com speaks CORS) |
 | durability | every op hits the outbox `annotakit:ghq:<scope>` BEFORE the network; failed/late ops drain on next load (boot drain), any mutation (wake), or the 30s sweep — which ALSO re-enqueues stalled threads (unmapped, or with un-mirrored deltas) |
-| leader | ONE manager TAB flushes (v0.6.5: a localStorage lease `annotakit:ghleader:<scope>` — two top-level tabs never double-flush; the iframe only enqueues — storage events wake the leader) |
-| overrides | panel → GitHub (static) settings (repo/labels/token/poll/disable) merge over the baked file (`annotakit:ghcfg:<scope>`); "Reset" drops them |
+| leader | ONE manager TAB flushes (v0.6.5: a localStorage lease `annotakit:ghleader:<scope>` — two top-level tabs never double-flush; the iframe only enqueues — storage events wake the leader). v0.6.6: the lease is `{id, nonce, at}` — the nonce is per-DOCUMENT, so a duplicated tab can never co-claim, and a pagehide release makes a reload reclaim instantly |
+| overrides | panel → GitHub (static) settings (repo/labels/token/poll/disable) merge over the baked file (`annotakit:ghcfg:<scope>`); "Reset" drops them. v0.6.6: a saved token override is VISIBLE (`tokenOverridden` — amber warning + honest placeholder) with a one-click "use baked" recovery that drops ONLY the token; whitespace-only token input is ignored |
 | status | v0.6.4: NO persistent chips — dots on the GitHub button (green live / amber off-with-queue / red error) + `sync · N` queue count on the sync button + tooltip + settings |
 | dev mode | NEVER client-publishes (engine owns the mirror — two writers = double issues) |
 | serve-static.py | double-fork twin (any dir+port; logs static-<port>.log). No host validation — the 403 dance is dev-only; any file server works. Serves by PATH, never chdir — a rebuild wiping the output dir kills the request handlers |
@@ -69,10 +69,12 @@ echo "ANNOTAKIT_GH_TOKEN=<PAT>" >> .env
 # e) repo — auto-detected from `git remote get-url origin` (or package.json
 #    "repository"); FAILS SILENTLY in a non-git project — pin it:
 echo '{"ghRepo":"owner/name"}' > .storybook/annotakit.config.json   # or ANNOTAKIT_GH_REPO in .env
-# f) RESTART dev — .env, config, repo detection are read ONCE at boot
+# f) RESTART dev — .env, config, repo detection are read ONCE at boot (v0.6.6 exception:
+#    ANNOTAKIT_GH_TOKEN rotations apply WITHOUT a restart: edit .env → POST
+#    /annotakit/api/gh/reload)
 ```
 
-Env knobs (all optional, read at boot): `ANNOTAKIT_GH_TOKEN` (PAT) · `ANNOTAKIT_GH_REPO` (owner/name) · `ANNOTAKIT_GH_LABELS` (a,b — applied on create, AND-combined in the pull filter; the multi-workstream knob) · `ANNOTAKIT_GH_AUTO=0|false|off|no` (mirror off → local mode) · `ANNOTAKIT_GH_POLL=<sec>` (pull interval; 0 = POST /sync only) · `ANNOTAKIT_GH_INTERVAL=<ms>` (worker tick, default 700) · `ANNOTAKIT_GH_API=<base>` (GHE / test fake) · `ANNOTAKIT_API_KEY` (shared secret gating NON-loopback clients ONLY — loopback ALWAYS passes; a non-loopback peer sends it as `x-annotakit-key`, else 401; with no key at all non-loopback gets 403).
+Env knobs (all optional, read at boot — the TOKEN alone is hot-reloadable, v0.6.6): `ANNOTAKIT_GH_TOKEN` (PAT — rotate in .env + `POST /annotakit/api/gh/reload`, no restart) · `ANNOTAKIT_GH_REPO` (owner/name) · `ANNOTAKIT_GH_LABELS` (a,b — applied on create, AND-combined in the pull filter; the multi-workstream knob) · `ANNOTAKIT_GH_AUTO=0|false|off|no` (mirror off → local mode) · `ANNOTAKIT_GH_POLL=<sec>` (pull interval; 0 = POST /sync only) · `ANNOTAKIT_GH_INTERVAL=<ms>` (worker tick, default 700) · `ANNOTAKIT_GH_API=<base>` (GHE / test fake) · `ANNOTAKIT_API_KEY` (shared secret gating NON-loopback clients ONLY — loopback ALWAYS passes; a non-loopback peer sends it as `x-annotakit-key`, else 401; with no key at all non-loopback gets 403).
 
 Consumer git: auto-sync commits into whatever repo git finds, walking UP (a non-git SB project in another repo adopts the ENCLOSING repo; git-init yours or `"autoSync": false`). Add `*.db-wal`/`*.db-shm` to YOUR .gitignore. `file:` installs copy the addon's whole dir into node_modules (incl. .env) — registry installs don't.
 
@@ -88,11 +90,12 @@ NATIVE toolbar buttons (pin · region · threads+count · show/hide) + ⌥-hotke
 
 ```json
 "agentSurfaces": { "rest": true, "digests": ["md","json"], "github": true,
-  "githubLabel": "annotakit", "durability": "git-push" }
+  "githubAuth": "ok", "githubLabel": "annotakit", "durability": "git-push" }
 ```
 
 - `github: true` → **Path A (GitHub) AND Path B (local REST) both live**.
 - `github: false` (+ `githubReason: "no token" | "no repo" | "disabled"`) → **Path B only**.
+- `githubAuth` (v0.6.6) = the token's OUTCOME — `ok` / `rejected` / `unexercised` / `missing` (`gh.tokenState` + `gh.lastAuthError` in /health say the same). `github` is presence-based and stays `true` through a total auth outage — trust `githubAuth` before committing work to a rejected mirror; recovery = rotate the PAT in .env + `POST /annotakit/api/gh/reload` (resets `rejected`, clears a 401 backoff).
 
 **Path B — local REST loop** (every install; base `http://localhost:<port>/annotakit/api`):
 
@@ -106,6 +109,9 @@ curl -X PATCH $API/threads/<id> -H 'content-type: application/json' -d '{"status
 curl -X DELETE $API/threads/<id>                   # path form (?id= also works)
 curl -X POST $API/sync                             # force mirror reconcile (idempotent; local mode →
                                                    #   200 {noop, reason} — §4)
+curl -X POST $API/gh/reload                       # re-read .env, apply token changes WITHOUT a restart
+                                                   #   (v0.6.6 — boot-applied keys only; response lists
+                                                   #   applied/removed/requiresRestart; PAT never echoed)
 ```
 
 Also: `POST /threads` (create — needs the full pin target; copy the /schema example) · `GET /threads/<id>` (single doc) · `?storyId=` filter · `/export?format=md|json` · `/threads/<id>/snapshot` (DOM at pin time; `data-annota-snap="1"`; `?format=html` renders).
@@ -125,6 +131,7 @@ The loop: GET threads → `component.source.file:line` + `story.importPath` → 
 | comment ids | re-hashed server-side — key comments by thread id, never your own comment id |
 | thread number | PER-STORY (two stories can each have a #1) — key threads by `id` |
 | pre-mapping replies | land in the issue BODY on backfill; only post-mapping replies mirror as comments |
+| gh/reload (v0.6.6) | POST-only (GET → 405 + Allow). Re-reads `.env`, applies CHANGES to process.env for boot-applied keys ONLY (shell vars keep precedence; vanished keys removed); response `{ok, file, applied, removed, tokenChanged, requiresRestart, tokenState, mode}` — repo/labels/poll/interval/auto are boot-captured and land in `requiresRestart`; the PAT is NEVER echoed |
 | tokens | never appear in responses or exports |
 
 **Path A — GitHub-only loop** (no localhost access): list issues labeled `annotakit` → body (component, repo-root-relative `jsx:` path, element, selector, thread id — FULL verbatim notes, v0.6.3) → fix code → comment evidence (diff + SHA) → do NOT close (closing = REVIEWER-confirmed): the reviewer closes / panel-confirms → thread resolves within one poll (60s), comments imported as replies (`source: "github"`); issue-reopen re-opens the thread; post-close comments still import. Issues written by pre-v0.6.3 versions (clipped bodies/titles) self-heal to verbatim on the deployment's first sync after upgrade — v0.6.5 exact-match: only a body that still BYTE-EQUALS the frozen legacy machine render (v0.5.0–v0.6.2, both engines — `src/shared/legacyMirror.ts`) is rewritten; a human-edited mirror never matches and stays untouched (safe miss — replies still flow).
@@ -149,7 +156,13 @@ The loop: GET threads → `component.source.file:line` + `story.importPath` → 
 - **Serialized engine**: pushes, pulls, POST /sync run through ONE mutex — no duplicate issues under concurrent syncs, no lost interleaved writes. Engine writes are atomic per-thread (`store.mutateThread`); `updateThread` returning null (id deleted concurrently) = 404, never resurrect. Internal rule: never `run()` inside `run()` — self-deadlock; entries wrap RAWs, internals call the raws.
 - **Push on every mutation** (debounced): unmapped → create the issue ONCE; reply → issue comment (ghId dedupe); status flip → close/reopen + sentinel notice; DELETE → tombstone → close with note. A thread deleted WHILE its issue is created self-closes it (orphan guard). v0.6.5 create-crash recovery: a create that landed on GitHub but crashed before the mapping was stamped is ADOPTED on the next sync (stamped orphan — no duplicate issue).
 - **Pull every `ANNOTAKIT_GH_POLL` sec (default 60)**: remote close/reopen → local flip; third-party comments → replies (comment-id dedupe); engine comments carry `GH_SENTINEL`, never echo. API budget: comments fetched only for issues updated since our last sync (idle = 0 requests); listings follow Link headers (10-page cap, loud truncation warning if hit).
-- **Failure behavior**: 401 → a/b/c self-healing steps, mirror pauses, local keeps working. 429/403-rate → timed backoff (Retry-After / x-ratelimit-reset, clamped against clock skew; `backoffUntil` in GET /sync). 5xx/unreachable → 4 exponential retries, then delta `stalled` (nothing lost) — re-attempted by the ~10min sweep / POST /sync / next mutation / restart. Remote issue deleted (404) → mapping resets, thread survives, fresh issue next sync (no dupes).
+- **Failure behavior**: 401 → a/b/c self-healing steps (step c = `POST /annotakit/api/gh/reload` — no restart), pull 401s back off 5min (a token rotation clears the backoff + resets `tokenState` off `rejected`), mirror pauses, local keeps working. 429/403-rate → timed backoff (Retry-After / x-ratelimit-reset, clamped against clock skew; `backoffUntil` in GET /sync). 5xx/unreachable → 4 exponential retries, then delta `stalled` (nothing lost) — re-attempted by the ~10min sweep / POST /sync / next mutation / restart. Remote issue deleted (404) → mapping resets, thread survives, fresh issue next sync (no dupes).
+- **Incident runbook — "an old PAT shadows every re-bake" (v0.6.6; the round's root-cause incident, reproduced live)**. A browser that EVER saved a token override keeps using it across every re-bake; pre-v0.6.6 the UI showed an empty token field + "empty keeps the baked token" while the override silently 401'd:
+  1. Symptom: static deployment red dot / 401s, yet the baked `annotakit-gh.json` token is known-good (fresh re-bake, works elsewhere).
+  2. Panel → GitHub settings: `tokenOverridden` → amber "⚠ a token override is saved in this browser" + the placeholder reads "empty keeps the OVERRIDE".
+  3. Click **use baked** (drops ONLY the token override — repo/labels/poll overrides survive; clears op + pull backoff) — or paste a fresh PAT (whitespace-only input is ignored with a notice).
+  4. Verify: green dot, queue drains; a follower tab shows "follower tab" in the settings status line, and its Sync either claims the lease or reports "another tab holds the sync lease" honestly.
+  5. Dev-server twin: rotate `ANNOTAKIT_GH_TOKEN` in .env → `POST /annotakit/api/gh/reload` → `/health` `gh.tokenState` leaves `rejected`; a LIVE client tab self-heals on its next 401 (the baked-config cache invalidates + re-probes — no reload needed).
 - **Idempotency contract**: POST /sync (and the legacy POST /gh alias) never creates a second issue for a mapped thread — click it all day. Local mode → `200 {ok, noop: true, reason: <a/b/c steps>}`.
 
 ## 5. Build & test (when developing the addon)
@@ -198,7 +211,8 @@ Suites self-report totals + exit nonzero — report what they print; expected co
 - **Deduped failure logs hide PERMANENT failure** (`logOnce` prints once, then silence — indistinguishable from healthy quiet sync): pair dedup with a failure counter that feeds /health (gitHealth does).
 - **A shutdown path must never exit PAST a running critical section**: a "skip if busy" guard read as "done" by a shutdown kills the in-flight cycle. Fix: JOIN the in-flight promise (`if (inflight) return inflight`); the flush awaits it before its final cycle. Such a guard turns deadly the moment a shutdown reads it as "done".
 - **Bare `fs` in `node -e` is an eval-context injection, not a global** — `require('fs')` resolves everywhere (and `node -e` scripts in package.json need double-escaped quotes in JSON).
-- **A "wake"-style re-arm must NEVER fire when the invocation did no work** (v0.6.1 P0): a flusher whose `finally` re-armed unconditionally spun forever when the loop exited early (cfg null → disabled) with eligible ops — an undebuggable microtask busy-loop re-freezing the tab at every boot-drain. Gate the re-arm on actual work (`ranWork`); no-work exits wait for a real wake. Any "re-check in finally" needs a did-work guard, or an early exit becomes that busy-loop.
+- **A "wake"-style re-arm must NEVER fire when the invocation did no work** (v0.6.1 P0): a flusher whose `finally` re-armed unconditionally spun forever when the loop exited early (cfg null → disabled) with eligible ops — an undebuggable microtask busy-loop re-freezing the tab at every boot-drain. Gate the re-arm on actual work (`ranWork`); no-work exits wait for a real wake. Any "re-check in finally" needs a did-work guard, or an early exit becomes that busy-loop. (v0.6.6: a wake arriving MID-flush is LATCHED — `wakePending` — and honored by exactly one finishing pass, so a re-enabling save never loses its flush to an in-flight cfg-null pass.)
+- **v0.6.6 sync-robustness facts**: the cross-tab lease is `{id, nonce, at}` — the nonce is per-DOCUMENT (a duplicated tab shares the sessionStorage id but never the nonce → cannot co-claim; a RELOAD gets a fresh nonce but its predecessor's pagehide released the lease → instant reclaim; a v0.6.5-format lease without a nonce counts as expired → rolling upgrade takes over ≤1 TTL); the lease is re-verified per flush-loop iteration AND before every remote write (create, each comment — a long drain renews it, lifecycle, close; loss → transient re-queue for the new leader); pull 401s back off 5min (a manual Sync or settings save clears it); `syncedAt` stamps are SERVER-CLOCK (GitHub `updated_at` — client clock skew can no longer permanently hide third-party replies; a legacy future-stamp is repaired on sight by re-listing without a `since` filter).
 
 ## 7. Verification checklist (before reporting success)
 
@@ -217,6 +231,7 @@ Routine gates ([prereq]; totals self-report — §5):
 | 6 | resolve in preview → panel updates live | needs browser |
 | 7 | `git ls-remote origin refs/heads/<store-branch>` advanced (`annotakit`/`annotakit-store`, §4). NOT `git log` — orphan branch, clean tree; sync commits on main = FALSE failure | needs git remote |
 | 8 | POST a thread → issue within ~2s (POST /sync twice → `created: 0`); resolve → closed; `gh.state` via GET /threads | needs PAT + repo |
+| 8b | token health + rotation (v0.6.6): `/health` `gh.tokenState` ∈ {ok, unexercised} when configured + `agentSurfaces.githubAuth` present; `POST /annotakit/api/gh/reload` → 200 `{ok, requiresRestart…}` (rotate the .env PAT → `tokenState` resets off `rejected`) | needs PAT + repo |
 | 9 | local mode (no .env): `github:false` + reason; POST /sync → 200 noop; pin/resolve/export work | needs dev server |
 
 10. [needs gateway] serving through a proxy → verify the PUBLIC URL, not localhost (localhost passes even when public 403s — §0): derive, curl from inside, then BROWSER-verify — manager JS loads, WS/HMR connects, story renders, pin click arms the preview; curl sees none of those failures

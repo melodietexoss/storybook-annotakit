@@ -473,16 +473,24 @@ function ReviewPanel(): React.ReactElement {
     if (!store.gh) return;
     setGhBusy(true);
     try {
+      // v0.6.6 (F9): diff against the FRESH effective config — the ghStat
+      // snapshot can be seconds stale, and diffing against it used to write
+      // spurious overrides (pollMs was written on EVERY save, freezing a
+      // moment-in-time config into localStorage forever).
+      const freshStat = await ghClientStatus();
       const labels = String(ghForm.labels ?? '')
         .split(/[,\s]+/)
         .map((l) => l.trim())
         .filter(Boolean);
       const patch: GhClientSettings = {};
-      if (ghForm.repo) patch.repo = ghForm.repo.trim();
-      if (ghForm.token) patch.token = ghForm.token.trim();
-      if (labels.length) patch.labels = labels;
-      if (ghForm.pollMs !== undefined) patch.pollMs = ghForm.pollMs;
+      const repo = (ghForm.repo ?? '').trim();
+      if (repo && repo !== freshStat.repo) patch.repo = repo;
+      const tok = (ghForm.token ?? '').trim();
+      if (tok) patch.token = tok; // whitespace-only input is IGNORED (SR-A N1: it used to save token:"" and disarm the whole config)
+      if (labels.length && labels.join(',') !== (freshStat.labels ?? []).join(',')) patch.labels = labels;
+      if (ghForm.pollMs !== undefined && ghForm.pollMs !== freshStat.pollMs) patch.pollMs = ghForm.pollMs;
       patch.disabled = ghForm.disabled ? true : undefined;
+      const tokIgnored = Boolean(ghForm.token) && !tok;
       store.gh.saveSettings(patch);
       const s = await ghClientStatus();
       setGhStat(s);
@@ -491,8 +499,10 @@ function ReviewPanel(): React.ReactElement {
       // localStorage write failed — the notice now reports the EFFECTIVE state.
       if (!s.configured && !patch.disabled) {
         setNotice('saved — but NOT publishing yet: repo must be owner/name and a token must be present (check GitHub settings below)');
+      } else if (tokIgnored) {
+        setNotice('saved — token unchanged (whitespace-only input ignored; use "use baked" to drop a saved override)');
       } else {
-        setNotice(`saved — publishing${patch.disabled ? ' disabled' : ` → ${patch.repo ?? ghStat?.repo ?? '(baked repo)'}`}${labels.length ? ` · labels: ${labels.join(', ')}` : ''}`);
+        setNotice(`saved — publishing${patch.disabled ? ' disabled' : ` → ${patch.repo ?? freshStat.repo ?? '(baked repo)'}`}${labels.length ? ` · labels: ${labels.join(', ')}` : ''}`);
       }
       window.setTimeout(() => setNotice(null), 5000);
       await store.gh.syncNow();
@@ -503,6 +513,21 @@ function ReviewPanel(): React.ReactElement {
     } finally {
       setGhBusy(false);
     }
+  };
+
+  const useBakedToken = async (): Promise<void> => {
+    const store = await getGhLinkedStaticStore();
+    store.gh?.clearTokenOverride();
+    setGhForm((f) => ({ ...f, token: '' }));
+    const s = await ghClientStatus();
+    setGhStat(s);
+    // SR-W2 P3: be honest when there is NO baked config to fall back to
+    setNotice(
+      s.configured
+        ? 'token override removed — the baked annotakit-gh.json token applies again (repo/labels/poll overrides survive)'
+        : 'token override removed — but NO baked config exists for this deployment: paste a token above (or in GitHub settings) to publish',
+    );
+    window.setTimeout(() => setNotice(null), 5000);
   };
 
   const clearGhSettings = async (): Promise<void> => {
@@ -704,6 +729,8 @@ function ReviewPanel(): React.ReactElement {
             {ghStat?.configured && !ghStat.suppressed && (
               <span style={{ color: theme.textMutedColor }}>
                 queue {ghStat.queue}{ghStat.flushing ? ' (flushing)' : ''}{ghStat.parked ? ` · parked ${ghStat.parked}` : ''}{ghStat.lastPushAt ? ` · pushed ${ago(ghStat.lastPushAt)}` : ''}{ghStat.lastPullAt ? ` · pulled ${ago(ghStat.lastPullAt)}` : ''}{ghStat.pollMs > 0 ? ` · polls every ${Math.round(ghStat.pollMs / 1000)}s` : ' · polling off'}
+                {/* v0.6.6 (SR-B P2-3): a follower tab was indistinguishable from broken sync */}
+                {!ghStat.leader ? ' · follower tab — another tab holds the sync lease' : ''}
               </span>
             )}
           </div>
@@ -739,11 +766,27 @@ function ReviewPanel(): React.ReactElement {
               style={{ flex: 1, padding: '3px 8px', fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || 'transparent', color: theme.textColor }}
               value={String(ghForm.token ?? '')}
               onChange={(e) => setGhForm((f) => ({ ...f, token: e.target.value }))}
-              placeholder="classic PAT with repo scope — empty keeps the baked token"
+              placeholder={ghStat?.tokenOverridden
+                ? 'a token saved in THIS browser OVERRIDES the baked one — empty keeps the OVERRIDE'
+                : 'classic PAT with repo scope — empty keeps the baked token'}
               spellCheck={false}
               autoComplete="off"
             />
+            {ghStat?.tokenOverridden && (
+              <button
+                style={{ padding: '3px 8px', fontSize: 10, fontWeight: 600, cursor: 'pointer', borderRadius: 6, border: `1px solid ${theme.appBorderColor}`, background: 'transparent', color: theme.textColor, whiteSpace: 'nowrap' }}
+                onClick={() => void useBakedToken()}
+                title="Remove ONLY the saved token override — the baked annotakit-gh.json token applies again (repo/labels/poll overrides survive). Recovery path for an old PAT that shadows every re-bake."
+              >
+                use baked
+              </button>
+            )}
           </label>
+          {ghStat?.tokenOverridden && (
+            <div style={{ padding: '3px 8px', borderRadius: 6, background: '#f59e0b18', color: '#b45309', fontSize: 10 }}>
+              ⚠ a token override is saved in this browser — it overrides the baked annotakit-gh.json on every deploy. If syncing fails with 401, paste a fresh PAT or click "use baked".
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
             <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <span style={{ color: theme.textMutedColor }}>poll (s)</span>

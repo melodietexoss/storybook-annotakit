@@ -254,6 +254,10 @@ export interface HealthInfo {
   gh?: {
     repo: string | null;
     hasToken: boolean;
+    /** v0.6.6 (F7): machine-readable token outcome — see AgentSurfaces.githubAuth. */
+    tokenState?: 'missing' | 'unexercised' | 'ok' | 'rejected';
+    /** The last 401 message (set when tokenState === 'rejected'). */
+    lastAuthError?: string | null;
     autoSync: string;
     /** v0.5.3: labels applied to created issues (multi-workstream routing). */
     labels?: string[];
@@ -287,6 +291,10 @@ export interface AgentSurfaces {
   digests: string[];
   /** 1:1 GitHub issue mirror is active (agents can work purely from GitHub). */
   github: boolean;
+  /** v0.6.6 (F7): the mirror token's OUTCOME state — 'ok' | 'rejected' |
+   *  'unexercised' | 'missing'. `github` above is presence-based and stays
+   *  true through a total auth outage; this is the honest signal. */
+  githubAuth?: 'ok' | 'rejected' | 'unexercised' | 'missing';
   /** Label the mirror files issues under. */
   githubLabel: string;
   /** v0.5.3: full label set — ALL applied on issue create, AND-combined for
@@ -323,6 +331,13 @@ export interface GhSyncStatus {
   lastError: string | null;
   /** While set (rate-limit/transient backoff), pushes+polls pause. */
   backoffUntil: string | null;
+  /** v0.6.6 (F7): machine-readable token state — 'missing' (no token),
+   *  'unexercised' (present, never validated by a REST call), 'ok' (a REST
+   *  call succeeded with it), 'rejected' (GitHub answered 401). A rotation
+   *  via POST /annotakit/api/gh/reload resets 'rejected' to 'unexercised'. */
+  tokenState?: 'missing' | 'unexercised' | 'ok' | 'rejected';
+  /** The last 401 message (set when tokenState === 'rejected'). */
+  lastAuthError?: string | null;
   /** When the periodic stalled sweep retries (dogfood #4: recovery must be
    *  observable). null in local/off modes (nothing can be stalled). */
   nextStalledSweepAt?: string | null;

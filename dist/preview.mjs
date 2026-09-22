@@ -11,7 +11,7 @@ import {
 } from "./chunk-XM4L6WNP.mjs";
 import {
   getGhLinkedStaticStore
-} from "./chunk-Y3KBXHJT.mjs";
+} from "./chunk-BKSLU7VF.mjs";
 import {
   MAX_BODY_CHARS,
   elementSummary

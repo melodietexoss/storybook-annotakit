@@ -74,6 +74,8 @@ export function loadDotEnv(configDir: string): DotEnvResult {
       if (v && !process.env[key]) {
         process.env[key] = v;
         applied.push(key);
+        bootAppliedKeys.push(key); // v0.6.6 (F8): reloadDotEnv may only touch these
+        envFileCache = file;
       }
     }
     if (applied.length) {
@@ -88,6 +90,80 @@ export function loadDotEnv(configDir: string): DotEnvResult {
 /** The GitHub token after env/config resolution. */
 export function ghToken(): string | undefined {
   return process.env.ANNOTAKIT_GH_TOKEN || undefined;
+}
+
+/* ------------------- v0.6.6 (F8/SR-C-03): hot .env reload ------------------- */
+
+/** Keys boot-applied from .env — ONLY these may be overwritten by
+ *  reloadDotEnv (shell-provided vars keep their precedence forever). */
+let bootAppliedKeys: string[] = [];
+let envFileCache: string | null = null;
+
+export interface ReloadDotEnvResult {
+  /** .env keys whose value CHANGED and were applied to process.env. */
+  changed: string[];
+  /** .env keys removed from the file (and from process.env). */
+  removed: string[];
+  /** Boot-applied keys whose new value needs a RESTART to take effect
+   *  (repo/labels/poll/interval/auto are captured at boot; the TOKEN is the
+   *  only engine-live key — the lazy getter re-reads it every cycle). */
+  requiresRestart: string[];
+  /** The .env file that was read (null = none found). */
+  file: string | null;
+  /** True when NO key the engine reads live changed (nothing to apply). */
+  tokenChanged: boolean;
+}
+
+/** Re-read `.env` and apply changes to process.env WITHOUT a restart.
+ *  Scope: ONLY keys that were boot-applied from .env (shell vars win, as at
+ *  boot). Vanished keys are deleted. ANNOTAKIT_GH_TOKEN is hot (the ghsync
+ *  token() getter reads process.env every cycle); everything else is
+ *  reported in requiresRestart because the engine captured it at boot. */
+export function reloadDotEnv(configDir: string): ReloadDotEnvResult {
+  const root = projectRoot(configDir);
+  const candidates = [
+    path.join(root, '.env'),
+    path.isAbsolute(configDir) ? path.join(configDir, '.env') : path.resolve(process.cwd(), configDir, '.env'),
+    path.resolve(process.cwd(), '.env'),
+  ];
+  const file = candidates.find((p) => existsSync(p)) ?? null;
+  const out: ReloadDotEnvResult = { changed: [], removed: [], requiresRestart: [], file, tokenChanged: false };
+  if (!file) return out;
+  try {
+    const parsed = parseDotEnv(readFileSync(file, 'utf8'));
+    const prevFile = envFileCache;
+    envFileCache = file;
+    for (const key of bootAppliedKeys) {
+      const fresh = parsed[key];
+      const cur = process.env[key];
+      if (fresh && fresh !== cur) {
+        process.env[key] = fresh;
+        out.changed.push(key);
+        if (key !== 'ANNOTAKIT_GH_TOKEN') out.requiresRestart.push(key);
+        else out.tokenChanged = true;
+      } else if (!fresh && cur !== undefined && prevFile === file) {
+        // key vanished from the file — remove it (only when THIS file was the source)
+        delete process.env[key];
+        out.removed.push(key);
+        if (key !== 'ANNOTAKIT_GH_TOKEN') out.requiresRestart.push(key);
+        else out.tokenChanged = true;
+      }
+    }
+    // a token that appeared for the first time (wasn't boot-applied) also
+    // applies — AND registers as boot-applied so EVERY subsequent rotation
+    // or removal flows through the main loop (SR-W2: this branch used to be
+    // one-shot, silently ignoring all later .env rotations)
+    if (!bootAppliedKeys.includes('ANNOTAKIT_GH_TOKEN') && parsed.ANNOTAKIT_GH_TOKEN && !process.env.ANNOTAKIT_GH_TOKEN) {
+      process.env.ANNOTAKIT_GH_TOKEN = parsed.ANNOTAKIT_GH_TOKEN;
+      bootAppliedKeys.push('ANNOTAKIT_GH_TOKEN');
+      envFileCache = file;
+      out.changed.push('ANNOTAKIT_GH_TOKEN');
+      out.tokenChanged = true;
+    }
+  } catch {
+    /* unreadable file — report nothing changed */
+  }
+  return out;
 }
 
 /** Repo override from env (beats detection, loses to config file). */

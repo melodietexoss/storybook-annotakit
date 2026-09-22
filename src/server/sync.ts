@@ -718,7 +718,13 @@ export function createAutoSync(opts: {
           consecutivePushFailures += 1;
           lastPushError = redact(push.out).slice(0, 200) || 'git push failed';
           lastSyncAttemptAt = new Date().toISOString();
-          logOnce(`git push failed (${push.out})${ghToken() ? '' : ' — no ANNOTAKIT_GH_TOKEN in .env?'}`);
+          // v0.6.6 (F14/SR-C-05): classify auth failures — the old hint only
+          // fired when the token was MISSING, never when REJECTED, and the
+          // recovery path (rotate + reload endpoint) was never named.
+          const authRejected = /Authentication failed|could not read Username|terminal prompts disabled|403/.test(String(push.out));
+          logOnce(
+            `git push failed (${push.out})${ghToken() ? (authRejected ? ' — the token looks REJECTED or lacks scope: rotate ANNOTAKIT_GH_TOKEN in .env, then POST /annotakit/api/gh/reload (v0.6.6) or restart' : '') : ' — no ANNOTAKIT_GH_TOKEN in .env?'}`,
+          );
           state = 'committed locally; push failed (retry on next mutation)';
         } else {
           state = 'orphan branch updated locally (no remote to push)';

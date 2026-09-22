@@ -52,7 +52,7 @@ export function missingTokenMessage(configPath: string): string {
     '  a) echo "ANNOTAKIT_GH_TOKEN=<your PAT>" >> .env   (dev server auto-loads it)',
     '  b) ANNOTAKIT_GH_TOKEN=<your PAT> bun run storybook  (env var at start)',
     `  c) {"ghToken": "<your PAT>"} in ${configPath}`,
-    'then RESTART storybook dev (.env is read once at boot).',
+    'then POST /annotakit/api/gh/reload (applies without restart — v0.6.6) or restart storybook dev.',
     'No token? The review loop still works 100% locally: REST + markdown digests on this server (see /annotakit/api/export).',
   ].join('\n');
 }
@@ -76,7 +76,7 @@ function invalidTokenMessage(detail: string): string {
     `GitHub rejected the token (401: ${detail.slice(0, 160)}). Fix:`,
     '  a) regenerate the PAT at github.com/settings/tokens (classic: repo scope for private repos)',
     '  b) update .env → ANNOTAKIT_GH_TOKEN=<new PAT>',
-    '  c) RESTART storybook dev (.env is read once at boot).',
+    '  c) POST /annotakit/api/gh/reload (applies without restart — v0.6.6) or restart storybook dev.',
     'Until then: local review (threads/digests/resolve) keeps working; GH mirroring is paused.',
   ].join('\n');
 }
@@ -239,7 +239,7 @@ export function createIssue(
   token: string,
   repo: string,
   input: { title: string; body: string; labels?: string[] },
-): Promise<{ number: number; html_url: string; state: 'open' | 'closed' }> {
+): Promise<{ number: number; html_url: string; state: 'open' | 'closed'; updated_at?: string }> {
   return ghJson(token, 'POST', `/repos/${repo}/issues`, {
     title: input.title,
     body: input.body,
@@ -252,7 +252,7 @@ export function addIssueComment(
   repo: string,
   issue: number,
   body: string,
-): Promise<{ id: number; html_url: string }> {
+): Promise<{ id: number; html_url: string; updated_at?: string; created_at?: string }> {
   return ghJson(token, 'POST', `/repos/${repo}/issues/${issue}/comments`, { body });
 }
 
@@ -262,7 +262,7 @@ export function setIssueState(
   repo: string,
   issue: number,
   state: 'open' | 'closed',
-): Promise<{ number: number; state: 'open' | 'closed'; html_url: string }> {
+): Promise<{ number: number; state: 'open' | 'closed'; html_url: string; updated_at?: string }> {
   return ghJson(token, 'PATCH', `/repos/${repo}/issues/${issue}`, { state });
 }
 
@@ -274,7 +274,7 @@ export function editIssue(
   repo: string,
   issue: number,
   fields: { title?: string; body?: string },
-): Promise<{ number: number; html_url: string }> {
+): Promise<{ number: number; html_url: string; updated_at?: string }> {
   return ghJson(token, 'PATCH', `/repos/${repo}/issues/${issue}`, fields);
 }
 
