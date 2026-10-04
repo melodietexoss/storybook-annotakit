@@ -84,6 +84,13 @@ export interface GhClientSettings {
   pollMs?: number;
   /** Escape hatch: kill client GH even when a baked config exists. */
   disabled?: boolean;
+  /** v0.6.7 (PR #33): stamped by the 401 self-heal (flushOnce) when a SAVED
+   *   token was dropped in favor of the deployment's baked one —
+   *   informational: the settings panel reads it (via status) to explain
+   *   what happened. A later fresh-token Save overwrites the token and
+   *   leaves a stale stamp behind (harmless: the panel hint renders only
+   *   while no override token exists). */
+  tokenDroppedAt?: string;
 }
 
 export interface GhClientConfig {
@@ -121,6 +128,12 @@ export interface GhClientStatus {
    *  truncated bodies re-pushed verbatim) — the panel surfaces the headline
    *  v0.6.4 feature instead of reporting zero work. */
   lastHealedCount?: number;
+  /** v0.6.7 (PR #33): when a saved (override) token was rejected (401) and
+   *  dropped in favor of the baked config — null when no heal ever fired.
+   *  Durable on purpose: state.lastError is wiped by the next SUCCESSFUL op,
+   *  so this status field (read straight off the override record) is the
+   *  only trace that survives the heal actually working. */
+  tokenDroppedAt: string | null;
   pollMs: number;
 }
 
@@ -531,7 +544,10 @@ export function resolveGhConfig(baked: GhClientSettings | null, override: GhClie
   if (!token || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return null;
   const labels = (merged.labels ?? []).map((l) => String(l).trim()).filter(Boolean);
   const pollMs = typeof merged.pollMs === 'number' && Number.isFinite(merged.pollMs) && merged.pollMs >= 0 ? Math.floor(merged.pollMs) : DEFAULT_POLL_MS;
-  const apiBase = (merged.apiBase ?? '').trim() || DEFAULT_API;
+  // v0.6.7: trailing-slash collapse — `${apiBase}${pathname}` concatenation
+  // made a pasted 'https://api.github.com/' produce '//repos/…' URLs that
+  // miss every route; normalize once at resolution
+  const apiBase = (merged.apiBase ?? '').trim().replace(/\/+$/, '') || DEFAULT_API;
   return { token, repo, labels: labels.length ? labels : [DEFAULT_LABEL], apiBase, pollMs };
 }
 
@@ -893,6 +909,18 @@ function freshThread(base: StaticStore, id: string): Thread | undefined {
 /** True when the thread has a queued/in-flight op — pull must skip it (its
  *  remote state is about to change). */
 function threadPending(id: string): boolean {
+  // v0.6.7 (audit 24-c P3): parked ops used to count — a thread whose sync op
+  // was terminally parked (422 body rejection) was skipped by every PULL
+  // forever, so third-party replies on its mirror never imported. A parked op
+  // never pushes again; the pull must not treat it as pending.
+  return readQueue().some((o) => o.kind === 'sync' && o.threadId === id && !o.parked);
+}
+
+/** The SWEEP's variant: parked ops COUNT. A parked thread must not be
+ *  re-enqueued every cycle — the body is rejected, a fresh op just 422s and
+ *  re-parks every 30s (an infinite retry loop). The un-park path is NEW
+ *  thread content (C30), not the sweep. */
+function threadPendingOrParked(id: string): boolean {
   return readQueue().some((o) => o.kind === 'sync' && o.threadId === id);
 }
 
@@ -1084,6 +1112,89 @@ async function flushOnce(base: StaticStore): Promise<void> {
               removeOp(op.id);
               enqueue('sync', String(op.threadId));
               continue; // the loop re-reads the queue; the fresh op creates a new issue
+            }
+          }
+        }
+        // v0.6.7 (PR #33) 401 SELF-HEAL: a SAVED (override) token that GitHub
+        // rejected is a dead credential, not user intent — when this
+        // deployment bakes a working token, the user's real intent (publish
+        // the feedback) is better served by falling back to it. Left alone
+        // this state is terminal: 401 is non-transient, so bumpOp's backoff
+        // grows to max and the queue parks until a manual panel Reset or a
+        // fresh PAT paste — nothing ever questions an override that rejects
+        // ("delivery beats PAT secrecy" applied to a rejected credential).
+        // Guards, each load-bearing:
+        //   - the 401 must be attributable to the OVERRIDE's token: an
+        //     override without a truthy-trimmed token cannot produce one
+        //     (resolveGhConfig nulls out before any call), and the equality
+        //     with cfg.token closes the cross-tab re-save race (a FRESH
+        //     token saved by another tab between our resolve and this catch
+        //     must never be dropped — it never produced a 401).
+        //   - the baked config must carry a truthy-trimmed token (else the
+        //     post-heal resolveGhConfig nulls out: queue parked forever AND
+        //     the user's token already dropped — strictly worse than stuck),
+        //     a DIFFERENT one than the override's (an equal string is the
+        //     same credential — falling back to it is a guaranteed-wasted
+        //     retry), and the same EFFECTIVE api base (normalized the same
+        //     way resolveGhConfig normalizes — an override that redirected
+        //     the endpoint owns its 401s: pairing the baked token with a
+        //     foreign GHES/proxy would 401 again and burn a good token).
+        //   - a SYNC re-verify of the override token immediately before the
+        //     write: the probe await above can span seconds (cache
+        //     invalidated by a pull-401 — exactly this incident's state),
+        //     and a fresh token saved in that window must survive.
+        //   - writeOverride must SUCCEED (H-H-05 quota/privacy-mode false →
+        //     the override still carries the dead token, so continuing would
+        //     loop real 401s forever — fall through to bumpOp/return instead).
+        // Idempotent by construction: the patch removes the token KEY (an
+        // explicit undefined wins writeOverride's merge and JSON.stringify
+        // drops undefined-valued keys), so a second 401 — the baked token
+        // dead too — finds the first condition false and takes the normal
+        // bumpOp path. No counter needed. NO invalidateBakedConfig() here
+        // (deliberate): the retry must use exactly the credential this
+        // guard verified — the cached probe promise; a stale bake costs one
+        // bounded extra cycle, an invalidate could resolve a mid-deploy null
+        // AFTER the drop (unconfigured + nothing left = the one state this
+        // design must never create deliberately).
+        if ((err as { status?: number })?.status === 401) {
+          const ov = readOverride();
+          if (ov && typeof ov.token === 'string' && ov.token.trim() && ov.token.trim() === cfg.token) {
+            const bk = await probeBakedGhConfig(); // memoized per document — one microtask here (cached success)
+            // effective-base parity, normalized EXACTLY as resolveGhConfig
+            // normalizes (default + trim) plus trailing-slash collapse —
+            // 'https://api.github.com/' ≡ 'https://api.github.com' ≡ absent
+            const normBase = (v?: string) => (v ?? '').trim().replace(/\/+$/, '') || DEFAULT_API;
+            if (
+              bk &&
+              typeof bk.token === 'string' &&
+              bk.token.trim() &&
+              bk.token.trim() !== ov.token.trim() &&
+              // v0.6.7 (audit 24-c P2): an ABSENT override apiBase INHERITS the
+              // bake's (resolveGhConfig merges override-over-baked) — filling
+              // it with DEFAULT_API instead silently refused the heal for every
+              // GHES/proxy bake behind a token-only override (the common shape).
+              normBase(ov.apiBase ?? bk.apiBase) === normBase(bk.apiBase)
+            ) {
+              const now = readOverride(); // sync re-verify: the probe await is a real race window
+              if (now && typeof now.token === 'string' && now.token.trim() === ov.token.trim() && writeOverride({ token: undefined, tokenDroppedAt: new Date().toISOString() })) {
+                // repo/labels/pollMs/disabled survive via writeOverride's
+                // merge; the durable user-visible trace is tokenDroppedAt on
+                // the override record (status() → settings panel) because
+                // state.lastError is wiped by the next SUCCESSFUL op — the
+                // line below only stays visible while the retry keeps
+                // failing. Notice text is ASCII-only on purpose (F6 lesson:
+                // em-dashes do not survive every dist/patch pipeline).
+                if (state) state.lastError = "saved GitHub token was rejected (401) - publishing with this deployment's built-in token; your other settings were kept";
+                // Same semantics as a settings Save: the user's situation
+                // just changed, so OTHER ops carrying 401 backoff from
+                // earlier sweeps retry now, and a pull that 401'd moments
+                // earlier unparks immediately instead of sitting dark for
+                // its 5-minute backoff (four in-code precedents: save /
+                // clear / clearTokenOverride / syncNow).
+                clearOpBackoff();
+                if (state) state.pullBackoffUntil = 0;
+                continue; // this op was never bumped — still eligible, retry NOW on the baked token
+              }
             }
           }
         }
@@ -1413,7 +1524,7 @@ function startRuntime(base: StaticStore): void {
       const cfg = await probeGhConfig();
       if (cfg) {
         for (const t of base.list()) {
-          if (threadPending(t.id)) continue; // queued/parked already owns it
+          if (threadPendingOrParked(t.id)) continue; // queued/parked already owns it
           const stalled =
             !t.gh ||
             t.comments.some((c) => !c.ghId && c.source !== 'github') ||
@@ -1467,6 +1578,11 @@ function buildStatus(): GhClientStatus {
     lastPullAt: state?.lastPullAt,
     lastPullCount: state?.lastPullCount,
     lastHealedCount: state?.lastHealedCount,
+    // v0.6.7 (PR #33): read off the override record (NOT state) — a 401
+    // heal's lastError notice is wiped by the next successful op; this is
+    // the durable trace. Stale after a later fresh save by design (harmless:
+    // the panel hint gates on !tokenOverridden).
+    tokenDroppedAt: override?.tokenDroppedAt ?? null,
     pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS,
   };
 }

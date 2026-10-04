@@ -47,7 +47,27 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import path from 'node:path';
 
 const args = process.argv.slice(2);
-const outDir = path.resolve(args.find((a) => !a.startsWith('--')) ?? 'examples/nimbus/dist-storybook');
+/** v0.6.7 (audit 24-e P2): the old "first non-flag token" heuristic never
+ *  consumed flag VALUES — `--gh-token <pat> <out>` resolved outDir to the
+ *  TOKEN itself and wrote the seed into a directory NAMED after the secret
+ *  (secret-as-pathname in ls/backups) while the real outDir silently missed
+ *  its static-mode marker. Walk argv properly: consume --flag value pairs
+ *  (and --flag=value), then the first REMAINING token is the positional. */
+const FLAG_NAMES = ['config-dir', 'gh-token', 'gh-repo', 'gh-labels', 'gh-poll-sec', 'env-file', 'store'];
+const positional = (() => {
+  const rest = [...args];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i] ?? '';
+    if (a.startsWith('--')) {
+      const name = a.slice(2).split('=')[0] ?? '';
+      if (!a.includes('=') && FLAG_NAMES.includes(name)) i++; // consume the value token
+      continue;
+    }
+    return a;
+  }
+  return undefined;
+})();
+const outDir = path.resolve(positional ?? 'examples/nimbus/dist-storybook');
 /** Space-separated value, RAW (no path.resolve — gh tokens/repos/labels are
  *  not paths and would be mangled). */
 const rawOpt = (name) => {

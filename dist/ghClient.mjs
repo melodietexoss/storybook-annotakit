@@ -12,10 +12,10 @@ import {
   probeBakedGhConfig,
   probeGhConfig,
   resolveGhConfig
-} from "./chunk-BKSLU7VF.mjs";
+} from "./chunk-KLEHYURA.mjs";
 import {
   ISSUE_BODY_LIMIT
-} from "./chunk-LNF6XYUQ.mjs";
+} from "./chunk-UERRFJPI.mjs";
 export {
   GH_CLIENT_SENTINEL,
   ISSUE_BODY_LIMIT,

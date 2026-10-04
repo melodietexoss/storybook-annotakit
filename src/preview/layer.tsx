@@ -140,7 +140,16 @@ function parseHotkey(spec: string | undefined, fallback: string): HotkeySpec {
   const withAlt = altPrefix.test(raw);
   warnLegacyHotkey(spec, raw, withAlt);
   const key = raw.replace(altPrefix, '');
-  return { key: key || fallback, alt: withAlt };
+  // v0.6.7 (audit P1): the legacy remap the warning PROMISES ("a 0.4-era
+  // plain-key spec fires with ⌥/Alt held") was never implemented — matching
+  // compared e.altKey === spec.alt (false), so a user `pin: 'c'` fired on
+  // the BARE key and collided with story interactions (the exact v0.5.0
+  // regression the warning exists to prevent). A collidable plain key
+  // (letter/digit — NOT the '?' help key, NOT the alt-prefixed defaults)
+  // now really does require Alt. The warning's suggested fix
+  // (`alt+<key>` explicit) remains the no-surprise spelling.
+  const collidablePlainKey = !withAlt && /^[a-z0-9]$/.test(key);
+  return { key: key || fallback, alt: withAlt || collidablePlainKey };
 }
 function hotkeyMatches(e: KeyboardEvent, spec: HotkeySpec): boolean {
   // PHYSICAL-key matching (e.code): on macOS, Option+letter COMPOSES a
@@ -703,7 +712,17 @@ export function AnnotaLayer({ storyId, title, name, hotkeys }: AnnotaLayerProps)
       if (hotkeys === false) {
         if (e.key === 'Escape') {
           if (mode !== 'idle') exitMode();
-          else if (composer) setComposer(null);
+          else if (composer) {
+            // v0.6.7 (audit P2): this branch used to one-shot a non-empty
+            // draft — the C27 two-stage guard existed only in the
+            // hotkeys-enabled branch. Same guard, same hint, both branches.
+            if (draftBodyRef.current.trim() && !discardArmedDocRef.current) {
+              discardArmedDocRef.current = true;
+              showHint('Press Esc again to discard the draft');
+              return;
+            }
+            setComposer(null);
+          }
         }
         return;
       }
@@ -1149,7 +1168,10 @@ function ComposerCard(props: {
             props.onDraftChange?.(e.target.value);
           }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && body.trim()) {
+            // v0.6.7 (audit P1): the button gates on busy + MAX_BODY_CHARS —
+            // this hotkey path gated on NEITHER, so Enter auto-repeat during
+            // the in-flight create minted N duplicate threads + N mirror ops.
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && body.trim() && body.length <= MAX_BODY_CHARS && !props.busy) {
               e.preventDefault();
               props.onSubmit(body);
             }

@@ -17,6 +17,9 @@
  *     remote close → thread resolved, remote 404 → mapping reset
  *   - leader election: a follower (iframe-like) doc only enqueues
  *   - settings facet: runtime repo override + reset
+ *   - v0.6.7 (PR #33) 401 override self-heal: a rejected SAVED token falls
+ *     back to the baked one (token key dropped, settings kept, same op
+ *     retried) — plus every guard that keeps it from mis-firing or looping
  */
 
 import assert from 'node:assert';
@@ -858,31 +861,43 @@ let createdThread;
   ok('FIXTURE: server variant-B body byte-exact after dateNorm (YYYY-MM-DD status line + "Storybook" footer)', dateNorm(serverCands[1]) === dateNorm(serverWantB), JSON.stringify(dateNorm(serverCands[1])?.slice(0, 160)));
 }
 
-/* 23 — v0.6.6 (V1/F1): sticky override token — the live incident. An old
- * saved token shadows every re-bake; status must SAY so (tokenOverridden),
- * and clearTokenOverride() restores the baked token surgically. */
+/* 23 — v0.6.6 (V1/F1) → v0.6.7 (PR #33): sticky override token — the live
+ * incident. v0.6.6 made the state VISIBLE (tokenOverridden + "use baked");
+ * v0.6.7's 401 self-heal closes the common case automatically (a rejected
+ * saved token over a DIFFERENT valid bake — scenario 31a). This scenario
+ * pins the NO-heal residue the panel runbook still owns: the override
+ * token EQUALS the baked token (same credential — a fallback retry is
+ * futile, the heal structurally declines), visibility stays honest, and
+ * clearTokenOverride() remains surgical. */
 {
-  const ghc23 = await fresh({ token: 'tok_BAKE', repo: 'acme/web', pollMs: 600_000 });
+  const cfgKey23 = 'annotakit:ghcfg:https://site.test/stories/';
+  const ghc23 = await fresh({ token: 'ghp_dead_bake', repo: 'acme/web', pollMs: 600_000 });
   const store = await ghc23.getGhLinkedStaticStore();
+  // the no-heal state: an old PAT saved in THIS browser that happens to be
+  // the SAME string as the (dead) bake — the fake rejects it (no 'tok_')
+  store.gh?.saveSettings({ token: 'ghp_dead_bake', labels: ['ws-x'] });
   await store.create(threadInput('th_sticky'));
-  await until(() => queueOps(ghc23).length === 0, 'baked create drains');
-  ok('baked token created the issue', [...gh.issues.values()].some((i) => i.body.includes('th_sticky')));
-  // an old PAT saved in THIS browser (the fake rejects it — no 'tok_')
-  store.gh?.saveSettings({ token: 'ghp_old_dead', labels: ['ws-x'] });
-  await store.addComment('th_sticky', 'reply under a dead override', 'reviewer');
-  await until(() => queueOps(ghc23).some((o) => o.lastError), 'reply fails with 401');
+  await until(() => queueOps(ghc23).some((o) => o.lastError), 'same-dead-token 401s (heal declines: same credential)');
   const st = store.gh?.status();
-  ok('override token flagged (tokenOverridden)', st?.tokenOverridden === true);
-  ok('401 surfaced in status', String(st?.lastError ?? '').includes('401'));
-  ok('op kept queued (feedback never dropped)', queueOps(ghc23).some((o) => o.kind === 'sync' && o.threadId === 'th_sticky'));
+  ok('no-heal case: override token still flagged (tokenOverridden)', st?.tokenOverridden === true);
+  ok('no-heal case: 401 surfaced in status', String(st?.lastError ?? '').includes('401'));
+  ok('no-heal case: NO auto-drop (tokenDroppedAt unset)', st?.tokenDroppedAt == null);
+  ok('no-heal case: op kept queued (feedback never dropped)', queueOps(ghc23).some((o) => o.kind === 'sync' && o.threadId === 'th_sticky'));
   // surgical recovery: drop ONLY the token — the labels override survives
   store.gh?.clearTokenOverride();
-  await until(() => queueOps(ghc23).length === 0, 'drains under the baked token again');
-  ok('tokenOverridden cleared', store.gh?.status()?.tokenOverridden === false);
-  const cfgRaw = JSON.parse(storageShim._dump()['annotakit:ghcfg:https://site.test/stories/'] ?? '{}');
+  await until(() => store.gh?.status()?.tokenOverridden === false, 'token override cleared');
+  const cfgRaw = JSON.parse(storageShim._dump()[cfgKey23] ?? '{}');
   ok('labels override survived the token clear', Array.isArray(cfgRaw.labels) && cfgRaw.labels.includes('ws-x') && !('token' in cfgRaw));
+  // operator re-bakes a GOOD token; the cached dead bake 401s once, the F2
+  // invalidation re-probes, the next flush drains (scenario-24 precedent)
+  bakedConfig = { token: 'tok_BAKE', repo: 'acme/web', pollMs: 600_000 };
+  const before23 = bakedFetchCount;
+  store.gh?.saveSettings({});
+  await until(() => bakedFetchCount > before23, 'baked config re-probed after the 401');
+  store.gh?.saveSettings({});
+  await until(() => queueOps(ghc23).length === 0, 'drains under the re-baked token');
   const issue = [...gh.issues.values()].find((i) => i.body.includes('th_sticky'));
-  ok('reply mirrored under the baked token', Boolean(issue?.comments.some((c) => c.body.includes('reply under a dead override'))));
+  ok('thread mirrored under the re-baked token', Boolean(issue));
 }
 
 /* 24 — v0.6.6 (F2/V3/V4): a 401 invalidates the baked-config cache — a LIVE
@@ -1008,24 +1023,38 @@ let createdThread;
   ok('syncedAt reset to the server clock', t2?.gh?.syncedAt === issue.updated_at);
 }
 
-/* 29 — v0.6.6 (F10/SR-D N1): a LIVE 401 leads the status line over a stale
- * parked error; a successful manual sync clears the stale engine error (the
- * parked error becomes visible again — not masked, not permanent). */
+/* 29 — v0.6.6 (F10/SR-D N1) → v0.6.7 adaptation: a LIVE 401 leads the status
+ * line over a stale parked error; a successful manual sync clears the stale
+ * engine error (the parked error becomes visible again — not masked, not
+ * permanent). v0.6.7: the override here DUPLICATES the dead baked token
+ * (same string) so the 401 self-heal structurally declines — the persistent
+ * 401 this scenario needs (a different-string override over a valid bake
+ * now auto-heals, scenario 31a). */
 {
-  const ghc29 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const ghc29 = await fresh({ token: 'ghp_dead29', repo: 'acme/web', pollMs: 600_000 });
   const store = await ghc29.getGhLinkedStaticStore();
-  gh.failNext = { match: /\/issues$/, status: 422, body: 'Validation Failed', count: 2 }; // listing + create
+  gh.failNext = { match: /\/issues$/, status: 422, body: 'Validation Failed', count: 2 }; // listing + create (failNext precedes auth — the dead bake can't 401 first)
   await store.create(threadInput('th_parked29'));
   await until(() => (store.gh?.status()?.parked ?? 0) === 1, 'op parked (422)');
   gh.failNext = null;
-  store.gh?.saveSettings({ token: 'ghp_dead29' });
+  store.gh?.saveSettings({ token: 'ghp_dead29' }); // SAME string as the bake → no self-heal
   await store.create(threadInput('th_auth29'));
   await until(() => String(store.gh?.status()?.lastError ?? '').includes('401'), 'live 401 state error');
   const st = store.gh?.status();
   ok('live 401 leads over the stale parked error', String(st?.lastError ?? '').includes('401') && !String(st?.lastError ?? '').includes('parked'));
-  // recovery: baked token applies again + manual sync succeeds
+  // recovery: the operator re-bakes a good token AND the user drops the
+  // override (both needed: the override duplicates the dead bake). Sequenced
+  // deterministically: the clear wakes a flush that 401s ONCE more on the
+  // cached-dead bake (bumping the op) and invalidates the cache — wait for
+  // BOTH, then the manual sync runs on the FRESH bake and succeeds (racing a
+  // Save against an in-flight failing op just re-arms notBefore AFTER the
+  // clear — the 30s sweep would resolve it, too slow for a test).
+  bakedConfig = { token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 };
   store.gh?.clearTokenOverride();
-  await store.gh?.syncNow();
+  await until(() => (queueOps(ghc29).find((o) => o.threadId === 'th_auth29')?.attempts ?? 0) >= 2, 'the cached-dead retry bumped');
+  const bf29 = bakedFetchCount;
+  await until(() => bakedFetchCount > bf29, 'invalidation re-probe landed the fresh bake');
+  await store.gh?.syncNow(); // flush drains on the fresh bake + pull succeeds → error cleared
   await until(() => queueOps(ghc29).filter((o) => !o.parked).length === 0, 'auth thread drained');
   const st2 = store.gh?.status();
   ok('stale 401 cleared after the successful manual sync', !String(st2?.lastError ?? '').includes('401'));
@@ -1056,6 +1085,417 @@ let createdThread;
   ok('create used the RESTORED baked token (self-healed, no reload)', Boolean(createCall));
   ok('exactly one issue', [...gh.issues.values()].filter((i) => i.body.includes('th_latch')).length === 1);
   ghc30.__setBakedNullRetryMsForTests(60_000);
+}
+
+/* 31 — v0.6.7 (PR #33): 401 OVERRIDE SELF-HEAL. A saved (override) token that
+ * GitHub rejects is a dead credential, not user intent: when the deployment
+ * bakes a working token, the flush drops ONLY the override's token key
+ * (repo/labels/pollMs survive), stamps tokenDroppedAt, and retries the SAME
+ * op on the baked token — the queue drains with zero user action. Pre-fix
+ * this state was terminal (the real-world incident: days of queued feedback
+ * while a VALID baked token sat on the same origin). Sub-blocks pin each
+ * guard that keeps the heal honest (attribution, fallback validity, endpoint
+ * parity, write failure, cross-tab re-saves incl. the probe-await window)
+ * and the no-loop property when the baked token is dead too. */
+{
+  const cfgKey31 = 'annotakit:ghcfg:https://site.test/stories/';
+  const overrideDoc = () => {
+    const raw = storageShim._dump()[cfgKey31];
+    return raw ? { raw, doc: JSON.parse(raw) } : { raw: undefined, doc: {} };
+  };
+
+  /* 31a — the heal itself (fail-then-appear) */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'], pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' }); // the incident state: dead override shadows a valid baked token
+    // record the auth of every transport call — the fake 401s any token
+    // without the 'tok_' prefix, so 'DEAD' produces real 401s and the
+    // post-heal retry must arrive carrying the BAKED token
+    const authLog = [];
+    const base = gh.transport;
+    ghc31.__ghSetTransportForTests(async (url, init = {}) => {
+      const res = await base(url, init);
+      authLog.push({ auth: (init.headers ?? {})['Authorization'] ?? null, ok: res.ok });
+      return res;
+    });
+    await store.create(threadInput('th_heal401'));
+    ok('heal: op consumed (queue drained on the baked token)', await until(() => queueOps(ghc31).length === 0, 'healed op flushed'));
+    const issue = [...gh.issues.values()].find((i) => i.body.includes('thread id: th_heal401'));
+    ok('heal: issue created', Boolean(issue));
+    ok('heal: the DEAD override token produced the 401', authLog.some((e) => e.auth === 'Bearer DEAD' && !e.ok));
+    ok('heal: the retry used the BAKED token', authLog.some((e) => e.auth === 'Bearer tok_AAA' && e.ok), authLog.map((e) => `${e.auth}:${e.ok ? 'ok' : '401'}`).join(' '));
+    const t = store.list().find((x) => x.id === 'th_heal401');
+    ok('heal: gh mapping stamped (publish really landed)', t?.gh?.issue === issue?.number);
+    const { raw, doc } = overrideDoc();
+    ok('heal: override token KEY gone (explicit undefined + stringify drop — not a falsy value)', raw !== undefined && !('token' in doc), raw);
+    ok('heal: tokenDroppedAt stamped (ISO)', typeof doc.tokenDroppedAt === 'string' && !Number.isNaN(Date.parse(doc.tokenDroppedAt)));
+    ok('heal: other override settings kept', doc.repo === 'acme/web');
+    const st = store.gh?.status();
+    ok('heal: status carries the durable trace (lastError is wiped by the success)', typeof st?.tokenDroppedAt === 'string' && st.tokenDroppedAt === doc.tokenDroppedAt && st?.lastError === undefined, JSON.stringify({ dropped: st?.tokenDroppedAt, lastError: st?.lastError }));
+  }
+
+  /* 31b — override WITHOUT a token: the 401 belongs to the baked token —
+   * nothing to attribute to the override, the heal must not fire. */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ repo: 'other/team' }); // override carries repo only
+    let calls = 0;
+    ghc31.__ghSetTransportForTests(async () => { calls++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+    await store.create(threadInput('th_notok'));
+    await sleep(150);
+    const ops = queueOps(ghc31);
+    ok('no-token override: NO heal — op stays queued, bumped once', ops.some((o) => o.threadId === 'th_notok') && (ops.find((o) => o.threadId === 'th_notok')?.attempts ?? 0) >= 1);
+    const { doc } = overrideDoc();
+    ok('no-token override: override untouched (no tokenDroppedAt)', doc.repo === 'other/team' && doc.tokenDroppedAt === undefined);
+    ok('no-token override: bounded calls (listing + create, no hammer)', calls === 2, `calls=${calls}`);
+  }
+
+  /* 31c — no baked config: dropping the override token would UNCONFIGURE the
+   * deployment entirely (resolveGhConfig → null → queue parked forever with
+   * no credential left) — strictly worse than stuck. Never fire. */
+  {
+    const ghc31 = await fresh(null);
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' });
+    let calls = 0;
+    ghc31.__ghSetTransportForTests(async () => { calls++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+    await store.create(threadInput('th_nobake'));
+    await sleep(150);
+    const ops = queueOps(ghc31);
+    ok('no-baked: NO heal — op stays queued, bumped once', ops.some((o) => o.threadId === 'th_nobake') && (ops.find((o) => o.threadId === 'th_nobake')?.attempts ?? 0) >= 1);
+    const { doc } = overrideDoc();
+    ok('no-baked: the override keeps its (only) token', doc.token === 'DEAD' && doc.tokenDroppedAt === undefined, JSON.stringify(doc));
+    ok('no-baked: bounded calls', calls === 2, `calls=${calls}`);
+  }
+
+  /* 31d — whitespace BAKED token: "carries a token" is not enough — a baked
+   * '   ' trims to '' so the post-heal resolveGhConfig would null out (queue
+   * parked forever AND the user's token already dropped). Trimmed-truthy. */
+  {
+    const ghc31 = await fresh({ token: '   ', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' });
+    let calls = 0;
+    ghc31.__ghSetTransportForTests(async () => { calls++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+    await store.create(threadInput('th_wsbake'));
+    await sleep(150);
+    const ops = queueOps(ghc31);
+    ok('whitespace baked token: NO heal (nothing real to fall back to)', ops.some((o) => o.threadId === 'th_wsbake') && (ops.find((o) => o.threadId === 'th_wsbake')?.attempts ?? 0) >= 1);
+    const { doc } = overrideDoc();
+    ok('whitespace baked token: override keeps its token', doc.token === 'DEAD' && doc.tokenDroppedAt === undefined, JSON.stringify(doc));
+  }
+
+  /* 31e — apiBase redirect: an override pointing at a GHES/proxy owns its
+   *  own 401s — the heal must not pair the BAKED token with the FOREIGN
+   *  endpoint (it would 401 again and burn a possibly-good token). */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web', apiBase: 'https://ghes.example.com' });
+    let calls = 0;
+    ghc31.__ghSetTransportForTests(async () => { calls++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+    await store.create(threadInput('th_ghes'));
+    await sleep(150);
+    const ops = queueOps(ghc31);
+    ok('apiBase mismatch: NO heal (endpoint attribution unclear)', ops.some((o) => o.threadId === 'th_ghes') && (ops.find((o) => o.threadId === 'th_ghes')?.attempts ?? 0) >= 1);
+    const { doc } = overrideDoc();
+    ok('apiBase mismatch: override keeps its token AND its endpoint', doc.token === 'DEAD' && doc.apiBase === 'https://ghes.example.com' && doc.tokenDroppedAt === undefined, JSON.stringify(doc));
+  }
+
+  /* 31e2 — apiBase parity is NORMALIZED: an override that explicitly sets
+   *  apiBase to the default endpoint (or a trailing-slash variant) did NOT
+   *  redirect anything — the heal must still fire. */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web', apiBase: 'https://api.github.com/' }); // same endpoint, slash + explicit
+    await store.create(threadInput('th_normbase'));
+    ok('normalized apiBase: heal fires (no real redirect)', await until(() => queueOps(ghc31).length === 0, 'drained on baked'));
+    ok('normalized apiBase: issue created on the baked token', [...gh.issues.values()].some((i) => i.body.includes('thread id: th_normbase')));
+    const { doc } = overrideDoc();
+    ok('normalized apiBase: override token dropped', !('token' in doc) && typeof doc.tokenDroppedAt === 'string');
+  }
+
+  /* 31e3 — GHES/proxy BAKE + token-only override (audit 24-c P2): an absent
+   *  override apiBase inherits the bake's endpoint — the heal must fire. The
+   *  pre-fix guard filled the absent side with DEFAULT_API and silently
+   *  refused the heal for every non-github.com bake behind the common
+   *  token-only override shape. */
+  {
+    const ghc31 = await fresh({ token: 'tok_GHES', repo: 'acme/web', apiBase: 'https://ghes.example.com/api/v3', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' }); // token ONLY — inherits the bake's endpoint
+    // the fake's matchers are ^/repos-anchored: rewrite the GHES-prefixed
+    // URLs to the standard base (the guard runs client-side, pre-transport)
+    const base31e3 = gh.transport;
+    ghc31.__ghSetTransportForTests(async (url, init = {}) => base31e3(String(url).replace('https://ghes.example.com/api/v3/', 'https://api.github.com/'), init));
+    await store.create(threadInput('th_ghesbake'));
+    ok('GHES bake + token-only override: heal fires (absent apiBase inherits the bake)', await until(() => queueOps(ghc31).length === 0, 'drained on the GHES bake'));
+    ok('GHES bake: issue created on the baked token', [...gh.issues.values()].some((i) => i.body.includes('thread id: th_ghesbake')));
+    const { doc } = overrideDoc();
+    ok('GHES bake: override token dropped', !('token' in doc) && typeof doc.tokenDroppedAt === 'string');
+  }
+
+  /* 31f — cross-tab re-save race (WIDE window): a FRESH token saved by
+   *  another tab between this flush's cfg resolution and the 401 catch must
+   *  never be dropped — it never produced a 401. Simulated at the transport
+   *  seam (the await IS the interleave window). */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' });
+    const base = gh.transport;
+    ghc31.__ghSetTransportForTests(async (url, init = {}) => {
+      if (String(url).includes('/issues') && (init.headers ?? {})['Authorization'] === 'Bearer DEAD') {
+        storageShim.setItem(cfgKey31, JSON.stringify({ token: 'tok_FRESH', repo: 'acme/web' })); // the other tab's Save
+      }
+      return base(url, init);
+    });
+    await store.create(threadInput('th_race'));
+    await sleep(150);
+    const ops = queueOps(ghc31);
+    ok('re-save race: NO heal (the override token is no longer the one that 401-ed)', ops.some((o) => o.threadId === 'th_race') && (ops.find((o) => o.threadId === 'th_race')?.attempts ?? 0) >= 1);
+    const { doc } = overrideDoc();
+    ok('re-save race: the FRESH token survives untouched', doc.token === 'tok_FRESH' && doc.tokenDroppedAt === undefined, JSON.stringify(doc));
+    // and it WORKS: the user's remedy (Save) clears backoff → the fresh
+    // token drains the queue (a heal that had eaten it would be stuck)
+    store.gh?.saveSettings({});
+    ok('re-save race: the fresh token drains the queue', await until(() => queueOps(ghc31).length === 0));
+    ok('re-save race: issue created with the fresh token', [...gh.issues.values()].some((i) => i.body.includes('thread id: th_race')));
+  }
+
+  /* 31g — writeOverride FAILS (quota/privacy mode, H-H-05): the override
+   *  still carries the dead token, so continuing would hammer real 401s
+   *  forever — the heal must fall through to bumpOp/return instead. */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' }); // seed BEFORE the quota shim
+    let calls = 0;
+    ghc31.__ghSetTransportForTests(async () => { calls++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+    const orig = storageShim.setItem.bind(storageShim);
+    storageShim.setItem = (k, v) => { if (String(k).includes('annotakit:ghcfg:')) throw new Error('QuotaExceeded'); return orig(k, v); };
+    await store.create(threadInput('th_quota401'));
+    await sleep(150); // the whole flush attempt runs inside the quota window
+    storageShim.setItem = orig;
+    const ops = queueOps(ghc31);
+    ok('quota-false heal: NO loop — op bumped once, flush returned', ops.some((o) => o.threadId === 'th_quota401') && (ops.find((o) => o.threadId === 'th_quota401')?.attempts ?? 0) === 1);
+    const { doc } = overrideDoc();
+    ok('quota-false heal: override keeps its dead token (the write failed)', doc.token === 'DEAD' && doc.tokenDroppedAt === undefined, JSON.stringify(doc));
+    ok('quota-false heal: bounded transport calls (no 401 hammer)', calls === 2, `calls=${calls}`);
+  }
+
+  /* 31h — baked token dead TOO (transport 401s forever): the heal fires
+   *  exactly once (override goes tokenless), the post-heal 401 takes the
+   *  normal bumpOp path, flushOnce RETURNS — two queued ops both bumped, no
+   *  loop, no hammering. */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' });
+    let calls = 0;
+    ghc31.__ghSetTransportForTests(async () => { calls++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+    await store.create(threadInput('th_loop1'));
+    await store.create(threadInput('th_loop2'));
+    ok('no-loop: BOTH ops attempted and bumped (flush returned, none lost)', await until(() => queueOps(ghc31).length === 2 && queueOps(ghc31).every((o) => (o.attempts ?? 0) >= 1 && !o.parked)));
+    const { doc } = overrideDoc();
+    ok('no-loop: override tokenless (the heal fired exactly ONCE)', !('token' in doc) && typeof doc.tokenDroppedAt === 'string', JSON.stringify(doc));
+    const callsAfterLoop = calls;
+    await sleep(250); // nothing may hammer in the background (sweep is 30s out)
+    ok('no-loop: calls stay bounded with the engine idle', calls === callsAfterLoop, `calls=${calls} (was ${callsAfterLoop})`);
+  }
+
+  /* 31h2 — delta-A SELF-CORRECT: heal fires → retry 401s (the baked token is
+   *  dead too) → bumpOp + the F2 invalidation re-probes (bakedFetchCount
+   *  increments) → operator swaps in a valid bake → next flush drains. The
+   *  "self-corrects in one extra cycle" claim, pinned. */
+  {
+    const ghc31 = await fresh({ token: 'ghp_STALEBAKE', repo: 'acme/web', pollMs: 600_000 }); // dead (no 'tok_' prefix) AND a different string than the override's 'DEAD' — the heal fires, the retry 401s
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' });
+    await store.create(threadInput('th_selfcorrect'));
+    ok('self-correct: heal fired then retry 401-ed (op back in queue, bumped)', await until(() => { const o = queueOps(ghc31).find((x) => x.threadId === 'th_selfcorrect'); return o && (o.attempts ?? 0) >= 1; }));
+    const { doc } = overrideDoc();
+    ok('self-correct: override tokenless (heal fired once)', !('token' in doc));
+    await until(() => queueOps(ghc31).every((o) => o.lastError), 'retry 401 surfaced');
+    bakedConfig = { token: 'tok_GOODBAKE', repo: 'acme/web', pollMs: 600_000 }; // operator re-bakes
+    // double-save rhythm (scenario-24 precedent): the retry-401's invalidate
+    // may already have re-cached the STILL-stale bake (a success promise is
+    // memoized for the document lifetime) — save #1's flush 401s on it and
+    // re-invalidates (the async re-fetch now lands the GOOD bake), save #2
+    // resolves the fresh cache and drains
+    const before = bakedFetchCount;
+    store.gh?.saveSettings({}); // flush → 401 on the cached-stale bake → invalidate → async re-fetch (GOODBAKE)
+    ok('self-correct: the 401 cycle invalidated + re-fetched the baked cache', await until(() => bakedFetchCount > before), `bakedFetch ${before} → ${bakedFetchCount}`);
+    store.gh?.saveSettings({}); // flush → resolves the FRESH bake → drains
+    ok('self-correct: drains on the re-baked token', await until(() => queueOps(ghc31).length === 0, 'drained'));
+    ok('self-correct: exactly one issue', [...gh.issues.values()].filter((i) => i.body.includes('thread id: th_selfcorrect')).length === 1);
+  }
+
+  /* 31i — empty-string override token (SR-A N1 semantics): resolveGhConfig
+   *  treats an empty override token as ABSENT — the flush proceeds on the
+   *  baked token, and the heal structurally cannot fire (no truthy override
+   *  token to attribute the 401 to). */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    storageShim.setItem(cfgKey31, JSON.stringify({ token: '', repo: 'acme/web' })); // hand-crafted (the panel omits empty fields)
+    let calls = 0;
+    ghc31.__ghSetTransportForTests(async () => { calls++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+    await store.create(threadInput('th_empty'));
+    await sleep(150);
+    ok('empty override token: flush PROCEEDS on the baked token (N1) — transport calls happened', calls === 2, `calls=${calls}`);
+    const ops = queueOps(ghc31);
+    ok('empty override token: op bumped (401 on the baked token), kept queued', ops.some((o) => o.threadId === 'th_empty') && (ops.find((o) => o.threadId === 'th_empty')?.attempts ?? 0) >= 1);
+    const { doc } = overrideDoc();
+    ok('empty override token: override untouched (no heal — nothing truthy to drop)', doc.token === '' && doc.tokenDroppedAt === undefined);
+  }
+
+  /* 31j — override token EQUALS the baked token: the same string is the same
+   *  credential — falling back to it is a guaranteed-wasted retry cycle, so
+   *  the heal declines. */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'tok_AAA', repo: 'acme/web' }); // same string as the bake
+    let calls = 0;
+    ghc31.__ghSetTransportForTests(async () => { calls++; return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }; });
+    await store.create(threadInput('th_same'));
+    await sleep(150);
+    const ops = queueOps(ghc31);
+    ok('same-token bake: NO heal (identical credential — a fallback retry cannot succeed)', ops.some((o) => o.threadId === 'th_same') && (ops.find((o) => o.threadId === 'th_same')?.attempts ?? 0) === 1);
+    const { doc } = overrideDoc();
+    ok('same-token bake: override keeps its token', doc.token === 'tok_AAA' && doc.tokenDroppedAt === undefined, JSON.stringify(doc));
+    ok('same-token bake: bounded calls', calls === 2, `calls=${calls}`);
+  }
+
+  /* 31k — probe-await race (NARROW window): the fresh save lands while the
+   *  heal's probeBakedGhConfig() await is IN FLIGHT (a real fetch — the
+   *  cache was just invalidated by an earlier 401). The sync re-verify
+   *  before writeOverride must catch it: the fresh token survives, no drop. */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' });
+    // pass-through transport: 401 only for the DEAD token, real behavior otherwise
+    const base = gh.transport;
+    ghc31.__ghSetTransportForTests(async (url, init = {}) => ((init.headers ?? {})['Authorization'] === 'Bearer DEAD'
+      ? { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } }
+      : base(url, init)));
+    // step 1: an op 401s under DEAD → bumpOp path fires the F2 invalidate →
+    // the heal's probe will be a REAL fetch (the window we need)
+    await store.create(threadInput('th_probe'));
+    await until(() => queueOps(ghc31).some((o) => o.lastError), 'first 401 (cache invalidated)');
+    // deferred baked fetch: capture the probe, hold it until we land the save
+    let resolveProbe;
+    const probeHeld = new Promise((r) => { resolveProbe = r; });
+    const origFetch = globalThis.fetch;
+    let probeCalls = 0;
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('annotakit-gh.json')) {
+        probeCalls++;
+        await probeHeld; // hold EVERY baked probe until the test says go
+      }
+      return origFetch(url, init);
+    };
+    try {
+      // step 2: retry the op — flush → 401 under DEAD → heal guard passes →
+      // probeBakedGhConfig() awaited (HELD) → …window open…
+      store.gh?.saveSettings({}); // clear backoff, trigger the flush
+      await until(() => probeCalls > 0, 'the heal probe is in flight (held)');
+      // step 3: the other tab saves a FRESH token INSIDE the window
+      storageShim.setItem(cfgKey31, JSON.stringify({ token: 'tok_FRESH2', repo: 'acme/web' }));
+      resolveProbe(); // release the probe — the heal resumes NOW
+      await until(() => { const o = queueOps(ghc31).find((x) => x.threadId === 'th_probe'); return o && (o.attempts ?? 0) >= 1; }, 'heal declined (re-verify caught the fresh save)');
+      const { doc } = overrideDoc();
+      ok('probe-await race: the FRESH token survives (sync re-verify held)', doc.token === 'tok_FRESH2' && doc.tokenDroppedAt === undefined, JSON.stringify(doc));
+      store.gh?.saveSettings({}); // the fresh token drains
+      ok('probe-await race: queue drains on the fresh token', await until(() => queueOps(ghc31).length === 0, 'drained'));
+      ok('probe-await race: issue created', [...gh.issues.values()].some((i) => i.body.includes('thread id: th_probe')));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  }
+
+  /* 31l — delta-B pull-unpark: a pull that 401'd arms the 5-minute
+   *  pullBackoffUntil; when the push-path heal fires (config just changed),
+   *  the pull backoff is cleared too — the pull listing re-fires within a
+   *  poll cycle instead of sitting dark for 5 minutes. */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 80 }); // fast pull timer
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' });
+    const base = gh.transport;
+    const listings = [];
+    ghc31.__ghSetTransportForTests(async (url, init = {}) => {
+      const u = new URL(String(url));
+      const isListing = u.pathname.endsWith('/issues') && (init.method ?? 'GET').toUpperCase() === 'GET';
+      const auth = (init.headers ?? {})['Authorization'];
+      if (isListing) listings.push({ auth, at: Date.now() });
+      if (auth === 'Bearer DEAD') return { ok: false, status: 401, text: async () => 'Bad credentials', json: async () => ({}), headers: { get: () => null } };
+      return base(url, init);
+    });
+    // wait for a pull listing under DEAD → 401 → 5-min pull backoff armed
+    await until(() => listings.some((l) => l.auth === 'Bearer DEAD'), 'pull attempted under DEAD');
+    const nWhenArmed = listings.length;
+    await sleep(300); // >3 poll cycles — the backoff must hold the pull dark
+    ok('pull backoff armed (no listings while parked)', listings.length === nWhenArmed, `listings ${nWhenArmed} → ${listings.length}`);
+    // the push op 401s → heal fires (valid bake) → pull backoff cleared
+    await store.create(threadInput('th_pullunpark'));
+    await until(() => queueOps(ghc31).length === 0, 'push healed + drained');
+    ok('pull re-fired promptly after the heal (backoff cleared)', await until(() => listings.length > nWhenArmed, 'pull listing resumed'));
+    ok('the resumed pull used the BAKED token', listings.slice(nWhenArmed).some((l) => l.auth === 'Bearer tok_AAA'));
+  }
+
+  /* 31m — clearOpBackoff ripple: op A parked by a 401 backoff (NO override —
+   *  the 401 belongs to the dead bake, the heal structurally cannot fire),
+   *  then a dead override appears (written DIRECTLY — saveSettings would
+   *  clearOpBackoff itself and pollute the proof) and op B's 401 heals →
+   *  the heal's clearOpBackoff() makes A eligible AGAIN (it is re-attempted
+   *  in the same pass — attempts 1→2 with no other trigger in between). */
+  {
+    const ghc31 = await fresh({ token: 'ghp_STALEBAKE2', repo: 'acme/web', pollMs: 600_000 }); // dead bake, NO override
+    const store = await ghc31.getGhLinkedStaticStore();
+    await store.create(threadInput('th_ripple_a'));
+    await until(() => { const o = queueOps(ghc31).find((x) => x.threadId === 'th_ripple_a'); return o && (o.attempts ?? 0) >= 1; }, 'op A 401-backed-off');
+    const aAfterBump = queueOps(ghc31).find((o) => o.threadId === 'th_ripple_a');
+    ok('op A parked (attempts=1, future notBefore, no override — no heal possible)', (aAfterBump?.attempts ?? 0) === 1 && (aAfterBump?.notBefore ?? 0) > Date.now(), JSON.stringify(aAfterBump));
+    // another tab saves a DEAD override — written DIRECTLY (saveSettings
+    // clears op backoff itself; the ripple must be attributable to the HEAL)
+    storageShim.setItem(cfgKey31, JSON.stringify({ token: 'DEAD', repo: 'acme/web' }));
+    await store.create(threadInput('th_ripple_b')); // enqueue-wake → flush → B 401s under DEAD → heal fires
+    await until(() => { const o = queueOps(ghc31).find((x) => x.threadId === 'th_ripple_a'); return o && (o.attempts ?? 0) >= 2; }, 'op A re-attempted after the heal made it eligible');
+    const { doc } = overrideDoc();
+    ok('ripple: the heal fired on op B (override tokenless)', !('token' in doc) && typeof doc.tokenDroppedAt === 'string', JSON.stringify(doc));
+    const aAfterRipple = queueOps(ghc31).find((o) => o.threadId === 'th_ripple_a');
+    ok('ripple: op A RE-ATTEMPTED in the heal pass (attempts 1→2 — the clearOpBackoff ripple)', (aAfterRipple?.attempts ?? 0) === 2, JSON.stringify(aAfterRipple));
+    // behavioral proof: swap a good bake (double-save rhythm — the cache may
+    // hold the stale success) → BOTH ops drain
+    bakedConfig = { token: 'tok_GOOD', repo: 'acme/web', pollMs: 600_000 };
+    const beforeM = bakedFetchCount;
+    store.gh?.saveSettings({});
+    await until(() => bakedFetchCount > beforeM, 're-fetch landed the good bake');
+    store.gh?.saveSettings({});
+    ok('ripple: BOTH ops drain on the good bake', await until(() => queueOps(ghc31).length === 0, 'both drained'));
+    ok('ripple: both issues landed', [...gh.issues.values()].some((i) => i.body.includes('thread id: th_ripple_a')) && [...gh.issues.values()].some((i) => i.body.includes('thread id: th_ripple_b')));
+  }
+
+  /* 31n — async status parity: ghClientStatus() (the panel's first paint)
+   *  carries tokenDroppedAt too, and tokenOverridden reads false while the
+   *  trace is live (the settings hint gates on exactly this pair). */
+  {
+    const ghc31 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const store = await ghc31.getGhLinkedStaticStore();
+    store.gh?.saveSettings({ token: 'DEAD', repo: 'acme/web' });
+    await store.create(threadInput('th_asyncstat'));
+    await until(() => queueOps(ghc31).length === 0, 'healed + drained');
+    const sync31 = store.gh?.status();
+    const async31 = await ghc31.ghClientStatus();
+    ok('async status carries the durable trace', typeof async31.tokenDroppedAt === 'string' && async31.tokenDroppedAt === sync31?.tokenDroppedAt, JSON.stringify({ sync: sync31?.tokenDroppedAt, async: async31.tokenDroppedAt }));
+    ok('tokenOverridden false while the trace is live (hint/warning stay exclusive)', async31.tokenOverridden === false && sync31?.tokenOverridden === false);
+  }
 }
 
 /* cleanup + summary */

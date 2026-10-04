@@ -191,7 +191,9 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     const message = err instanceof Error ? err.message : String(err);
     if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
     noteAuthFailure(err); // v0.6.6 (F7): a 401 is an AUTH-STATE event, not just a task failure
-    if (n <= RETRY_LIMIT && (e.status ?? 0) !== 401 && (e.status ?? 0) !== 404) {
+    // v0.6.7 (audit 24-b P3): 422 is NON-transient per gh.ts's contract —
+    // the body is rejected; retrying re-422s. Park it like a 401/404.
+    if (n <= RETRY_LIMIT && (e.status ?? 0) !== 401 && (e.status ?? 0) !== 404 && (e.status ?? 0) !== 422) {
       retries.set(id, n);
       notBefore.set(id, Date.now() + Math.min(intervalMs * 2 ** (n - 1), RETRY_MAX_DELAY_MS));
       queue.push(id);
@@ -210,7 +212,10 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
   /* ------------------------------ push direction ----------------------------- */
 
   function issueTitle(t: Thread): string {
-    const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
+    // v0.6.7 (audit 24-b P3): storyLabel single-lined — a story name/title
+    // carrying newlines flowed into the GitHub issue TITLE (the 160-slice
+    // happened after injection)
+    const storyLabel = String(t.story?.name ?? t.story?.title ?? t.storyId).replace(/\s+/g, ' ').trim();
     // headline budget 100 (issue #16: titles clipped at 60 hid the substance;
     // the body now carries everything verbatim, the title is the scannable ID)
     const headline = (t.comments[0]?.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 100);
@@ -498,6 +503,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     let pulled = 0;
     let closedTombstones = 0;
     let healed = 0;
+    let pullHadError = false; // v0.6.7 (audit 24-b): an in-pull failure keeps its lastError
     const threads = await store.listThreads();
 
     // one listing per cycle (paged); per-thread comment fetches are gated by
@@ -709,6 +715,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
           continue;
         }
         lastError = `tombstone close failed (issue #${issueNumber}): ${err instanceof Error ? err.message : String(err)}`;
+        pullHadError = true;
       }
     }
 
@@ -719,6 +726,13 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
       for (const t of await stalledThreads()) enqueue(t.id);
     }
 
+    // v0.6.7 (audit 24-b P2): a fully-clean pull clears the engine error —
+    // symmetric with drainQueue's post-success clear. The agent loop is
+    // pull-centric (pulled replies never enqueue pushes), so a transient
+    // pull error used to leave /health's lastError + every
+    // X-Annotakit-Mirror: unhealthy header lying about a healthy mirror
+    // forever. An in-pull failure (tombstone close) keeps its own error.
+    if (!pullHadError) lastError = null;
     lastPullAt = nowIso();
     return { pulled, closedTombstones, healed };
   };
@@ -748,6 +762,10 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
         void run(pullOnceRaw).catch((err: unknown) => {
           // v0.6.6 (F11/SR-C): this kick used to swallow 401s without even
           // setting lastError — a dead token was invisible here
+          // v0.6.7 (audit 24-b P3): also honor retryMs + the 401 backoff like
+          // the other three pull invocation sites
+          const e = err as { retryMs?: number; status?: number };
+          if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
           noteAuthFailure(err);
           lastError = err instanceof Error ? err.message : String(err);
         });
@@ -828,6 +846,13 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
   };
 
   const status = async (): Promise<GhSyncStatus> => {
+    // v0.6.7 (audit 24-b P2): rotation is detected ONLY in the engine timers
+    // today — a POST /gh/reload response could pair tokenChanged:true with
+    // tokenState:'rejected', and in ghAuto:false mode (no timers installed)
+    // a rejected state NEVER cleared. noteTokenRotation is idempotent and
+    // only acts on an actual token value change — running it on every status
+    // read is strictly more honest.
+    noteTokenRotation();
     const list = await store.listThreads();
     const cfg = configured();
     const mode: GhSyncStatus['mode'] = !opts.enabled ? 'off' : cfg.error ? 'unconfigured' : 'auto';

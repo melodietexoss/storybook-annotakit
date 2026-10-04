@@ -167,10 +167,12 @@ function sqliteStore(db, storePath) {
     return next;
   };
   const deleteThread = async (id) => {
+    const exists = db.prepare("SELECT 1 FROM threads WHERE id = ?").get(id);
+    if (!exists) return false;
     db.prepare("INSERT OR REPLACE INTO deleted_threads (id, deleted_at) VALUES (?, ?)").run(id, nowIso());
     db.prepare("DELETE FROM snapshots WHERE thread_id = ?").run(id);
-    const r = db.prepare("DELETE FROM threads WHERE id = ?").run(id);
-    return Number(r.changes) > 0;
+    db.prepare("DELETE FROM threads WHERE id = ?").run(id);
+    return true;
   };
   const countThreads = async () => {
     const row = db.prepare("SELECT COUNT(*) AS c FROM threads").get();
@@ -788,7 +790,7 @@ function kitRepo() {
 function fmtDate(iso) {
   if (!iso) return "";
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
+  if (Number.isNaN(d.getTime())) return oneLine(iso).slice(0, 40);
   return d.toISOString().replace("T", " ").slice(5, 16);
 }
 function oneLine(body) {
@@ -811,7 +813,7 @@ function threadBlock(t, snapshotUrl, full) {
   const headline = first ? full ? firstLine(first.body) || "(no text)" : clip2(first.body) : "(no text)";
   const status = t.status === "fixed" ? "FIXED" : t.status === "resolved" ? "RESOLVED" : "OPEN";
   const out = [];
-  out.push(`### #${t.number} ${status} \u2014 ${headline}`);
+  out.push(`### Thread ${t.number} \xB7 ${status} \u2014 ${headline}`);
   out.push("");
   if (t.story) {
     const ip = repoRelPath(t.story.importPath) ?? t.story.importPath;
@@ -846,7 +848,7 @@ function threadBlock(t, snapshotUrl, full) {
     for (const [i, c] of t.comments.entries()) {
       const via = c.source === "github" ? " via github" : "";
       const label = i === 0 ? "note" : "reply";
-      out.push(`**${label} \u2014 ${c.author}${via} ${fmtDate(c.createdAt)} (verbatim):**`);
+      out.push(`**${label} \u2014 ${metaLine(c.author, 60)}${via} ${metaLine(fmtDate(c.createdAt), 40)} (verbatim):**`);
       out.push("");
       out.push(c.body?.trim() || "(empty)");
       out.push("");
@@ -854,7 +856,7 @@ function threadBlock(t, snapshotUrl, full) {
   } else {
     for (const r of replies) {
       const via = r.source === "github" ? " (via github)" : "";
-      out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip2(r.body)}`);
+      out.push(`  - ${metaLine(r.author, 60)}${via} ${metaLine(fmtDate(r.createdAt), 40)}: ${clip2(r.body)}`);
     }
   }
   if (t.status === "resolved" && t.resolvedAt) {
@@ -870,7 +872,7 @@ function renderDigest(stories, opts) {
   const open = stories.reduce((n, s) => n + (Number(s.counts.open) || 0), 0);
   const fixed = stories.reduce((n, s) => n + (Number(s.counts.fixed) || 0), 0);
   const resolved = stories.reduce((n, s) => n + (Number(s.counts.resolved) || 0), 0);
-  const title = stories.length === 1 ? `UI review \u2014 ${stories[0].story.title ?? stories[0].story.storyId}` : `UI review \u2014 ${stories.length} stories`;
+  const title = stories.length === 1 ? `UI review \u2014 ${metaLine(stories[0].story.title ?? stories[0].story.storyId, 120)}` : `UI review \u2014 ${stories.length} stories`;
   out.push(`# ${title}`);
   out.push("");
   out.push(`${open} open / ${fixed} fixed (awaiting review) / ${resolved} resolved \xB7 ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " ")}`);
@@ -879,12 +881,12 @@ function renderDigest(stories, opts) {
   for (const s of stories) {
     const st = s.story;
     const storyTitle = [st.title ?? st.storyId, st.name].filter(Boolean).join(" / ");
-    out.push(`## ${storyTitle}`);
+    out.push(`## ${metaLine(storyTitle, 160)}`);
     out.push("");
-    out.push(`story id: \`${st.storyId}\``);
+    out.push(`story id: \`${metaLine(st.storyId, 200)}\``);
     if (st.importPath) out.push(`story file: ${repoRelPath(st.importPath) ?? st.importPath}`);
     if (st.componentPath) out.push(`component file: ${repoRelPath(st.componentPath) ?? st.componentPath}`);
-    if (st.url) out.push(`open: ${st.url}`);
+    if (st.url) out.push(`open: ${metaLine(st.url, 300)}`);
     out.push("");
     if (s.threads.length === 0) {
       out.push("_no threads_");
@@ -1294,7 +1296,7 @@ function createGhSync(opts) {
     const message = err instanceof Error ? err.message : String(err);
     if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
     noteAuthFailure(err);
-    if (n <= RETRY_LIMIT && (e.status ?? 0) !== 401 && (e.status ?? 0) !== 404) {
+    if (n <= RETRY_LIMIT && (e.status ?? 0) !== 401 && (e.status ?? 0) !== 404 && (e.status ?? 0) !== 422) {
       retries.set(id, n);
       notBefore.set(id, Date.now() + Math.min(intervalMs * 2 ** (n - 1), RETRY_MAX_DELAY_MS));
       queue.push(id);
@@ -1307,7 +1309,7 @@ function createGhSync(opts) {
     console.warn(`[storybook-annotakit] gh-sync: ${lastError}`);
   };
   function issueTitle(t) {
-    const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
+    const storyLabel = String(t.story?.name ?? t.story?.title ?? t.storyId).replace(/\s+/g, " ").trim();
     const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
     return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 160);
   }
@@ -1512,6 +1514,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
     let pulled = 0;
     let closedTombstones = 0;
     let healed = 0;
+    let pullHadError = false;
     const threads = await store.listThreads();
     const remote = new Map((await listLabeledIssues(tk, rp, labelsOf())).map((i) => [i.number, i]));
     for (const t of threads) {
@@ -1667,12 +1670,14 @@ thread deleted in Storybook \u2014 closing.`);
           continue;
         }
         lastError = `tombstone close failed (issue #${issueNumber}): ${err instanceof Error ? err.message : String(err)}`;
+        pullHadError = true;
       }
     }
     if (Date.now() - lastStalledSweep > STALLED_SWEEP_MS) {
       lastStalledSweep = Date.now();
       for (const t of await stalledThreads()) enqueue(t.id);
     }
+    if (!pullHadError) lastError = null;
     lastPullAt = nowIso();
     return { pulled, closedTombstones, healed };
   };
@@ -1691,6 +1696,8 @@ thread deleted in Storybook \u2014 closing.`);
     void store.tombstone(issue).then(() => {
       if (opts.enabled && token() && repo) {
         void run(pullOnceRaw).catch((err) => {
+          const e = err;
+          if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
           noteAuthFailure(err);
           lastError = err instanceof Error ? err.message : String(err);
         });
@@ -1755,6 +1762,7 @@ thread deleted in Storybook \u2014 closing.`);
     return run(syncAllRaw);
   };
   const status = async () => {
+    noteTokenRotation();
     const list = await store.listThreads();
     const cfg = configured();
     const mode = !opts.enabled ? "off" : cfg.error ? "unconfigured" : "auto";
@@ -2539,7 +2547,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.6";
+var VERSION = "0.6.7";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2928,7 +2936,7 @@ async function handleApi(req, res, url, configDir, origin) {
         ["POST", `${API_BASE}/threads/<id>/comments`, "reply \u2192 201 with the FULL updated thread doc (not the new comment); key comments by thread id, never by your own comment id (ids are re-hashed)"],
         ["DELETE", `${API_BASE}/threads/<id>`, "delete (path form; legacy DELETE /threads?id=<id> equivalent)"],
         ["GET|PUT", `${API_BASE}/threads/<id>/snapshot`, "plan-b DOM evidence \u2014 GET \u2192 JSON, GET ?format=html \u2192 human view; PUT replaces (idempotent, 96KB cap)"],
-        ["GET", `${API_BASE}/export?format=md|json`, "digest \u2014 md clips comment bodies at 200 chars for display; json keeps FULL bodies. NOTE the json envelope is {generatedAt, stories:[...]} (story-grouped), NOT the {threads:[...]} shape of GET /threads"],
+        ["GET", `${API_BASE}/export?format=md|json`, "digest \u2014 json keeps FULL bodies (envelope {generatedAt, stories:[...]}, story-grouped, NOT the {threads:[...]} shape of GET /threads). md default is the LEAN digest (200-char clips for token economy); add ?mode=full for VERBATIM bodies (the panel export uses this \u2014 a hand-off artifact must never shorten a note)"],
         ["GET|POST", `${API_BASE}/sync`, "mirror status / force reconcile \u2014 POST also forces one git store cycle first (v0.6.1)"],
         ["POST", `${API_BASE}/gh/reload`, "re-read .env and apply token changes WITHOUT a restart (v0.6.6) \u2014 response lists applied/requiresRestart; the PAT is never echoed"]
       ],
@@ -3221,7 +3229,12 @@ async function handleApi(req, res, url, configDir, origin) {
       sendJson(res, 200, bundle);
       return true;
     }
-    const md = renderDigest(stories, { origin, snapshotIds });
+    const mode = url.searchParams.get("mode")?.toLowerCase() ?? null;
+    if (mode !== null && mode !== "lean" && mode !== "full") {
+      throw Object.assign(new Error(`unknown mode ${JSON.stringify(mode)} \u2014 use ?mode=lean (default; clipped digest) or ?mode=full (verbatim bodies)`), { status: 400 });
+    }
+    const fullText = mode === "full";
+    const md = renderDigest(stories, { origin, snapshotIds, fullText });
     res.writeHead(200, {
       "Content-Type": "text/markdown; charset=utf-8",
       "Cache-Control": "no-store"
@@ -3260,10 +3273,14 @@ async function handleApi(req, res, url, configDir, origin) {
     return true;
   }
   if (p === `${API_BASE}/gh` && method === "POST") {
+    await rt.sync.restore().catch(() => void 0);
+    const gitOk = await rt.sync.syncNow("api").catch(() => false);
     const summary = await rt.ghsync.syncAll();
     sendJson(res, 200, {
       ...summary,
-      note: "digest issues are gone: each thread mirrors to exactly ONE issue now. POST /annotakit/api/sync is the canonical force-reconcile; this alias behaves identically."
+      gitSync: rt.sync.gitHealth(),
+      gitSyncForced: gitOk,
+      note: "digest issues are gone: each thread mirrors to exactly ONE issue now. POST /annotakit/api/sync is the canonical force-reconcile; this alias behaves identically (restore settle + forced git cycle + mirror reconcile)."
     });
     return true;
   }
@@ -3275,6 +3292,9 @@ var KNOWN_API_ROUTES = [
   [new RegExp(`^${API_BASE}/threads$`), "GET, POST, DELETE, OPTIONS"],
   [new RegExp(`^${API_BASE}/threads/[^/]+$`), "GET, PATCH, DELETE, OPTIONS"],
   [new RegExp(`^${API_BASE}/threads/[^/]+/comments$`), "POST, OPTIONS"],
+  // v0.6.7 (audit 24-b P3): the snapshot endpoint was missing — unsupported
+  // methods on a documented route 404'd as "unknown route" instead of 405+Allow
+  [new RegExp(`^${API_BASE}/threads/[^/]+/snapshot$`), "GET, PUT, OPTIONS"],
   [new RegExp(`^${API_BASE}/export$`), "GET, OPTIONS"],
   [new RegExp(`^${API_BASE}/sync$`), "GET, POST, OPTIONS"],
   [new RegExp(`^${API_BASE}/gh$`), "POST, OPTIONS"],
@@ -3299,7 +3319,6 @@ function createMiddleware(configDir) {
     }
     const origin = `http://${req.headers.host ?? "localhost:6006"}`;
     const rt = runtime;
-    if (rt) rt.origin = origin;
     let url;
     try {
       url = new URL(urlStr, origin);
@@ -3326,6 +3345,7 @@ function createMiddleware(configDir) {
         return;
       }
       if (!enforceApiAccess(req, res)) return;
+      if (rt) rt.origin = origin;
       handleApi(req, res, url, configDir, origin).then(
         (handled) => {
           if (!handled) resolveNotHandled(res, url.pathname);

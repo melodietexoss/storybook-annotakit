@@ -367,17 +367,29 @@ async function main() {
   /* ------------------------------ stress: v0.4.0 ----------------------------- */
 
   console.log('== 9. CONCURRENT syncAll on unmapped threads → ONE issue each ==');
-  await Promise.all([j('POST', '/annotakit/api/threads', threadInput(10)), j('POST', '/annotakit/api/threads', threadInput(11)), j('POST', '/annotakit/api/threads', threadInput(12))]);
+  // v0.6.7: the baseline is captured BEFORE the creates — the 100ms drain
+  // timer can mint case-10's issue between a POST resolving and a baseline
+  // read AFTER the Promise.all, inflating issuesBefore so `+3` never lands
+  // (observed once as `issues=5 vs 3`: 2 pre-existing + 3 new, baseline=3).
+  // The invariant is now stamp-based: count issues carrying the three stress
+  // threads' `- thread id:` stamps — exactly 3, distinct numbers, one each.
   const issuesBefore = gh.issues.length;
+  await Promise.all([j('POST', '/annotakit/api/threads', threadInput(10)), j('POST', '/annotakit/api/threads', threadInput(11)), j('POST', '/annotakit/api/threads', threadInput(12))]);
   const [sa, sb, sc] = await Promise.all([j('POST', '/annotakit/api/sync'), j('POST', '/annotakit/api/sync'), j('POST', '/annotakit/api/sync')]);
   const all = [sa, sb, sc];
   check('all concurrent syncs → 200 ok', all.every((s) => s.status === 200 && s.body.ok), all.map((s) => s.status).join(','));
   // the mutex serializes worker + 3 syncs: whoever creates, exactly ONE issue
   // per thread lands — the invariant is the issue count, not who counted it
-  await waitFor(() => gh.issues.length === issuesBefore + 3, 6000, '3 issues created');
+  await waitFor(() => (async () => {
+    const th = (await j('GET', '/annotakit/api/threads')).body.threads.filter((t) => /case-1[012]/.test(t.storyId));
+    const stamps = th.map((t) => `- thread id: ${t.id}`);
+    return th.length === 3 && th.every((t) => t.gh?.issue) && gh.issues.filter((i) => stamps.some((s) => i.body?.includes(s))).length === 3;
+  })(), 6000, '3 stamped issues created');
   const stressThreads = (await j('GET', '/annotakit/api/threads')).body.threads.filter((t) => /case-1[012]/.test(t.storyId));
+  const stressStamps = stressThreads.map((t) => `- thread id: ${t.id}`);
+  const stressIssues = gh.issues.filter((i) => stressStamps.some((s) => i.body?.includes(s)));
   check('all 3 threads mapped 1:1', stressThreads.length === 3 && stressThreads.every((t) => t.gh?.issue), JSON.stringify(stressThreads.map((t) => t.gh?.issue)));
-  check('ZERO duplicate issues (exactly 3 created, distinct numbers)', gh.issues.length === issuesBefore + 3 && new Set(stressThreads.map((t) => t.gh?.issue)).size === 3, `issues=${gh.issues.length} vs ${issuesBefore}`);
+  check('ZERO duplicate issues (exactly 3 stamped, distinct numbers)', stressIssues.length === 3 && new Set(stressIssues.map((i) => i.number)).size === 3 && new Set(stressThreads.map((t) => t.gh?.issue)).size === 3, `stampedIssues=${stressIssues.length} nums=${JSON.stringify(stressIssues.map((i) => i.number))} (baseline ${issuesBefore}, total ${gh.issues.length})`);
 
   console.log('== 10. orphan guard: delete DURING createIssue ==');
   const issuesBefore10 = gh.issues.length;

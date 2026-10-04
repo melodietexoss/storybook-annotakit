@@ -6,7 +6,7 @@ import {
   mirrorStateOf,
   renderThreadBlock,
   staticScope
-} from "./chunk-LNF6XYUQ.mjs";
+} from "./chunk-UERRFJPI.mjs";
 
 // src/shared/legacyMirror.ts
 function fmtDate(iso) {
@@ -387,7 +387,7 @@ function resolveGhConfig(baked, override) {
   if (!token || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return null;
   const labels = (merged.labels ?? []).map((l) => String(l).trim()).filter(Boolean);
   const pollMs = typeof merged.pollMs === "number" && Number.isFinite(merged.pollMs) && merged.pollMs >= 0 ? Math.floor(merged.pollMs) : DEFAULT_POLL_MS;
-  const apiBase = (merged.apiBase ?? "").trim() || DEFAULT_API;
+  const apiBase = (merged.apiBase ?? "").trim().replace(/\/+$/, "") || DEFAULT_API;
   return { token, repo, labels: labels.length ? labels : [DEFAULT_LABEL], apiBase, pollMs };
 }
 async function probeGhConfig() {
@@ -606,6 +606,9 @@ function freshThread(base, id) {
   return base.list().find((t) => t.id === id);
 }
 function threadPending(id) {
+  return readQueue().some((o) => o.kind === "sync" && o.threadId === id && !o.parked);
+}
+function threadPendingOrParked(id) {
   return readQueue().some((o) => o.kind === "sync" && o.threadId === id);
 }
 function stillLeading() {
@@ -753,6 +756,26 @@ async function flushOnce(base) {
               removeOp(op.id);
               enqueue("sync", String(op.threadId));
               continue;
+            }
+          }
+        }
+        if (err?.status === 401) {
+          const ov = readOverride();
+          if (ov && typeof ov.token === "string" && ov.token.trim() && ov.token.trim() === cfg.token) {
+            const bk = await probeBakedGhConfig();
+            const normBase = (v) => (v ?? "").trim().replace(/\/+$/, "") || DEFAULT_API;
+            if (bk && typeof bk.token === "string" && bk.token.trim() && bk.token.trim() !== ov.token.trim() && // v0.6.7 (audit 24-c P2): an ABSENT override apiBase INHERITS the
+            // bake's (resolveGhConfig merges override-over-baked) — filling
+            // it with DEFAULT_API instead silently refused the heal for every
+            // GHES/proxy bake behind a token-only override (the common shape).
+            normBase(ov.apiBase ?? bk.apiBase) === normBase(bk.apiBase)) {
+              const now = readOverride();
+              if (now && typeof now.token === "string" && now.token.trim() === ov.token.trim() && writeOverride({ token: void 0, tokenDroppedAt: (/* @__PURE__ */ new Date()).toISOString() })) {
+                if (state) state.lastError = "saved GitHub token was rejected (401) - publishing with this deployment's built-in token; your other settings were kept";
+                clearOpBackoff();
+                if (state) state.pullBackoffUntil = 0;
+                continue;
+              }
             }
           }
         }
@@ -986,7 +1009,7 @@ function startRuntime(base) {
       const cfg = await probeGhConfig();
       if (cfg) {
         for (const t of base.list()) {
-          if (threadPending(t.id)) continue;
+          if (threadPendingOrParked(t.id)) continue;
           const stalled = !t.gh || t.comments.some((c) => !c.ghId && c.source !== "github") || (t.gh ? t.gh.state !== mirrorStateOf(t.status) : false);
           if (stalled) enqueue("sync", t.id, { fromSweep: true });
         }
@@ -1023,6 +1046,11 @@ function buildStatus() {
     lastPullAt: state?.lastPullAt,
     lastPullCount: state?.lastPullCount,
     lastHealedCount: state?.lastHealedCount,
+    // v0.6.7 (PR #33): read off the override record (NOT state) — a 401
+    // heal's lastError notice is wiped by the next successful op; this is
+    // the durable trace. Stale after a later fresh save by design (harmless:
+    // the panel hint gates on !tokenOverridden).
+    tokenDroppedAt: override?.tokenDroppedAt ?? null,
     pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS
   };
 }

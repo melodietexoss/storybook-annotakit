@@ -255,12 +255,21 @@ function sqliteStore(db: SqliteDb, storePath: string): Store {
   };
 
   const deleteThread = async (id: string): Promise<boolean> => {
+    // v0.6.7 (audit P0): existence-gate the tombstone. A 404'd DELETE of an
+    // id that never existed locally (e.g. a remote-only thread id read off a
+    // GitHub issue's `- thread id:` stamp) used to write a delete-wins
+    // tombstone ANYWAY — the next logical merge then destroyed that thread
+    // globally while its mirror issue stayed open forever. jsonStore already
+    // gates on idx >= 0; this is parity. An already-deleted id also lands
+    // here (idempotent 404 — its tombstone already stands).
+    const exists = db.prepare('SELECT 1 FROM threads WHERE id = ?').get(id);
+    if (!exists) return false;
     // A1: tombstone FIRST (delete-wins for logical merges), then drop the row
     // + its snapshot (evidence goes with its thread)
     db.prepare('INSERT OR REPLACE INTO deleted_threads (id, deleted_at) VALUES (?, ?)').run(id, nowIso());
     db.prepare('DELETE FROM snapshots WHERE thread_id = ?').run(id);
-    const r = db.prepare('DELETE FROM threads WHERE id = ?').run(id);
-    return Number(r.changes) > 0;
+    db.prepare('DELETE FROM threads WHERE id = ?').run(id);
+    return true;
   };
 
   const countThreads = async (): Promise<number> => {

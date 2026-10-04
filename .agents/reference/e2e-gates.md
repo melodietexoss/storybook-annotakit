@@ -1,0 +1,10 @@
+# E2E verification gates 10-13 (gateway / static build / client GH / local-only)
+
+The LONG-FORM procedures behind SKILL.md §7 gates 10-13 — read the one you are
+about to run. Extracted from SKILL.md (v0.6.7 condense), unchanged. Gates 1-9
+(the routine table) live in SKILL.md itself.
+
+10. [needs gateway] serving through a proxy → verify the PUBLIC URL, not localhost (localhost passes even when public 403s — §0): derive, curl from inside, then BROWSER-verify — manager JS loads, WS/HMR connects, story renders, pin click arms the preview.
+11. [needs browser; bake is cold-runnable] **static build shipped?** `build:static` (bake log shows thread count) → serve (any port) → browser: pins from the seed, canvas overlay-FREE — no static chip, no capture banner, no PANEL stickers; status = GitHub-button dots + sync-button queue count + tooltip; `.annota-badge` ABSENT → toolbar pin → composer → submit (native-setter, §6) → count +1, scope key materialized → RELOAD → count survives (idempotent merge; tombstones stay deleted) → panel reply persists, copy-md builds (clipboard block must not throw) → sync → old-format mirrors in the issue repo come back VERBATIM (exact-match heal — §3; second sync heals nothing).
+12. [needs browser + baked GH config] **client-side GH publishing shipped?** `node scripts/ghclient-test.mjs` green (§5). Bake log shows the `annotakit-gh.json` line (token masked). Browser: GitHub button green live dot, sync-button queue 0 after submit; `ghq:<scope>` empty; thread has `gh.issue` + `ghId`. E2E: bake with .env → serve :3000 → browser via public URL → pin (toolbar + native-setter, §6) → issue on GitHub (~3s) → agent comment via API → panel "sync" → imported (`source:'github'`) → resolve → issue closed. KILLER TEST: `pkill -f serve-static` → panel reply still lands on GitHub (queue drains via the still-loaded page); restart after.
+13. [needs browser] **local-only (client GH disabled) never freezes**: settings → disable → pin/reply → page responsive (timers fire; GitHub button amber dot; queue held) → re-enable → backlog drains to exactly one issue (pinned headlessly).

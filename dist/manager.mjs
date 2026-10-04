@@ -6,15 +6,15 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-XM4L6WNP.mjs";
+} from "./chunk-J3CH2RMF.mjs";
 import {
   getGhLinkedStaticStore,
   ghClientStatus
-} from "./chunk-BKSLU7VF.mjs";
+} from "./chunk-KLEHYURA.mjs";
 import {
   MAX_BODY_CHARS,
   renderStaticDigest
-} from "./chunk-LNF6XYUQ.mjs";
+} from "./chunk-UERRFJPI.mjs";
 
 // src/manager/index.tsx
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -47,7 +47,7 @@ var getThreadsAndSnapshots = (storyId) => jfetch(`${API_BASE}/threads${storyId ?
 });
 var getHealth = () => fetch(`${API_BASE}/health`, { cache: "no-store" }).then((r) => r.ok ? r.json() : null).catch(() => null);
 var getExport = (format, storyId) => fetch(
-  `${API_BASE}/export?format=${format}${storyId ? `&storyId=${encodeURIComponent(storyId)}` : ""}`,
+  `${API_BASE}/export?format=${format}${format === "md" ? "&mode=full" : ""}${storyId ? `&storyId=${encodeURIComponent(storyId)}` : ""}`,
   { cache: "no-store" }
 ).then((r) => {
   if (!r.ok) throw new Error(`export failed: HTTP ${r.status}`);
@@ -284,6 +284,26 @@ function ReviewPanel() {
       setBusy(false);
     }
   };
+  const del = async (t) => {
+    setBusy(true);
+    try {
+      if (staticMode) {
+        const store = await getGhLinkedStaticStore();
+        await store.deleteThread(t.id);
+      } else {
+        await jfetch(`${API_BASE}/threads/${encodeURIComponent(t.id)}`, { method: "DELETE" });
+      }
+      await refresh();
+      setNotice(`thread #${t.number} deleted${t.gh?.issue ? ` \u2014 mirror issue #${t.gh.issue} closes (tombstone)` : ""}`);
+      window.setTimeout(() => setNotice(null), 4e3);
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
   const copy = async (text, what) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -296,12 +316,12 @@ function ReviewPanel() {
   const exportAny = async (format) => {
     const list = staticMode ? (await getGhLinkedStaticStore()).list(scope === "story" ? storyId : void 0) : null;
     if (list !== null) {
-      return format === "md" ? renderStaticDigest(list, { storageNote: ghStat?.configured ? `mirrored to GitHub (${ghStat.repo}) by this browser` : void 0 }) : JSON.stringify({ generatedAt: (/* @__PURE__ */ new Date()).toISOString(), mode: "static", threads: list }, null, 2);
+      return format === "md" ? renderStaticDigest(list, { storageNote: ghStat?.configured && !ghStat?.suppressed ? `mirrored to GitHub (${ghStat.repo}) by this browser` : void 0, full: true }) : JSON.stringify({ generatedAt: (/* @__PURE__ */ new Date()).toISOString(), mode: "static", threads: list }, null, 2);
     }
     return getExport(format, scope === "story" ? storyId : void 0);
   };
   const doExport = (format, sink) => {
-    void exportAny(format).then((text) => sink === "copy" ? copy(text, format === "md" ? "markdown digest" : "JSON bundle") : download(text, "annotakit-review.md")).catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    void exportAny(format).then((text) => sink === "copy" ? copy(text, format === "md" ? "markdown digest" : "JSON bundle") : download(text, format === "md" ? "annotakit-review.md" : "annotakit-review.json")).catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
   const download = (text, filename) => {
     const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
@@ -375,7 +395,9 @@ function ReviewPanel() {
       store.gh.saveSettings(patch);
       const s = await ghClientStatus();
       setGhStat(s);
-      if (!s.configured && !patch.disabled) {
+      if (String(s.lastError ?? "").startsWith("settings NOT saved")) {
+        setError(String(s.lastError));
+      } else if (!s.configured && !patch.disabled) {
         setNotice("saved \u2014 but NOT publishing yet: repo must be owner/name and a token must be present (check GitHub settings below)");
       } else if (tokIgnored) {
         setNotice('saved \u2014 token unchanged (whitespace-only input ignored; use "use baked" to drop a saved override)');
@@ -398,6 +420,10 @@ function ReviewPanel() {
     setGhForm((f) => ({ ...f, token: "" }));
     const s = await ghClientStatus();
     setGhStat(s);
+    if (s.tokenOverridden) {
+      setError("token override NOT removed \u2014 localStorage is full or blocked; free space or check browser storage settings");
+      return;
+    }
     setNotice(
       s.configured ? "token override removed \u2014 the baked annotakit-gh.json token applies again (repo/labels/poll overrides survive)" : "token override removed \u2014 but NO baked config exists for this deployment: paste a token above (or in GitHub settings) to publish"
     );
@@ -526,7 +552,7 @@ function ReviewPanel() {
       title: "Remove ONLY the saved token override \u2014 the baked annotakit-gh.json token applies again (repo/labels/poll overrides survive). Recovery path for an old PAT that shadows every re-bake."
     },
     "use baked"
-  )), ghStat?.tokenOverridden && /* @__PURE__ */ React.createElement("div", { style: { padding: "3px 8px", borderRadius: 6, background: "#f59e0b18", color: "#b45309", fontSize: 10 } }, '\u26A0 a token override is saved in this browser \u2014 it overrides the baked annotakit-gh.json on every deploy. If syncing fails with 401, paste a fresh PAT or click "use baked".'), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "poll (s)"), /* @__PURE__ */ React.createElement(
+  )), ghStat?.tokenOverridden && /* @__PURE__ */ React.createElement("div", { style: { padding: "3px 8px", borderRadius: 6, background: "#f59e0b18", color: "#b45309", fontSize: 10 } }, '\u26A0 a token override is saved in this browser \u2014 it overrides the baked annotakit-gh.json on every deploy. If syncing fails with 401, paste a fresh PAT or click "use baked".'), ghStat?.tokenDroppedAt && !ghStat?.tokenOverridden && !ghForm.token && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: theme.textMutedColor } }, "the previously saved token was rejected (401) \u2014 publishing with this deployment's built-in token; paste a fresh PAT to override again"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "poll (s)"), /* @__PURE__ */ React.createElement(
     "input",
     {
       style: { width: 60, padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor },
@@ -612,7 +638,7 @@ function ReviewPanel() {
       /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, marginTop: 3, color: theme.textColor, textDecoration: t.status === "resolved" ? "line-through" : "none" } }, t.comments[0]?.body?.split("\n")[0]?.slice(0, 140) ?? "(no text)"),
       t.component?.source && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: theme.textMutedColor, fontFamily: theme.fontMonospace, marginTop: 2 } }, t.component.source.file, t.component.source.line ? `:${t.component.source.line}` : ""),
       t.comments.length > 1 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: theme.textMutedColor, marginTop: 2 } }, "+", t.comments.length - 1, " replies"),
-      /* @__PURE__ */ React.createElement(ThreadActions, { thread: t, busy, onReply: reply, onSetStatus: setStatus, active })
+      /* @__PURE__ */ React.createElement(ThreadActions, { thread: t, busy, onReply: reply, onSetStatus: setStatus, onDelete: del, active })
     );
   }), /* @__PURE__ */ React.createElement(
     "div",
@@ -623,12 +649,19 @@ function ReviewPanel() {
     /* @__PURE__ */ React.createElement(MiniButton, { theme, onClick: () => doExport("md", "copy") }, "copy md"),
     /* @__PURE__ */ React.createElement(MiniButton, { theme, onClick: () => doExport("json", "copy") }, "copy json"),
     /* @__PURE__ */ React.createElement(MiniButton, { theme, onClick: () => doExport("md", "download") }, "download md"),
+    /* @__PURE__ */ React.createElement(MiniButton, { theme, onClick: () => doExport("json", "download") }, "download json"),
     /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }),
     /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor, fontFamily: theme.fontMonospace } }, staticMode ? "static build \xB7 digest generated locally from this browser's store" : `curl ${API_BASE}/export?format=md`)
   ));
 }
 function ThreadActions(props) {
   const [body, setBody] = useState("");
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  useEffect(() => {
+    if (!confirmingDelete) return;
+    const reset = window.setTimeout(() => setConfirmingDelete(false), 3e3);
+    return () => window.clearTimeout(reset);
+  }, [confirmingDelete]);
   const theme = useTheme();
   if (!props.active) return /* @__PURE__ */ React.createElement(React.Fragment, null);
   return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 6 }, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement(
@@ -684,6 +717,22 @@ function ThreadActions(props) {
       onClick: () => props.onSetStatus(props.thread, "open")
     },
     "reopen"
+  ), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      style: { padding: "3px 9px", fontSize: 10, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: `1px solid ${confirmingDelete ? "#b91c1c" : theme.appBorderColor}`, background: "transparent", color: confirmingDelete ? "#b91c1c" : theme.textMutedColor, display: "inline-flex", gap: 4, alignItems: "center" },
+      disabled: props.busy,
+      title: confirmingDelete ? "Click again to DELETE this thread permanently (its mirror issue closes with a tombstone)" : "Delete this thread (two-click confirm). On GitHub the mirror issue closes with a tombstone comment \u2014 nothing is deleted remotely.",
+      onClick: () => {
+        if (!confirmingDelete) {
+          setConfirmingDelete(true);
+          return;
+        }
+        setConfirmingDelete(false);
+        void props.onDelete(props.thread);
+      }
+    },
+    confirmingDelete ? "sure?" : "delete"
   ));
 }
 function MiniButton(props) {

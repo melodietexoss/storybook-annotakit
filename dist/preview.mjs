@@ -8,14 +8,14 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-XM4L6WNP.mjs";
+} from "./chunk-J3CH2RMF.mjs";
 import {
   getGhLinkedStaticStore
-} from "./chunk-BKSLU7VF.mjs";
+} from "./chunk-KLEHYURA.mjs";
 import {
   MAX_BODY_CHARS,
   elementSummary
-} from "./chunk-LNF6XYUQ.mjs";
+} from "./chunk-UERRFJPI.mjs";
 
 // src/preview/index.ts
 import React2 from "react";
@@ -1418,7 +1418,8 @@ function parseHotkey(spec, fallback2) {
   const withAlt = altPrefix.test(raw);
   warnLegacyHotkey(spec, raw, withAlt);
   const key = raw.replace(altPrefix, "");
-  return { key: key || fallback2, alt: withAlt };
+  const collidablePlainKey = !withAlt && /^[a-z0-9]$/.test(key);
+  return { key: key || fallback2, alt: withAlt || collidablePlainKey };
 }
 function hotkeyMatches(e, spec) {
   const codeKey = e.code.startsWith("Key") ? e.code.slice(3).toLowerCase() : null;
@@ -1848,7 +1849,14 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       if (hotkeys === false) {
         if (e.key === "Escape") {
           if (mode !== "idle") exitMode();
-          else if (composer) setComposer(null);
+          else if (composer) {
+            if (draftBodyRef.current.trim() && !discardArmedDocRef.current) {
+              discardArmedDocRef.current = true;
+              showHint("Press Esc again to discard the draft");
+              return;
+            }
+            setComposer(null);
+          }
         }
         return;
       }
@@ -2135,7 +2143,7 @@ function ComposerCard(props) {
         props.onDraftChange?.(e.target.value);
       },
       onKeyDown: (e) => {
-        if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && body.trim()) {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && body.trim() && body.length <= MAX_BODY_CHARS && !props.busy) {
           e.preventDefault();
           props.onSubmit(body);
         }

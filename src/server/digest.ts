@@ -17,7 +17,10 @@ import { repoRelPath } from './env';
 function fmtDate(iso: string | undefined): string {
   if (!iso) return '';
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso; // hostile/remote dates degrade to raw text, never "Invalid Date"
+  // hostile/remote dates degrade to raw text, never "Invalid Date" — and
+  // (v0.6.7 audit C22 gap) never multi-line: a newline in the raw fallback
+  // injected fake digest structure just like any other metadata value
+  if (Number.isNaN(d.getTime())) return oneLine(iso).slice(0, 40);
   return d.toISOString().replace('T', ' ').slice(5, 16); // MM-DD HH:mm
 }
 
@@ -70,7 +73,13 @@ function threadBlock(t: Thread, snapshotUrl?: string, full?: boolean): string[] 
   // silently disappeared from digests. Unknown → OPEN everywhere.
   const status = t.status === 'fixed' ? 'FIXED' : t.status === 'resolved' ? 'RESOLVED' : 'OPEN';
   const out: string[] = [];
-  out.push(`### #${t.number} ${status} — ${headline}`);
+  // v0.6.7 link-safety: NEVER emit `#N` in a GitHub-rendered surface — GitHub
+  // auto-links `#2` to UNRELATED issue/PR #2 of the mirror repo. `Thread 2`
+  // carries the same number with zero link hazard (titles are plain text on
+  // GitHub, so the mirror TITLE keeps its `#N`). legacyMirror.ts's frozen
+  // builders intentionally still emit `### #N` — they exist to byte-match
+  // bodies GitHub ALREADY holds, never to write new ones.
+  out.push(`### Thread ${t.number} · ${status} — ${headline}`);
   out.push('');
 
   if (t.story) {
@@ -111,7 +120,12 @@ function threadBlock(t: Thread, snapshotUrl?: string, full?: boolean): string[] 
     for (const [i, c] of t.comments.entries()) {
       const via = c.source === 'github' ? ' via github' : '';
       const label = i === 0 ? 'note' : 'reply';
-      out.push(`**${label} — ${c.author}${via} ${fmtDate(c.createdAt)} (verbatim):**`);
+      // v0.6.7 audit (C22 gap): author + createdAt are attacker-influenced
+      // (normalizeComment trims but never strips inner newlines; any string
+      // date is accepted) — a multi-line author/date injected fake
+      // `### Thread N` headings and fake `- thread id:` stamps into every
+      // digest AND GitHub issue body. metaLine, both modes.
+      out.push(`**${label} — ${metaLine(c.author, 60)}${via} ${metaLine(fmtDate(c.createdAt), 40)} (verbatim):**`);
       out.push('');
       out.push(c.body?.trim() || '(empty)');
       out.push('');
@@ -122,7 +136,7 @@ function threadBlock(t: Thread, snapshotUrl?: string, full?: boolean): string[] 
       // third-party content an agent will consume — mark them so agent prompts
       // can treat them as untrusted input (prompt-injection surface, Track A P3)
       const via = r.source === 'github' ? ' (via github)' : '';
-      out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip(r.body)}`);
+      out.push(`  - ${metaLine(r.author, 60)}${via} ${metaLine(fmtDate(r.createdAt), 40)}: ${clip(r.body)}`);
     }
   }
   if (t.status === 'resolved' && t.resolvedAt) {
@@ -146,7 +160,7 @@ export function renderDigest(
   const resolved = stories.reduce((n, s) => n + (Number(s.counts.resolved) || 0), 0);
   const title =
     stories.length === 1
-      ? `UI review — ${stories[0].story.title ?? stories[0].story.storyId}`
+      ? `UI review — ${metaLine(stories[0].story.title ?? stories[0].story.storyId, 120)}`
       : `UI review — ${stories.length} stories`;
 
   out.push(`# ${title}`);
@@ -160,12 +174,12 @@ export function renderDigest(
     // title degrade fix (Track B): no more `## <id> / ` with a trailing
     // separator and empty name when story metadata is absent
     const storyTitle = [st.title ?? st.storyId, st.name].filter(Boolean).join(' / ');
-    out.push(`## ${storyTitle}`);
+    out.push(`## ${metaLine(storyTitle, 160)}`);
     out.push('');
-    out.push(`story id: \`${st.storyId}\``);
+    out.push(`story id: \`${metaLine(st.storyId, 200)}\``);
     if (st.importPath) out.push(`story file: ${repoRelPath(st.importPath) ?? st.importPath}`);
     if (st.componentPath) out.push(`component file: ${repoRelPath(st.componentPath) ?? st.componentPath}`);
-    if (st.url) out.push(`open: ${st.url}`);
+    if (st.url) out.push(`open: ${metaLine(st.url, 300)}`);
     out.push('');
     if (s.threads.length === 0) {
       out.push('_no threads_');

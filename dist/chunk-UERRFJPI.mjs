@@ -351,7 +351,7 @@ function resetStaticStoreForTests() {
 function fmtDate(iso) {
   if (!iso) return "";
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
+  if (Number.isNaN(d.getTime())) return oneLine(iso).slice(0, 40);
   return d.toISOString().replace("T", " ").slice(5, 16);
 }
 function oneLine(body) {
@@ -370,7 +370,7 @@ function threadBlock(t, storageNote, full) {
   const headline = first ? full ? firstLine(first.body) || "(no text)" : clip2(first.body) : "(no text)";
   const status = t.status === "fixed" ? "FIXED" : t.status === "resolved" ? "RESOLVED" : "OPEN";
   const out = [];
-  out.push(`### #${t.number} ${status} \u2014 ${headline}`);
+  out.push(`### Thread ${t.number} \xB7 ${status} \u2014 ${headline}`);
   out.push("");
   if (t.story) {
     if (t.story.importPath) out.push(`- story: ${t.story.title ?? ""}/${t.story.name ?? ""} (${t.story.importPath})`);
@@ -392,7 +392,7 @@ function threadBlock(t, storageNote, full) {
     for (const [i, c] of t.comments.entries()) {
       const via = c.source === "github" ? " via github" : "";
       const label = i === 0 ? "note" : "reply";
-      out.push(`**${label} \u2014 ${c.author}${via} ${fmtDate(c.createdAt)} (verbatim):**`);
+      out.push(`**${label} \u2014 ${oneLine(String(c.author ?? "")).slice(0, 60)}${via} ${oneLine(fmtDate(c.createdAt)).slice(0, 40)} (verbatim):**`);
       out.push("");
       out.push(c.body?.trim() || "(empty)");
       out.push("");
@@ -400,7 +400,7 @@ function threadBlock(t, storageNote, full) {
   } else {
     for (const r of t.comments.slice(1)) {
       const via = r.source === "github" ? " (via github)" : "";
-      out.push(`  - ${r.author}${via} ${fmtDate(r.createdAt)}: ${clip2(r.body)}`);
+      out.push(`  - ${oneLine(String(r.author ?? "")).slice(0, 60)}${via} ${oneLine(fmtDate(r.createdAt)).slice(0, 40)}: ${clip2(r.body)}`);
     }
   }
   if (t.status === "resolved" && t.resolvedAt) out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
@@ -440,9 +440,9 @@ function renderStaticDigest(threads, opts) {
   out.push("");
   for (const s of stories) {
     const st = s.story;
-    out.push(`## ${[st.title ?? st.storyId, st.name].filter(Boolean).join(" / ")}`);
+    out.push(`## ${oneLine([st.title ?? st.storyId, st.name].filter(Boolean).join(" / ")).slice(0, 160)}`);
     out.push("");
-    out.push(`story id: \`${st.storyId}\``);
+    out.push(`story id: \`${oneLine(String(st.storyId)).slice(0, 200)}\``);
     if (st.importPath) out.push(`story file: ${st.importPath}`);
     out.push("");
     if (s.threads.length === 0) {
@@ -450,9 +450,9 @@ function renderStaticDigest(threads, opts) {
       out.push("");
       continue;
     }
-    for (const t of s.threads.filter((x) => x.status !== "fixed" && x.status !== "resolved")) out.push(...threadBlock(t, opts?.storageNote));
-    for (const t of s.threads.filter((x) => x.status === "fixed")) out.push(...threadBlock(t, opts?.storageNote));
-    for (const t of s.threads.filter((x) => x.status === "resolved")) out.push(...threadBlock(t, opts?.storageNote));
+    for (const t of s.threads.filter((x) => x.status !== "fixed" && x.status !== "resolved")) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
+    for (const t of s.threads.filter((x) => x.status === "fixed")) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
+    for (const t of s.threads.filter((x) => x.status === "resolved")) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
   }
   return out.join("\n");
 }

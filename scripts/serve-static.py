@@ -14,9 +14,26 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # kit repo root
+# v0.6.7 (cold-install audit): --help/-h must not be treated as a dirname —
+# the daemonized grandchild used to exit 0 silently (bind error hidden in
+# the side log) leaving the user with nothing.
+if any(a in ('--help', '-h') for a in sys.argv[1:]):
+    print(__doc__)
+    raise SystemExit(0)
 SERVE_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'examples', 'nimbus', 'dist-storybook')
 PORT = sys.argv[2] if len(sys.argv) > 2 else '3000'
-LOG = os.path.join(ROOT, 'examples', 'nimbus', f'static-{PORT}.log')
+# v0.6.7 (audit P1): the log used to point unconditionally at
+# <pkg>/examples/nimbus/ — a directory that does NOT exist in an npm
+# install (examples/ is not in the files whitelist), so the daemonized
+# grandchild died on os.open(LOG, O_CREAT) with FileNotFoundError, the
+# parent had already exited 0, and no server ever listened. Write the log
+# next to the SERVED directory (any dir the user can read, they can write
+# next to — and when they can't, /tmp is the fallback).
+LOG_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.abspath(SERVE_DIR)) or '.', f'annotakit-static-{PORT}.log'),
+    os.path.join(os.path.expanduser('~'), f'.annotakit-static-{PORT}.log'),
+    os.path.join('/tmp', f'annotakit-static-{PORT}.log'),
+]
 
 
 def daemonize():
@@ -27,7 +44,15 @@ def daemonize():
         os._exit(0)        # first child exits → grandchild reparents to PID 1
     sys.stdout.flush()
     sys.stderr.flush()
-    logfd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    logfd = None
+    for cand in LOG_CANDIDATES:
+        try:
+            logfd = os.open(cand, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            break
+        except OSError:
+            continue
+    if logfd is None:
+        os._exit(3)        # nowhere to log — die loudly (parent already exited 0, so ALSO print below pre-fork)
     devnull = os.open('/dev/null', os.O_RDONLY)
     os.dup2(devnull, 0)
     os.dup2(logfd, 1)

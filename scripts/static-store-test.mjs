@@ -237,6 +237,9 @@ resetStaticStoreForTests(); // scope switched in test 7 — drop the cached stor
   ok('digest renders FIXED heading', md.includes('FIXED —'));
   ok('digest carries the awaiting-review note', md.includes('awaiting reviewer verification'));
   ok('digest three-way summary line', /\d+ open \/ \d+ fixed \(awaiting review\) \/ \d+ resolved/.test(md));
+  // v0.6.7 link-safety: GitHub auto-links `#2` in bodies to UNRELATED issue 2
+  // of the mirror repo — the thread header must never carry a bare #N.
+  ok('thread header is link-safe (Thread N, never #N)', /^### Thread \d+ · (OPEN|FIXED|RESOLVED) — /m.test(md) && !/^### #\d/m.test(md), md.split('\n').find((l) => l.startsWith('### ')));
 }
 
 /* 9 — v0.6.1: huge first comment is display-clipped (server digest parity):
@@ -247,9 +250,24 @@ resetStaticStoreForTests(); // scope switched in test 7 — drop the cached stor
   const big = 'x'.repeat(5000);
   const t = await s.create({ id: 'th_big', storyId: 's1', target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null }, comments: [{ id: 'c_big', author: 'r', body: big, createdAt: new Date().toISOString() }] });
   const md = renderStaticDigest(s.list());
-  const line = md.split('\n').find((l) => l.includes('th_big') && l.startsWith('###')) ?? md.split('\n').find((l) => l.startsWith('### #') && l.includes('xxxx'));
+  const line = md.split('\n').find((l) => l.includes('th_big') && l.startsWith('###')) ?? md.split('\n').find((l) => l.startsWith('### Thread') && l.includes('xxxx'));
   ok('headline clipped to 200 chars + ellipsis', Boolean(line && line.length <= 200 + 60 && line.endsWith('…')));
   await s.deleteThread(t.id);
+}
+
+/* 9b — v0.6.7 (issue #22 parity): renderStaticDigest full mode renders
+ * VERBATIM comment bodies — the md EXPORT is the hand-off artifact and must
+ * never shorten a note (same contract as GitHub mirror bodies, v0.6.3). */
+{
+  const s = await getStaticStore();
+  const long = ['line one of a long reviewer note', 'line two — with, punctuation; and detail', 'line three the old 200-char clip would cut', 'x'.repeat(300) + ' and a fourth line deep past the lean budget'].join('\n');
+  await s.create({ id: 'th_full_export', storyId: 's1', target: { kind: 'region', rect: { x: 1, y: 1, w: 2, h: 2 }, selector: {}, context: null }, comments: [{ id: 'c_full', author: 'reviewer', body: long, createdAt: new Date().toISOString() }] });
+  const lean = renderStaticDigest(s.list());
+  const full = renderStaticDigest(s.list(), { full: true });
+  ok('lean digest still clips (token economy default)', !lean.includes('and a fourth line deep past the lean budget'));
+  ok('full export carries verbatim multi-line body', full.includes(long.trim()));
+  ok('full export labels the verbatim block', /note — reviewer .*\(verbatim\):/.test(full));
+  await s.deleteThread('th_full_export');
 }
 
 /* 10 — v0.6.1: a persist that CANNOT write (quota) surfaces via info().

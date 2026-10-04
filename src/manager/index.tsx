@@ -74,7 +74,7 @@ const getHealth = (): Promise<HealthInfo | null> =>
 
 const getExport = (format: 'md' | 'json', storyId?: string): Promise<string> =>
   fetch(
-    `${API_BASE}/export?format=${format}${storyId ? `&storyId=${encodeURIComponent(storyId)}` : ''}`,
+    `${API_BASE}/export?format=${format}${format === 'md' ? '&mode=full' : ''}${storyId ? `&storyId=${encodeURIComponent(storyId)}` : ''}`,
     { cache: 'no-store' },
   ).then((r) => {
     if (!r.ok) throw new Error(`export failed: HTTP ${r.status}`);
@@ -374,6 +374,31 @@ function ReviewPanel(): React.ReactElement {
     }
   };
 
+  /** v0.6.7 (F15): delete a thread — the destructive escape hatch for junk
+   *  feedback. Static mode: the ghClient-linked store's deleteThread already
+   *  enqueues the mirror close op (tombstone comment + issue closed); dev
+   *  mode: the server route does the same engine-side. */
+  const del = async (t: Thread): Promise<boolean> => {
+    setBusy(true);
+    try {
+      if (staticMode) {
+        const store = await getGhLinkedStaticStore();
+        await store.deleteThread(t.id);
+      } else {
+        await jfetch(`${API_BASE}/threads/${encodeURIComponent(t.id)}`, { method: 'DELETE' });
+      }
+      await refresh();
+      setNotice(`thread #${t.number} deleted${t.gh?.issue ? ` — mirror issue #${t.gh.issue} closes (tombstone)` : ''}`);
+      window.setTimeout(() => setNotice(null), 4000);
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const copy = async (text: string, what: string): Promise<void> => {
     try {
       await navigator.clipboard.writeText(text);
@@ -392,7 +417,7 @@ function ReviewPanel(): React.ReactElement {
       : null;
     if (list !== null) {
       return format === 'md'
-        ? renderStaticDigest(list, { storageNote: ghStat?.configured ? `mirrored to GitHub (${ghStat.repo}) by this browser` : undefined })
+        ? renderStaticDigest(list, { storageNote: ghStat?.configured && !ghStat?.suppressed ? `mirrored to GitHub (${ghStat.repo}) by this browser` : undefined, full: true })
         : JSON.stringify({ generatedAt: new Date().toISOString(), mode: 'static', threads: list }, null, 2);
     }
     return getExport(format, scope === 'story' ? storyId : undefined);
@@ -400,7 +425,7 @@ function ReviewPanel(): React.ReactElement {
 
   const doExport = (format: 'md' | 'json', sink: 'copy' | 'download'): void => {
     void exportAny(format)
-      .then((text) => (sink === 'copy' ? copy(text, format === 'md' ? 'markdown digest' : 'JSON bundle') : download(text, 'annotakit-review.md')))
+      .then((text) => (sink === 'copy' ? copy(text, format === 'md' ? 'markdown digest' : 'JSON bundle') : download(text, format === 'md' ? 'annotakit-review.md' : 'annotakit-review.json')))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
@@ -497,7 +522,12 @@ function ReviewPanel(): React.ReactElement {
       // H-E-09 (with H-H-05): "saved — publishing" used to be a lie when the
       // repo/token was invalid (resolveGhConfig silently nulled it) or the
       // localStorage write failed — the notice now reports the EFFECTIVE state.
-      if (!s.configured && !patch.disabled) {
+      // v0.6.7 (audit 24-a P2): the QUOTA/privacy write failure (the facet sets
+      // state.lastError = 'settings NOT saved — …' while configured stays
+      // true on the surviving old override) also gets the honest branch.
+      if (String(s.lastError ?? '').startsWith('settings NOT saved')) {
+        setError(String(s.lastError));
+      } else if (!s.configured && !patch.disabled) {
         setNotice('saved — but NOT publishing yet: repo must be owner/name and a token must be present (check GitHub settings below)');
       } else if (tokIgnored) {
         setNotice('saved — token unchanged (whitespace-only input ignored; use "use baked" to drop a saved override)');
@@ -521,6 +551,13 @@ function ReviewPanel(): React.ReactElement {
     setGhForm((f) => ({ ...f, token: '' }));
     const s = await ghClientStatus();
     setGhStat(s);
+    // v0.6.7 (audit 24-a P2): a quota/privacy-mode failure leaves the token
+    // override IN PLACE (clearTokenOverride's catch) — the old notice claimed
+    // removal regardless. Report the OBSERVED record, not the intent.
+    if (s.tokenOverridden) {
+      setError('token override NOT removed — localStorage is full or blocked; free space or check browser storage settings');
+      return;
+    }
     // SR-W2 P3: be honest when there is NO baked config to fall back to
     setNotice(
       s.configured
@@ -787,6 +824,17 @@ function ReviewPanel(): React.ReactElement {
               ⚠ a token override is saved in this browser — it overrides the baked annotakit-gh.json on every deploy. If syncing fails with 401, paste a fresh PAT or click "use baked".
             </div>
           )}
+          {/* v0.6.7 (PR #33) 401 self-heal trace: a rejected saved token was
+           *  dropped automatically in favor of the baked one — one quiet line
+           *  so the drop is never silent. Gates on the SAVED record
+           *  (!tokenOverridden), not the input: keeps this hint and the amber
+           *  override warning mutually exclusive and never contradicts a
+           *  fresh unsaved paste. */}
+          {ghStat?.tokenDroppedAt && !ghStat?.tokenOverridden && !ghForm.token && (
+            <div style={{ fontSize: 10, color: theme.textMutedColor }}>
+              the previously saved token was rejected (401) — publishing with this deployment's built-in token; paste a fresh PAT to override again
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
             <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <span style={{ color: theme.textMutedColor }}>poll (s)</span>
@@ -918,7 +966,7 @@ function ReviewPanel(): React.ReactElement {
             {t.comments.length > 1 && (
               <div style={{ fontSize: 10.5, color: theme.textMutedColor, marginTop: 2 }}>+{t.comments.length - 1} replies</div>
             )}
-            <ThreadActions thread={t} busy={busy} onReply={reply} onSetStatus={setStatus} active={active} />
+            <ThreadActions thread={t} busy={busy} onReply={reply} onSetStatus={setStatus} onDelete={del} active={active} />
           </div>
         );
       })}
@@ -932,6 +980,10 @@ function ReviewPanel(): React.ReactElement {
         <MiniButton theme={theme} onClick={() => doExport('md', 'copy')}>copy md</MiniButton>
         <MiniButton theme={theme} onClick={() => doExport('json', 'copy')}>copy json</MiniButton>
         <MiniButton theme={theme} onClick={() => doExport('md', 'download')}>download md</MiniButton>
+        {/* v0.6.7 (audit 24-a P2): the 65k issue-body clip has pointed at a
+         *  "Download JSON" affordance that did not exist — now it does (and
+         *  the json download gets the right filename, not the md one). */}
+        <MiniButton theme={theme} onClick={() => doExport('json', 'download')}>download json</MiniButton>
         <span style={{ flex: 1 }} />
         <span style={{ fontSize: 10, color: theme.textMutedColor, fontFamily: theme.fontMonospace }}>
           {staticMode ? 'static build · digest generated locally from this browser\'s store' : `curl ${API_BASE}/export?format=md`}
@@ -947,8 +999,18 @@ function ThreadActions(props: {
   active: boolean;
   onReply: (t: Thread, body: string) => Promise<boolean>;
   onSetStatus: (t: Thread, status: Thread['status']) => void;
+  onDelete: (t: Thread) => Promise<boolean>;
 }): React.ReactElement {
   const [body, setBody] = useState('');
+  // F15: two-click destructive confirm — the first click arms for 3s, the
+  // second executes. Lighter than a modal (none exists in the panel) and
+  // cannot be triggered by a stray click on the reply row.
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  useEffect(() => {
+    if (!confirmingDelete) return;
+    const reset = window.setTimeout(() => setConfirmingDelete(false), 3000);
+    return () => window.clearTimeout(reset);
+  }, [confirmingDelete]);
   const theme = useTheme();
   if (!props.active) return <></>;
   return (
@@ -1011,6 +1073,22 @@ function ThreadActions(props: {
           reopen
         </button>
       )}
+      {/* v0.6.7 (F15): destructive delete — right-separated + two-click confirm.
+       *  The mirror contract: the GitHub issue gets a tombstone comment and
+       *  closes; the local thread is gone immediately. */}
+      <span style={{ flex: 1 }} />
+      <button
+        style={{ padding: '3px 9px', fontSize: 10, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: `1px solid ${confirmingDelete ? '#b91c1c' : theme.appBorderColor}`, background: 'transparent', color: confirmingDelete ? '#b91c1c' : theme.textMutedColor, display: 'inline-flex', gap: 4, alignItems: 'center' }}
+        disabled={props.busy}
+        title={confirmingDelete ? 'Click again to DELETE this thread permanently (its mirror issue closes with a tombstone)' : 'Delete this thread (two-click confirm). On GitHub the mirror issue closes with a tombstone comment — nothing is deleted remotely.'}
+        onClick={() => {
+          if (!confirmingDelete) { setConfirmingDelete(true); return; }
+          setConfirmingDelete(false);
+          void props.onDelete(props.thread);
+        }}
+      >
+        {confirmingDelete ? 'sure?' : 'delete'}
+      </button>
     </div>
   );
 }

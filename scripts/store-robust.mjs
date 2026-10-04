@@ -2,6 +2,10 @@
 /**
  * storybook-annotakit — store-robustness suite (v0.5.0 Track B).
  *
+ * RUNNER: node (NOT bun). The suites spawn subprocesses via process.execPath —
+ * under bun that spawns bun, which lacks node:sqlite DatabaseSync compat
+ * (migration/divergence/subdir cases fail). Run: node scripts/store-robust.mjs
+ *
  * Verifies the audited design (design/2026-09-05-store-robustness.md + A1-A15)
  * against REAL git repos and a LOCAL bare "remote" (url.insteadOf rewrites
  * https://github.com/testowner/testrepo.git → the bare path, so the exact

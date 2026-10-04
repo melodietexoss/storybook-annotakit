@@ -14,7 +14,12 @@ export default function StatusBadge({ status }: { status: OrderStatus }) {
     <span
       className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${VARIANTS[status]}`}
     >
-      <span className="h-1.5 w-1.5 rounded-full bg-current opacity-70" aria-hidden="true" />
+      {/* review feedback (#24/#25): the pending dot pulses — an order awaiting
+       *  fulfillment reads as "in flight", not a static state */}
+      <span
+        className={`h-1.5 w-1.5 rounded-full bg-current opacity-70 ${status === 'pending' ? 'animate-pulse' : ''}`}
+        aria-hidden="true"
+      />
       {label}
     </span>
   )

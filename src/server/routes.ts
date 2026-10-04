@@ -35,7 +35,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.6';
+const VERSION = '0.6.7';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -604,7 +604,7 @@ async function handleApi(
         ['POST', `${API_BASE}/threads/<id>/comments`, 'reply → 201 with the FULL updated thread doc (not the new comment); key comments by thread id, never by your own comment id (ids are re-hashed)'],
         ['DELETE', `${API_BASE}/threads/<id>`, 'delete (path form; legacy DELETE /threads?id=<id> equivalent)'],
         ['GET|PUT', `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence — GET → JSON, GET ?format=html → human view; PUT replaces (idempotent, 96KB cap)'],
-        ['GET', `${API_BASE}/export?format=md|json`, 'digest — md clips comment bodies at 200 chars for display; json keeps FULL bodies. NOTE the json envelope is {generatedAt, stories:[...]} (story-grouped), NOT the {threads:[...]} shape of GET /threads'],
+        ['GET', `${API_BASE}/export?format=md|json`, 'digest — json keeps FULL bodies (envelope {generatedAt, stories:[...]}, story-grouped, NOT the {threads:[...]} shape of GET /threads). md default is the LEAN digest (200-char clips for token economy); add ?mode=full for VERBATIM bodies (the panel export uses this — a hand-off artifact must never shorten a note)'],
         ['GET|POST', `${API_BASE}/sync`, 'mirror status / force reconcile — POST also forces one git store cycle first (v0.6.1)'],
         ['POST', `${API_BASE}/gh/reload`, 're-read .env and apply token changes WITHOUT a restart (v0.6.6) — response lists applied/requiresRestart; the PAT is never echoed'],
       ],
@@ -986,9 +986,17 @@ async function handleApi(
       sendJson(res, 200, bundle);
       return true;
     }
-    // local export → local footer (PATCH guidance for Path-B agents); GitHub
-    // issue bodies (ghsync.issueBody) pass mirror:true for the GH-native footer
-    const md = renderDigest(stories, { origin, snapshotIds });
+    // v0.6.7 (issue #22 parity): ?mode=full renders VERBATIM comment bodies —
+    // the panel's human-triggered copy/download uses it (a hand-off artifact
+    // must never shorten a note). Default stays lean for token-economical
+    // agent digests; unknown mode values are 400 (never silently ignored).
+    // Case-insensitive like `format` (audit 24-b P3 consistency).
+    const mode = url.searchParams.get('mode')?.toLowerCase() ?? null;
+    if (mode !== null && mode !== 'lean' && mode !== 'full') {
+      throw Object.assign(new Error(`unknown mode ${JSON.stringify(mode)} — use ?mode=lean (default; clipped digest) or ?mode=full (verbatim bodies)`), { status: 400 });
+    }
+    const fullText = mode === 'full';
+    const md = renderDigest(stories, { origin, snapshotIds, fullText });
     res.writeHead(200, {
       'Content-Type': 'text/markdown; charset=utf-8',
       'Cache-Control': 'no-store',
@@ -1047,10 +1055,19 @@ async function handleApi(
 
   /* github (legacy digest publish → now a sync alias) ----------------------- */
   if (p === `${API_BASE}/gh` && method === 'POST') {
+    // v0.6.7 (audit 24-b P2): the alias used to call syncAll() DIRECTLY,
+    // skipping the A6 boot-restore settle AND the forced git cycle that
+    // POST /sync runs — an agent POSTing during boot-restore could mint a
+    // duplicate issue for a not-yet-restored mapping. Identical prologue to
+    // /sync now (including the response's git fields).
+    await rt.sync.restore().catch(() => undefined);
+    const gitOk = await rt.sync.syncNow('api').catch(() => false);
     const summary = await rt.ghsync.syncAll();
     sendJson(res, 200, {
       ...summary,
-      note: 'digest issues are gone: each thread mirrors to exactly ONE issue now. POST /annotakit/api/sync is the canonical force-reconcile; this alias behaves identically.',
+      gitSync: rt.sync.gitHealth(),
+      gitSyncForced: gitOk,
+      note: 'digest issues are gone: each thread mirrors to exactly ONE issue now. POST /annotakit/api/sync is the canonical force-reconcile; this alias behaves identically (restore settle + forced git cycle + mirror reconcile).',
     });
     return true;
   }
@@ -1066,6 +1083,9 @@ const KNOWN_API_ROUTES: [RegExp, string][] = [
   [new RegExp(`^${API_BASE}/threads$`), 'GET, POST, DELETE, OPTIONS'],
   [new RegExp(`^${API_BASE}/threads/[^/]+$`), 'GET, PATCH, DELETE, OPTIONS'],
   [new RegExp(`^${API_BASE}/threads/[^/]+/comments$`), 'POST, OPTIONS'],
+  // v0.6.7 (audit 24-b P3): the snapshot endpoint was missing — unsupported
+  // methods on a documented route 404'd as "unknown route" instead of 405+Allow
+  [new RegExp(`^${API_BASE}/threads/[^/]+/snapshot$`), 'GET, PUT, OPTIONS'],
   [new RegExp(`^${API_BASE}/export$`), 'GET, OPTIONS'],
   [new RegExp(`^${API_BASE}/sync$`), 'GET, POST, OPTIONS'],
   [new RegExp(`^${API_BASE}/gh$`), 'POST, OPTIONS'],
@@ -1103,7 +1123,13 @@ export function createMiddleware(configDir: string): (req: IncomingMessage, res:
     }
     const origin = `http://${req.headers.host ?? 'localhost:6006'}`;
     const rt = runtime;
-    if (rt) rt.origin = origin; // engine uses the freshest origin for links
+    // v0.6.7 (audit 24-b P2): the origin assignment used to run BEFORE the
+    // access gate — a network peer that gets 403'd had ALREADY replaced the
+    // runtime origin, poisoning every URL the engine stamps into GitHub
+    // issue bodies and digests. Only a request that PASSES the gate may
+    // update it now (the landing/OPTIONS early-returns below never reach the
+    // gate, so they never update it either — bootstrap's port-derived
+    // default covers the pre-first-authorized-request case).
     let url: URL;
     try {
       url = new URL(urlStr, origin);
@@ -1140,6 +1166,8 @@ export function createMiddleware(configDir: string): (req: IncomingMessage, res:
       }
       // access gate (dogfood #7): loopback free; network peers need a key
       if (!enforceApiAccess(req, res)) return;
+      // (see the origin comment above: only authorized requests update it)
+      if (rt) rt.origin = origin; // engine uses the freshest origin for links
       handleApi(req, res, url, configDir, origin).then(
         (handled) => {
           if (!handled) resolveNotHandled(res, url.pathname);
