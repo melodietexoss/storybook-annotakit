@@ -295,7 +295,9 @@ export interface AnchorResolution {
 }
 
 function attrsMatch(cand: HTMLElement, fp: ElementFingerprint): boolean {
-  if (fp.attrs.length === 0) return false;
+  // v0.6.7 (E2E P0): legacy fingerprints carry NO attrs key — guard (this
+  // crash took down every fresh visitor's Status Badge story)
+  if (!fp.attrs?.length) return false;
   return fp.attrs.some(({ name, value }) => cand.getAttribute(name) === value);
 }
 
@@ -368,7 +370,8 @@ function findByTextQuote(ann: AnchorLike, root: HTMLElement): HTMLElement | null
 
 function findByFingerprint(ann: AnchorLike, root: HTMLElement): HTMLElement | null {
   const fp = ann.fingerprint;
-  if (!fp || fp.attrs.length === 0) return null;
+  // v0.6.7 (E2E P0): legacy fingerprints carry NO attrs key — guard
+  if (!fp?.attrs?.length) return null;
   for (const { name, value } of fp.attrs) {
     if (name === 'name' || name === 'type' || name === 'href' || name === 'src') continue;
     try {

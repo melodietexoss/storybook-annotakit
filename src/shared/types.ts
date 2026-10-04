@@ -123,7 +123,11 @@ export interface AttrFingerprint {
 
 export interface ElementFingerprint {
   tag: string;
-  attrs: AttrFingerprint[];
+  /** v0.6.7 (E2E P0): OPTIONAL at runtime — legacy/seeded threads carry
+   *  fingerprints without attrs (4 baked demo threads crashed every fresh
+   *  visitor's story until the consumers learned to guard). Capture always
+   *  writes it; consumption must not assume it. */
+  attrs?: AttrFingerprint[];
   neighborText?: string;
 }
 

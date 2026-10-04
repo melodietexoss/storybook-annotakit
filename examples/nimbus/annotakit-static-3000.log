@@ -1,0 +1,252 @@
+127.0.0.1 - - [04/Oct/2026 10:08:42] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:08:46] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:08:46] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:08:46] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:28] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:28] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:28] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:28] "GET /sb-manager/runtime.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:28] "GET /sb-manager/globals-runtime.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /iframe.html?id=*&viewMode=story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /sb-common-assets/nunito-sans-regular.woff2 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /sb-common-assets/nunito-sans-bold.woff2 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /index.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /favicon.svg HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /assets/iframe-BQ-j3bju.css HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /vite-inject-mocker-entry.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /assets/iframe-BbL6Qi6Z.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:29] "GET /assets/preload-helper-PPVm8Dsz.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /assets/Onboarding-CLaZNkVP.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /assets/leaf.stories-B0gpJRJm.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /assets/react-18-D-GctJ9x.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /assets/pages.stories-D4QIGoY_.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /annotakit/api/threads?storyId=nimbus-components--kpi-card-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:30] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:42] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:42] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:42] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:42] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:42] "GET /sb-manager/globals-runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /index.json HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /assets/iframe-BQ-j3bju.css HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /assets/preload-helper-PPVm8Dsz.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /assets/iframe-BbL6Qi6Z.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /vite-inject-mocker-entry.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /assets/leaf.stories-B0gpJRJm.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /assets/Onboarding-CLaZNkVP.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /assets/react-18-D-GctJ9x.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /assets/pages.stories-D4QIGoY_.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /annotakit/api/threads?storyId=nimbus-components--status-badge-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:43] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:55] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:55] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:55] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:55] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:55] "GET /sb-manager/globals-runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /index.json HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /favicon.svg HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /vite-inject-mocker-entry.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /assets/iframe-BQ-j3bju.css HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /assets/iframe-BbL6Qi6Z.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /assets/preload-helper-PPVm8Dsz.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /assets/Onboarding-CLaZNkVP.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /assets/leaf.stories-B0gpJRJm.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /assets/react-18-D-GctJ9x.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /assets/pages.stories-D4QIGoY_.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /annotakit/api/threads?storyId=nimbus-components--status-badge-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:09:56] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /?path=/story/nimbus-components--kpi-card-story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /sb-manager/globals-runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /index.json HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:10] "GET /iframe.html?id=nimbus-components--kpi-card-story&viewMode=story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /vite-inject-mocker-entry.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /assets/iframe-BbL6Qi6Z.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /assets/preload-helper-PPVm8Dsz.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /assets/iframe-BQ-j3bju.css HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /assets/Onboarding-CLaZNkVP.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /assets/leaf.stories-B0gpJRJm.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /assets/pages.stories-D4QIGoY_.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /assets/react-18-D-GctJ9x.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /annotakit/api/threads?storyId=nimbus-components--kpi-card-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:11] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /sb-manager/globals-runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /index.json HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:33] "GET /vite-inject-mocker-entry.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /assets/preload-helper-PPVm8Dsz.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /assets/iframe-BQ-j3bju.css HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /assets/iframe-BbL6Qi6Z.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /assets/leaf.stories-B0gpJRJm.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /assets/Onboarding-CLaZNkVP.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /assets/react-18-D-GctJ9x.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /assets/pages.stories-D4QIGoY_.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /annotakit/api/threads?storyId=nimbus-components--status-badge-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:34] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:41] "GET /assets/react-18-D-GctJ9x.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /vite-inject-mocker-entry.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /assets/preload-helper-PPVm8Dsz.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /assets/iframe-BQ-j3bju.css HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /assets/iframe-BbL6Qi6Z.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /index.json HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /favicon.ico HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /assets/Onboarding-CLaZNkVP.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:47] "GET /assets/leaf.stories-B0gpJRJm.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:48] "GET /assets/react-18-D-GctJ9x.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:48] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:48] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:48] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:48] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:48] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:48] "GET /annotakit/api/threads?storyId=nimbus-components--status-badge-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:51] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:10:52] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:52] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:52] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:52] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:10:52] "GET /annotakit/api/threads?storyId=nimbus-components--status-badge-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:10:52] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:59] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:10:59] "GET /index.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:11:02] "GET /assets/iframe-BbL6Qi6Z.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:11:10] "GET /index.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:11:19] "GET /assets/leaf.stories-B0gpJRJm.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:11:24] "GET /assets/Onboarding-CLaZNkVP.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /vite-inject-mocker-entry.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /assets/preload-helper-PPVm8Dsz.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /assets/iframe-BQ-j3bju.css HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /assets/iframe-BbL6Qi6Z.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /index.json HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /assets/Onboarding-CLaZNkVP.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /assets/leaf.stories-B0gpJRJm.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /assets/react-18-D-GctJ9x.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /annotakit/api/threads?storyId=nimbus-components--status-badge-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:14:42] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:15:03] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:15:03] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:15:03] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:15:03] "GET /sb-manager/runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:15:03] "GET /sb-manager/globals-runtime.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /assets/pages.stories-D4QIGoY_.js HTTP/1.1" 304 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /annotakit/api/threads?storyId=nimbus-components--status-badge-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:15:04] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:29] "GET /index.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:34] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:35] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:35] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:35] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:35] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:16:35] "GET /favicon.ico?path=/story/nimbus-components--status-badge-story HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:16:35] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:35] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:16:35] "GET /favicon.ico HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:16:36] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:45] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:16:45] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:17:42] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:19] "GET /?path=/story/nimbus-components--status-badge-story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:19] "GET /sb-manager/runtime.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:19] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:19] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:20] "GET /sb-manager/globals-runtime.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:22] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:23] "GET /sb-manager/runtime.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:23] "GET /sb-addons/storybook-core-server-presets-0/common-manager-bundle.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:23] "GET /sb-addons/1/manager-bundle.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:23] "GET /sb-manager/globals-runtime.js HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:26] "GET /iframe.html?id=nimbus-components--status-badge-story&viewMode=story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:26] code 404, message File not found
+127.0.0.1 - - [04/Oct/2026 10:18:26] "GET /annotakit/api/health HTTP/1.1" 404 -
+127.0.0.1 - - [04/Oct/2026 10:18:26] "GET /index.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:27] "GET /annotakit-threads.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:28] "GET /annotakit-gh.json HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:29] "GET /iframe.html?id=*&viewMode=story HTTP/1.1" 200 -
+127.0.0.1 - - [04/Oct/2026 10:18:29] "GET /index.json HTTP/1.1" 200 -
+Traceback (most recent call last):
+  File "/home/z/work/annotakit/scripts/serve-static.py", line 70, in <module>
+    with http.server.ThreadingHTTPServer(('', int(PORT)), lambda *a, **kw: http.server.SimpleHTTPRequestHandler(*a, directory=os.path.abspath(SERVE_DIR), **kw)) as srv:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/z/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib/python3.12/socketserver.py", line 457, in __init__
+    self.server_bind()
+  File "/home/z/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib/python3.12/http/server.py", line 140, in server_bind
+    socketserver.TCPServer.server_bind(self)
+  File "/home/z/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib/python3.12/socketserver.py", line 478, in server_bind
+    self.socket.bind(self.server_address)
+OSError: [Errno 98] Address already in use
+127.0.0.1 - - [04/Oct/2026 10:21:43] "GET / HTTP/1.1" 200 -

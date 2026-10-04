@@ -513,7 +513,7 @@ function captureAnchor(el, root) {
   };
 }
 function attrsMatch(cand, fp) {
-  if (fp.attrs.length === 0) return false;
+  if (!fp.attrs?.length) return false;
   return fp.attrs.some(({ name, value }) => cand.getAttribute(name) === value);
 }
 function scoreCandidate(cand, ann, root) {
@@ -576,7 +576,7 @@ function findByTextQuote(ann, root) {
 }
 function findByFingerprint(ann, root) {
   const fp = ann.fingerprint;
-  if (!fp || fp.attrs.length === 0) return null;
+  if (!fp?.attrs?.length) return null;
   for (const { name, value } of fp.attrs) {
     if (name === "name" || name === "type" || name === "href" || name === "src") continue;
     try {
