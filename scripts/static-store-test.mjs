@@ -199,6 +199,92 @@ resetStaticStoreForTests();
   ok('merge: fresher fixed does NOT clobber resolved', m3?.status === 'resolved', `status=${m3?.status}`);
 }
 
+/* 6d — v0.6.9 (DD-42): event-proven downgrades survive the merge. The stale
+ * cases stay protected (6c above — no event, rank wins); a deliberate
+ * reopen/reject carries the server-stamped reopenedAt and MUST win against
+ * a stale higher-ranked copy, or the disagreement loop dies at the first
+ * sync cycle (found live by the kit's D14 drift row on a git-synced store). */
+resetStaticStoreForTests();
+{
+  const s0 = await getStaticStore();
+  const c1 = await s0.create({ id: 'th_dd42a', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_dd1', author: 'a', body: 'dd42', createdAt: new Date().toISOString() }], story: { storyId: 's1', title: 'T', name: 'n' } });
+  await s0.patch({ ...c1, status: 'resolved' });
+  const c2 = await s0.create({ id: 'th_dd42b', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_dd2', author: 'a', body: 'dd42b', createdAt: new Date().toISOString() }], story: { storyId: 's1', title: 'T', name: 'n' } });
+  await s0.patch({ ...c2, status: 'resolved' });
+}
+resetStaticStoreForTests();
+{
+  const laterTs = new Date(Date.now() + 60_000).toISOString();
+  seedData.threads = [
+    // the other machine's deliberate reopen: open + the event
+    thread('th_dd42a', { number: 20, updatedAt: laterTs, status: 'open', reopenedAt: '2026-10-10T00:00:00.000Z' }),
+    // the agent's re-fix after that reopen: fixed + the event (the D14 case)
+    thread('th_dd42b', { number: 21, updatedAt: laterTs, status: 'fixed', reopenedAt: '2026-10-10T00:00:00.000Z' }),
+  ];
+  const s = await getStaticStore();
+  const a = s.list().find((t) => t.id === 'th_dd42a');
+  ok('merge: event-proven reopen beats stale resolved', a?.status === 'open' && !a?.resolvedAt, `status=${a?.status}`);
+  const b = s.list().find((t) => t.id === 'th_dd42b');
+  ok('merge: event-proven re-fix beats stale resolved (the disagreement loop survives sync)', b?.status === 'fixed' && !b?.resolvedAt, `status=${b?.status}`);
+  // stamp parity through the client patch door
+  const t = await s.create({ id: 'th_dd42c', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_dd3', author: 'a', body: 'c', createdAt: new Date().toISOString() }], story: { storyId: 's1', title: 'T', name: 'n' } });
+  const fx = await s.patch({ ...t, status: 'fixed' });
+  ok('static patch: first-pass fix-mark stamps NO reopenedAt', fx.status === 'fixed' && !fx.reopenedAt);
+  const rj = await s.patch({ ...fx, status: 'open' });
+  ok('static patch: reject (fixed→open) stamps reopenedAt', rj.status === 'open' && typeof rj.reopenedAt === 'string');
+  const rf = await s.patch({ ...rj, status: 'fixed' });
+  ok('static patch: re-fix keeps the event (merge proof persists)', rf.status === 'fixed' && typeof rf.reopenedAt === 'string');
+  const cf = await s.patch({ ...rf, status: 'resolved' });
+  ok('static patch: confirm supersedes the event', cf.status === 'resolved' && !cf.reopenedAt && typeof cf.resolvedAt === 'string');
+}
+/* 6e — v0.6.9 adversarial fold (review F1/F2/F3): the event ALONE must not
+ * win — recency is the second proof. The confirm-after-re-fix livelock: a
+ * fresh confirm (newer, event cleared) vs the older fixed+event copy → the
+ * confirm MUST survive, or the loop never converges. Round-2 reject: both
+ * sides carry events — the newer act wins. */
+resetStaticStoreForTests();
+{
+  // store side: resolved → reopened → re-fixed (carries the event)
+  const s0 = await getStaticStore();
+  const c1 = await s0.create({ id: 'th_dd42x', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_dx1', author: 'a', body: 'x', createdAt: new Date().toISOString() }], story: { storyId: 's1', title: 'T', name: 'n' } });
+  await s0.patch({ ...c1, status: 'resolved' });
+  const reopened = await s0.patch({ ...s0.list().find((t) => t.id === 'th_dd42x'), status: 'open' });
+  await s0.patch({ ...reopened, status: 'fixed' });
+  // (the store rows' updatedAt is "now" via the patches; the seeds below pin
+  // determinism with a relative-future tAfter — the ACTS land after)
+  const c2 = await s0.create({ id: 'th_dd42y', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_dy1', author: 'a', body: 'y', createdAt: new Date().toISOString() }], story: { storyId: 's1', title: 'T', name: 'n' } });
+  await s0.patch({ ...c2, status: 'resolved' });
+  await s0.patch({ ...s0.list().find((t) => t.id === 'th_dd42y'), status: 'open' });
+  await s0.patch({ ...s0.list().find((t) => t.id === 'th_dd42y'), status: 'fixed' });
+}
+resetStaticStoreForTests();
+{
+  const tAfter = new Date(Date.now() + 120_000).toISOString(); // the ACTS after the store's rows
+  seedData.threads = [
+    // F1 livelock: the reviewer's fresh confirm — newer, event cleared
+    thread('th_dd42x', { number: 30, updatedAt: tAfter, status: 'resolved', resolvedAt: tAfter }),
+    // F2 round-2 reject: open + a NEWER event (both sides have events)
+    thread('th_dd42y', { number: 31, updatedAt: tAfter, status: 'open', reopenedAt: tAfter }),
+  ];
+  const s = await getStaticStore();
+  const x = s.list().find((t) => t.id === 'th_dd42x');
+  ok('merge: fresh confirm beats the older fixed+event copy (no livelock)', x?.status === 'resolved' && !x?.reopenedAt, `status=${x?.status} event=${x?.reopenedAt}`);
+  const y = s.list().find((t) => t.id === 'th_dd42y');
+  ok('merge: round-2 reject (newer event) beats the older fixed+event copy', y?.status === 'open' && !y?.resolvedAt, `status=${y?.status}`);
+}
+/* 6f — F3 forgery/drop through a full-doc patch: the event is store-owned */
+resetStaticStoreForTests();
+{
+  const s = await getStaticStore();
+  const t = await s.create({ id: 'th_dd42z', storyId: 's1', target: thread('x').target, comments: [{ id: 'c_dz1', author: 'a', body: 'z', createdAt: new Date().toISOString() }], story: { storyId: 's1', title: 'T', name: 'n' } });
+  await s.patch({ ...t, status: 'resolved' });
+  const rp = await s.patch({ ...s.list().find((q) => q.id === 'th_dd42z'), status: 'open' }); // event stamped
+  const forged = await s.patch({ ...rp, reopenedAt: '1999-01-01T00:00:00.000Z' }); // same-status full-doc, forged event
+  ok('forgery: same-status full-doc patch cannot forge the event', typeof forged.reopenedAt === 'string' && forged.reopenedAt !== '1999-01-01T00:00:00.000Z', `reopenedAt=${forged.reopenedAt}`);
+  const dropped = await s.patch({ ...{ ...forged, reopenedAt: undefined } }); // full-doc WITHOUT the field
+  ok('forgery: a full-doc patch missing the field cannot DROP the event', typeof dropped.reopenedAt === 'string', `reopenedAt=${dropped.reopenedAt}`);
+}
+
 /* 7 — scope isolation: another deployment dir gets its own storage */
 pageUrl = 'https://site.test/other/index.html';
 resetStaticStoreForTests();

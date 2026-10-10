@@ -6,7 +6,7 @@ import {
   mirrorStateOf,
   renderThreadBlock,
   staticScope
-} from "./chunk-UERRFJPI.mjs";
+} from "./chunk-X5NLCX4D.mjs";
 
 // src/shared/legacyMirror.ts
 function fmtDate(iso) {
@@ -888,8 +888,10 @@ async function pullOnce(base) {
       } else if (statusChange === "reopen" && next.status === "resolved") {
         next.status = "open";
         delete next.resolvedAt;
+        next.reopenedAt = pullStartedAt;
         next.comments = [...next.comments, systemComment(`gh-reopen-${mir.issue}`, "github", "reopened on GitHub")];
       }
+      if (next.status === "resolved") delete next.reopenedAt;
       const knownNow = new Set(next.comments.map((c) => c.ghId).filter((x) => Boolean(x)));
       const imported = [];
       for (const c of fresh) {

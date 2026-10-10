@@ -283,6 +283,11 @@ export function getStaticStore(): Promise<StaticStore> {
         // resolvedAt on transitions, never demote a confirmation to fixed
         const prev = threads[idx];
         const patched = { ...next } as Thread;
+        // v0.6.9 (DD-42, review F3): reopenedAt is store-owned — normalize
+        // BEFORE any status logic so a full-doc patch can neither FORGE the
+        // merge-proof event nor DROP it (the spread below would carry either
+        // through). The transition logic inside re-stamps/clears per act.
+        patched.reopenedAt = prev.reopenedAt;
         if (patched.status !== undefined) {
           const norm = String(patched.status).toLowerCase() as Thread['status'];
           if (norm !== 'open' && norm !== 'fixed' && norm !== 'resolved') {
@@ -294,6 +299,10 @@ export function getStaticStore(): Promise<StaticStore> {
           patched.status = norm;
           if (prev.status !== 'resolved' && norm === 'resolved' && !patched.resolvedAt) patched.resolvedAt = nowIso();
           if (prev.status === 'resolved' && norm !== 'resolved') delete patched.resolvedAt;
+          // v0.6.9 (DD-42) parity with the server PATCH door: stamp the
+          // reopen event on downward transitions, supersede it on confirm.
+          if (prev.status !== 'open' && norm === 'open') patched.reopenedAt = nowIso();
+          if (norm === 'resolved') delete patched.reopenedAt;
         }
         const merged: Thread = { ...prev, ...patched, updatedAt: nowIso() };
         // Hardening C09 (H-H-02/H-E-04): the server's PATCH door unions
@@ -328,6 +337,12 @@ export function getStaticStore(): Promise<StaticStore> {
         // not mask it)
         if (prev.status === 'resolved' && merged.status !== 'resolved') {
           delete merged.resolvedAt;
+        }
+        // v0.6.9 (DD-42) same spread-mask class: a confirmation must
+        // supersede the reopen event — prev's reopenedAt would survive the
+        // delete-on-patched above
+        if (merged.status === 'resolved') {
+          delete merged.reopenedAt;
         }
         threads[idx] = merged;
         persist();

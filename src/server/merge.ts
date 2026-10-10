@@ -14,9 +14,12 @@
  *   - per thread: comments union by comment id (body of higher row wins on
  *     same id), status = monotonic precedence open < fixed < resolved
  *     (v0.6.3 — extends "resolved-wins": a stale 'open' can't clobber 'fixed',
- *     a stale 'fixed' can't clobber 'resolved'; documented losses: a lost
- *     reopen AND a machine-A 'fixed' beating machine-B's newer explicit
- *     reject-to-open — accepted, same class), gh mapping = either side's
+ *     a stale 'fixed' can't clobber 'resolved') EXCEPT (v0.6.9, DD-42) a
+ *     DOWNGRADE is honored when the lower side carries the reopen event
+ *     (reopenedAt) and the higher side does not — the deliberate
+ *     reject/reopen survives sync; documented losses narrowed to: a
+ *     two-machine reopen race within one sync window (both-with → rank wins,
+ *     self-correcting), gh mapping = either side's
  *     (mapping loss = duplicate issues), every other scalar from the row with
  *     higher updatedAt
  *   - tombstone sets: union (a delete observed anywhere is final)
@@ -82,13 +85,32 @@ function mergeThread(local: Thread | undefined, remote: Thread | undefined): Thr
   const newer = later(local, remote);
   const older = newer === local ? remote : local;
   const merged = cloneThread(newer);
-  // status: monotonic precedence open < fixed < resolved (design amendment 8 —
-  // recency-resolved status was considered and rejected: loses agent fixes
-  // more often than it saves)
-  merged.status =
-    STATUS_RANK[local.status] >= STATUS_RANK[remote.status] ? local.status : remote.status;
-  if (merged.status === 'resolved' && !merged.resolvedAt) {
-    merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
+  // v0.6.9 (DD-42, adversarially folded): status merges by monotonic rank
+  // (amendment 8) EXCEPT a downgrade is honored when the LOWER side carries
+  // the reopen EVENT (reopenedAt — a server-stamped, guarded downward
+  // transition) AND is the NEWER row (later()). Two proofs, both required:
+  // the event is qualitative (a deliberate reopen/reject occurred — a stale
+  // replica without one cannot clobber, 6c holds), recency is the ordering
+  // (it happened after the other side's state was written). Recency alone
+  // was rejected (clock-skew clobber); the event alone LIVELOCKS the
+  // confirm-after-re-fix (the event persists on the fixed row by design, so
+  // a fresh confirm — newer, event cleared — would be reverted by the older
+  // fixed+event copy forever) and eats the round-2 reject (both sides carry
+  // events). Residual: a two-machine transition race from a common base
+  // (equal updatedAt) resolves by rank — self-correcting on the next act.
+  // A resolved row may graft an event via equal-rank merge (P2, benign —
+  // it only makes resolved stickier; resolved is never the lo side).
+  const rankL = STATUS_RANK[local.status];
+  const rankR = STATUS_RANK[remote.status];
+  const hi = rankL >= rankR ? local : remote;
+  const lo = rankL >= rankR ? remote : local;
+  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo;
+  merged.status = downgradeProven ? lo.status : hi.status;
+  merged.reopenedAt = (downgradeProven ? lo : hi).reopenedAt; // the winning side's own event — never cross-contaminated
+  if (merged.status === 'resolved') {
+    if (!merged.resolvedAt) merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
+  } else {
+    delete merged.resolvedAt; // a downgrade clears the confirmation stamp (wire parity)
   }
   // gh mapping: either side's — a mapping lost by whole-row-wins would make
   // the mirror engine mint a DUPLICATE issue on the next sync

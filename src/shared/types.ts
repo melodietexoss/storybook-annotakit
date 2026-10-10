@@ -222,6 +222,13 @@ export interface Thread {
   createdAt: string;
   updatedAt: string;
   resolvedAt?: string;
+  /** v0.6.9 (DD-42): server-stamped on every DOWNWARD transition
+   * (resolved→open, fixed→open — the reviewer's reject/reopen and the
+   * helper's reopen). Cleared again on the next →resolved. This is the
+   * EVENT PROOF the store merge needs to honor a deliberate reopen over a
+   * stale higher-ranked copy: a stale replica cannot synthesize it (the
+   * transition itself is guarded), so the disagreement loop survives sync. */
+  reopenedAt?: string;
   /** Author of the first comment (thread owner). */
   author: string;
   story: StoryRef;

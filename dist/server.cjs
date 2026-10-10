@@ -1599,8 +1599,10 @@ reopened in Storybook \u2014 thread #${t.number}.`;
           } else if (statusChange === "reopen" && cur.status === "resolved") {
             cur.status = "open";
             delete cur.resolvedAt;
+            cur.reopenedAt = nowIso();
             systemComment(cur, `gh-reopen-${mir.issue}`, "github", "reopened on GitHub");
           }
+          if (cur.status === "resolved") delete cur.reopenedAt;
           const knownNow = new Set(cur.comments.map((c) => c.ghId).filter((x) => Boolean(x)));
           for (const c of fresh) {
             if (knownNow.has(String(c.id))) continue;
@@ -1885,9 +1887,17 @@ function mergeThread(local, remote) {
   const newer = later(local, remote);
   const older = newer === local ? remote : local;
   const merged = cloneThread(newer);
-  merged.status = STATUS_RANK[local.status] >= STATUS_RANK[remote.status] ? local.status : remote.status;
-  if (merged.status === "resolved" && !merged.resolvedAt) {
-    merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
+  const rankL = STATUS_RANK[local.status];
+  const rankR = STATUS_RANK[remote.status];
+  const hi = rankL >= rankR ? local : remote;
+  const lo = rankL >= rankR ? remote : local;
+  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo;
+  merged.status = downgradeProven ? lo.status : hi.status;
+  merged.reopenedAt = (downgradeProven ? lo : hi).reopenedAt;
+  if (merged.status === "resolved") {
+    if (!merged.resolvedAt) merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
+  } else {
+    delete merged.resolvedAt;
   }
   if (!merged.gh?.issue) {
     const gh = local.gh?.issue ? local.gh : remote.gh?.issue ? remote.gh : null;
@@ -2547,7 +2557,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.8";
+var VERSION = "0.6.9";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -3110,6 +3120,13 @@ async function handleApi(req, res, url, configDir, origin) {
       }
       if (prev.status === "resolved" && full.status !== "resolved") {
         delete full.resolvedAt;
+      }
+      full.reopenedAt = prev.reopenedAt;
+      if (prev.status !== "open" && full.status === "open") {
+        full.reopenedAt = nowIso();
+      }
+      if (full.status === "resolved") {
+        delete full.reopenedAt;
       }
       if (prev.gh) full.gh = prev.gh;
       else delete full.gh;

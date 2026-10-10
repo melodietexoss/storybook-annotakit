@@ -329,11 +329,14 @@ async function main() {
   const guardFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' });
   check('resolved → fixed is a 400 (demotion guard)', guardFixed.status === 400 && /resolved \(reviewer-confirmed\)/.test(String(guardFixed.json?.error)), `status=${guardFixed.status}`);
   const rejectPath = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' });
-  check('resolved → open reopen clears resolvedAt', rejectPath.status === 200 && rejectPath.json?.status === 'open' && !rejectPath.json?.resolvedAt, `status=${rejectPath.status}`);
+  check('resolved → open reopen clears resolvedAt, stamps reopenedAt (DD-42 event proof)', rejectPath.status === 200 && rejectPath.json?.status === 'open' && !rejectPath.json?.resolvedAt && typeof rejectPath.json?.reopenedAt === 'string', `status=${rejectPath.status} reopenedAt=${typeof rejectPath.json?.reopenedAt}`);
   const fixedAgain = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' });
-  check('open → fixed again (re-addressed) works', fixedAgain.status === 200 && fixedAgain.json?.status === 'fixed', `status=${fixedAgain.status}`);
+  check('open → fixed again (re-addressed) works; the reopen event PERSISTS on the fixed row (the merge proof)', fixedAgain.status === 200 && fixedAgain.json?.status === 'fixed' && typeof fixedAgain.json?.reopenedAt === 'string', `status=${fixedAgain.status} reopenedAt=${typeof fixedAgain.json?.reopenedAt}`);
   const rejectFromFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' });
-  check('fixed → open (reviewer reject) works', rejectFromFixed.status === 200 && rejectFromFixed.json?.status === 'open', `status=${rejectFromFixed.status}`);
+  check('fixed → open (reviewer reject) works, re-stamps the event', rejectFromFixed.status === 200 && rejectFromFixed.json?.status === 'open' && typeof rejectFromFixed.json?.reopenedAt === 'string', `status=${rejectFromFixed.status}`);
+  const reconfirm = await j('PATCH', `${API}/threads/${fixId}`, { status: 'resolved' });
+  check('re-confirm supersedes the event (reopenedAt cleared, resolvedAt stamped)', reconfirm.status === 200 && reconfirm.json?.status === 'resolved' && typeof reconfirm.json?.resolvedAt === 'string' && !reconfirm.json?.reopenedAt, `status=${reconfirm.status}`);
+  const backToFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' }).then(() => j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' }));
   // ?status=fixed filter + three-way export counts + digest rendering
   const fixedFilterList = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' }).then(() => j('GET', `${API}/threads?storyId=${encodeURIComponent(storyId)}&status=fixed`));
   check('?status=fixed filter returns only fixed threads', Array.isArray(fixedFilterList.json?.threads) && fixedFilterList.json.threads.every((t) => t.status === 'fixed') && fixedFilterList.json.threads.some((t) => t.id === fixId), JSON.stringify(fixedFilterList.json?.threads?.map((t) => t.status) ?? null));

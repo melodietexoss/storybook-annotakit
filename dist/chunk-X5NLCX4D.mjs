@@ -36,9 +36,17 @@ function mergeThread(local, remote) {
   const newer = later(local, remote);
   const older = newer === local ? remote : local;
   const merged = cloneThread(newer);
-  merged.status = STATUS_RANK[local.status] >= STATUS_RANK[remote.status] ? local.status : remote.status;
-  if (merged.status === "resolved" && !merged.resolvedAt) {
-    merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
+  const rankL = STATUS_RANK[local.status];
+  const rankR = STATUS_RANK[remote.status];
+  const hi = rankL >= rankR ? local : remote;
+  const lo = rankL >= rankR ? remote : local;
+  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo;
+  merged.status = downgradeProven ? lo.status : hi.status;
+  merged.reopenedAt = (downgradeProven ? lo : hi).reopenedAt;
+  if (merged.status === "resolved") {
+    if (!merged.resolvedAt) merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
+  } else {
+    delete merged.resolvedAt;
   }
   if (!merged.gh?.issue) {
     const gh = local.gh?.issue ? local.gh : remote.gh?.issue ? remote.gh : null;
@@ -263,6 +271,7 @@ function getStaticStore() {
         if (idx === -1) throw new Error(`annotakit(static): no thread ${next.id}`);
         const prev = threads[idx];
         const patched = { ...next };
+        patched.reopenedAt = prev.reopenedAt;
         if (patched.status !== void 0) {
           const norm = String(patched.status).toLowerCase();
           if (norm !== "open" && norm !== "fixed" && norm !== "resolved") {
@@ -274,6 +283,8 @@ function getStaticStore() {
           patched.status = norm;
           if (prev.status !== "resolved" && norm === "resolved" && !patched.resolvedAt) patched.resolvedAt = nowIso();
           if (prev.status === "resolved" && norm !== "resolved") delete patched.resolvedAt;
+          if (prev.status !== "open" && norm === "open") patched.reopenedAt = nowIso();
+          if (norm === "resolved") delete patched.reopenedAt;
         }
         const merged = { ...prev, ...patched, updatedAt: nowIso() };
         const prevById = new Map(prev.comments.map((c) => [c.id, c]));
@@ -295,6 +306,9 @@ function getStaticStore() {
         if (!merged.gh && prev.gh) merged.gh = prev.gh;
         if (prev.status === "resolved" && merged.status !== "resolved") {
           delete merged.resolvedAt;
+        }
+        if (merged.status === "resolved") {
+          delete merged.reopenedAt;
         }
         threads[idx] = merged;
         persist();

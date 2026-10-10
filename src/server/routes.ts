@@ -35,7 +35,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.8';
+const VERSION = '0.6.9';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -828,6 +828,22 @@ async function handleApi(
       }
       if (prev.status === 'resolved' && full.status !== 'resolved') {
         delete full.resolvedAt;
+      }
+      // v0.6.9 (DD-42, review F3): reopenedAt is SERVER-OWNED, exactly like
+      // the gh block below — a full-doc PATCH returns the body verbatim, so
+      // without this normalization a crafted same-status PATCH could FORGE
+      // the event (the merge's proof — protection collapses) or DROP it
+      // (un-protect a re-fix). The transition logic below re-stamps/clears.
+      full.reopenedAt = prev.reopenedAt;
+      // v0.6.9 (DD-42): stamp reopenedAt on every DOWNWARD transition — the
+      // event-proof the store merge honors (a deliberate reopen/reject must
+      // survive a union-merge against a stale higher-ranked copy; see
+      // merge.ts). Superseded by the next confirmation.
+      if (prev.status !== 'open' && full.status === 'open') {
+        full.reopenedAt = nowIso();
+      }
+      if (full.status === 'resolved') {
+        delete full.reopenedAt;
       }
       // SERVER-OWNED mirror fields: a client PATCHing a stale snapshot would
       // otherwise wipe thread.gh → the next sync would create a DUPLICATE issue,

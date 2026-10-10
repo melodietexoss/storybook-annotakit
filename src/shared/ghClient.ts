@@ -1363,8 +1363,12 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
         // reopen fires from resolved ONLY — fixed+open is the natural state
         next.status = 'open';
         delete next.resolvedAt;
+        // v0.6.9 (DD-42, review F4): event parity — a GitHub-side reopen must
+        // carry the same merge proof the PATCH door stamps, or rank eats it.
+        next.reopenedAt = pullStartedAt;
         next.comments = [...next.comments, systemComment(`gh-reopen-${mir.issue}`, 'github', 'reopened on GitHub')];
       }
+      if (next.status === 'resolved') delete next.reopenedAt; // confirm supersedes the event (both doors)
       const knownNow = new Set(next.comments.map((c) => c.ghId).filter((x): x is string => Boolean(x)));
       const imported: Comment[] = [];
       for (const c of fresh) {

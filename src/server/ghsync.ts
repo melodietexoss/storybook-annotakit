@@ -624,8 +624,13 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
             // reopen fires from resolved ONLY — fixed+open is natural (see above)
             cur.status = 'open';
             delete cur.resolvedAt;
+            // v0.6.9 (DD-42, review F4): the mirror door must stamp the same
+            // event the PATCH door does, or a GitHub-side reopen merges
+            // event-less and is eaten by the next sync (rank reverts it).
+            cur.reopenedAt = nowIso();
             systemComment(cur, `gh-reopen-${mir.issue}`, 'github', 'reopened on GitHub');
           }
+          if (cur.status === 'resolved') delete cur.reopenedAt; // confirm supersedes the event (both doors)
           const knownNow = new Set(cur.comments.map((c) => c.ghId).filter((x): x is string => Boolean(x)));
           for (const c of fresh) {
             if (knownNow.has(String(c.id))) continue;
