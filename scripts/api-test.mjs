@@ -307,7 +307,7 @@ async function main() {
   const enumId = enumT.json?.id;
   if (enumId) ownIds.push(enumId);
   const badStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'closed' });
-  check('PATCH bogus status → 400 naming open|fixed|resolved', badStatus.status === 400 && /"open", "fixed" or "resolved"/.test(String(badStatus.json?.error)), `status=${badStatus.status}`);
+  check('PATCH bogus status → 400 naming open|fixed|rejected|resolved', badStatus.status === 400 && /"open", "fixed", "rejected" or "resolved"/.test(String(badStatus.json?.error)), `status=${badStatus.status}`);
   const upperStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'RESOLVED' });
   check('PATCH status case-normalized + resolvedAt stamped', upperStatus.status === 200 && upperStatus.json?.status === 'resolved' && typeof upperStatus.json?.resolvedAt === 'string', `status=${upperStatus.status}`);
   const lowerStatus = await j('PATCH', `${API}/threads/${enumId}`, { status: 'OPEN' });
@@ -331,12 +331,33 @@ async function main() {
   const rejectPath = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' });
   check('resolved → open reopen clears resolvedAt, stamps reopenedAt (DD-42 event proof)', rejectPath.status === 200 && rejectPath.json?.status === 'open' && !rejectPath.json?.resolvedAt && typeof rejectPath.json?.reopenedAt === 'string', `status=${rejectPath.status} reopenedAt=${typeof rejectPath.json?.reopenedAt}`);
   const fixedAgain = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' });
-  check('open → fixed again (re-addressed) works; the reopen event PERSISTS on the fixed row (the merge proof)', fixedAgain.status === 200 && fixedAgain.json?.status === 'fixed' && typeof fixedAgain.json?.reopenedAt === 'string', `status=${fixedAgain.status} reopenedAt=${typeof fixedAgain.json?.reopenedAt}`);
-  const rejectFromFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' });
-  check('fixed → open (reviewer reject) works, re-stamps the event', rejectFromFixed.status === 200 && rejectFromFixed.json?.status === 'open' && typeof rejectFromFixed.json?.reopenedAt === 'string', `status=${rejectFromFixed.status}`);
-  const reconfirm = await j('PATCH', `${API}/threads/${fixId}`, { status: 'resolved' });
-  check('re-confirm supersedes the event (reopenedAt cleared, resolvedAt stamped)', reconfirm.status === 200 && reconfirm.json?.status === 'resolved' && typeof reconfirm.json?.resolvedAt === 'string' && !reconfirm.json?.reopenedAt, `status=${reconfirm.status}`);
-  const backToFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' }).then(() => j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' }));
+  check('open → fixed again works; the reopen event PERSISTS on the fixed row (the merge proof)', fixedAgain.status === 200 && fixedAgain.json?.status === 'fixed' && typeof fixedAgain.json?.reopenedAt === 'string', `status=${fixedAgain.status} reopenedAt=${typeof fixedAgain.json?.reopenedAt}`);
+  // (a3) v0.6.11 (S7-A): durable rejected — guards, system notice, cycle.
+  // The open→rejected guard runs on enumId (open since the reopen check).
+  const badRejectOpen = await j('PATCH', `${API}/threads/${enumId}`, { status: 'rejected' });
+  check('open → rejected is a 400 (nothing to reject yet)', badRejectOpen.status === 400 && /reject applies to a fix/.test(String(badRejectOpen.json?.error)), `status=${badRejectOpen.status}`);
+  const rejectFromFixed = await j('PATCH', `${API}/threads/${fixId}`, { status: 'rejected', statusAuthor: 'api-reviewer' });
+  check('fixed → rejected (reviewer reject, DURABLE) works; upward stamps nothing — the chain event CARRIES (the merge proof)', rejectFromFixed.status === 200 && rejectFromFixed.json?.status === 'rejected' && !rejectFromFixed.json?.resolvedAt && typeof rejectFromFixed.json?.reopenedAt === 'string' && rejectFromFixed.json.reopenedAt === fixedAgain.json?.reopenedAt, `status=${rejectFromFixed.status} reopenedAt=${rejectFromFixed.json?.reopenedAt}`);
+  const rejectNotice = (rejectFromFixed.json?.comments ?? []).find((c) => String(c.body).includes('rejected — the fix was not accepted'));
+  check('fixed→rejected appends the system notice comment', Boolean(rejectNotice), 'notice comment missing');
+  check('notice attributes statusAuthor, never stored as a field', rejectNotice?.author === 'api-reviewer' && !('statusAuthor' in (rejectFromFixed.json ?? {})), 'attribution missing');
+  const rejExport = await fetch(`${API}/export?format=json&storyId=${encodeURIComponent(storyId)}`);
+  const rejExportJson = await rejExport.json();
+  const rejStory = (rejExportJson?.stories ?? []).find((st) => st.threads?.some((t) => t.id === fixId));
+  check('export json counts carry rejected (four-way)', rejStory && typeof rejStory.counts?.rejected === 'number' && rejStory.counts.rejected >= 1, JSON.stringify(rejStory?.counts ?? null));
+  const rejFilterList = await j('GET', `${API}/threads?storyId=${encodeURIComponent(storyId)}&status=rejected`);
+  check('?status=rejected filter returns the rejected thread', Array.isArray(rejFilterList.json?.threads) && rejFilterList.json.threads.some((t) => t.id === fixId && t.status === 'rejected'), 'rejected filter missing thread');
+  const rejMd = await fetch(`${API}/export?format=md&storyId=${encodeURIComponent(storyId)}`);
+  const rejMdText = await rejMd.text();
+  check('digest renders REJECTED heading + re-work note', rejMdText.includes('REJECTED —') && rejMdText.includes('re-work expected'), 'REJECTED rendering missing');
+  const resubmit = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' });
+  check('rejected → fixed resubmit re-enters review, STAMPS the event (the S7 loss dissolves)', resubmit.status === 200 && resubmit.json?.status === 'fixed' && typeof resubmit.json?.reopenedAt === 'string', `status=${resubmit.status} reopenedAt=${typeof resubmit.json?.reopenedAt}`);
+  const confirmFromRejected = await j('PATCH', `${API}/threads/${fixId}`, { status: 'rejected' }).then(() => j('PATCH', `${API}/threads/${fixId}`, { status: 'resolved' }));
+  check('rejected → resolved (confirm after all) works; the confirm supersedes the event', confirmFromRejected.status === 200 && confirmFromRejected.json?.status === 'resolved' && !confirmFromRejected.json?.reopenedAt && typeof confirmFromRejected.json?.resolvedAt === 'string', `status=${confirmFromRejected.status} reopenedAt=${confirmFromRejected.json?.reopenedAt}`);
+  const guardRejected = await j('PATCH', `${API}/threads/${fixId}`, { status: 'rejected' });
+  check('resolved → rejected is a 400 (demotion guard)', guardRejected.status === 400 && /reject applies to a fix/.test(String(guardRejected.json?.error)), `status=${guardRejected.status}`);
+  const clearFromRejected = await j('PATCH', `${API}/threads/${fixId}`, { status: 'open' }).then(() => j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' })).then(() => j('PATCH', `${API}/threads/${fixId}`, { status: 'rejected' })).then(() => j('PATCH', `${API}/threads/${fixId}`, { status: 'open', statusAuthor: 'api-reviewer' }));
+  check('rejected → open clears the verdict + appends the clear notice + STAMPS the event', clearFromRejected.status === 200 && clearFromRejected.json?.status === 'open' && typeof clearFromRejected.json?.reopenedAt === 'string' && Boolean((clearFromRejected.json?.comments ?? []).find((c) => String(c.body).includes('verdict cleared — back to open'))), `status=${clearFromRejected.status} reopenedAt=${typeof clearFromRejected.json?.reopenedAt}`);
   // ?status=fixed filter + three-way export counts + digest rendering
   const fixedFilterList = await j('PATCH', `${API}/threads/${fixId}`, { status: 'fixed' }).then(() => j('GET', `${API}/threads?storyId=${encodeURIComponent(storyId)}&status=fixed`));
   check('?status=fixed filter returns only fixed threads', Array.isArray(fixedFilterList.json?.threads) && fixedFilterList.json.threads.every((t) => t.status === 'fixed') && fixedFilterList.json.threads.some((t) => t.id === fixId), JSON.stringify(fixedFilterList.json?.threads?.map((t) => t.status) ?? null));
@@ -347,8 +368,18 @@ async function main() {
   const fixMd = await fetch(`${API}/export?format=md&storyId=${encodeURIComponent(storyId)}`);
   const fixMdText = await fixMd.text();
   check('digest renders FIXED heading + review note', fixMdText.includes('FIXED —') && /awaiting reviewer verification/.test(fixMdText), 'FIXED rendering missing');
-  check('digest three-way summary line', /\d+ open \/ \d+ fixed \(awaiting review\) \/ \d+ resolved/.test(fixMdText), 'three-way counts line missing');
+  check('digest four-way summary line (S7-A)', /\d+ open \/ \d+ fixed \(awaiting review\) \/ \d+ rejected \(re-work\) \/ \d+ resolved/.test(fixMdText), 'four-way counts line missing');
   check('digest footer teaches the fixed contract (Path B)', fixMdText.includes('{"status":"fixed"}'), 'agent-loop footer not flipped');
+  // (a4) v0.6.12 (DD-42 fold) server-door forgery/drop: reopenedAt is
+  // server-owned — a full-doc PATCH can neither forge nor drop the event.
+  // fixId is fixed + event-carrying here (the clear-chain stamped it).
+  const evThread = await j('GET', `${API}/threads/${fixId}`);
+  const evRow = Array.isArray(evThread.json?.threads) ? evThread.json.threads[0] : evThread.json;
+  check('pre-forgery: the thread carries the event', evRow && typeof evRow.reopenedAt === 'string', `reopenedAt=${evRow?.reopenedAt}`);
+  const forged = await j('PATCH', `${API}/threads/${fixId}`, { ...evRow, reopenedAt: '1999-01-01T00:00:00.000Z' });
+  check('forgery: same-status full-doc PATCH cannot forge the event', forged.status === 200 && typeof forged.json?.reopenedAt === 'string' && forged.json.reopenedAt !== '1999-01-01T00:00:00.000Z', `reopenedAt=${forged.json?.reopenedAt}`);
+  const dropped = await j('PATCH', `${API}/threads/${fixId}`, { ...evRow, reopenedAt: undefined });
+  check('forgery: a full-doc PATCH missing the field cannot DROP the event', dropped.status === 200 && typeof dropped.json?.reopenedAt === 'string', `reopenedAt=${dropped.json?.reopenedAt}`);
 
   // (b) POST idempotent replay is FLAGGED (body + header) — a replay of a
   // DIFFERENT body must not masquerade as "landed"

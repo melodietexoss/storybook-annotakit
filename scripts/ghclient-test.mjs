@@ -462,6 +462,51 @@ let createdThread;
   ok('close system comment', t2?.comments.some((c) => c.body === 'closed on GitHub' && c.source === 'github'));
 }
 
+/* 8c — v0.6.11/v0.6.12: the rejected notice mirrors through the CLIENT
+ * engine (S7-AUDIT-D7 parity) + DD-42 event parity on the pull path
+ * (S7-AUDIT-B6): a remote reopen must land event-carrying (else the next
+ * merge rank-reverts it) and a remote close from rejected clears it. */
+{
+  const ghc8c = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc8c.getGhLinkedStaticStore();
+  await store.create(threadInput('th_rej'));
+  await until(() => queueOps(ghc8c).length === 0);
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_rej'));
+  const tFixed0 = store.list().find((x) => x.id === 'th_rej');
+  await store.patch({ ...tFixed0, status: 'fixed' });
+  await until(() => queueOps(ghc8c).length === 0, 'fixed flush');
+  // reviewer rejects in the PANEL → durable verdict + the system notice
+  // mirrors to the issue (the agent-visible re-work signal); issue stays OPEN
+  const tFixed = store.list().find((x) => x.id === 'th_rej');
+  await store.patch({ ...tFixed, status: 'rejected' }, { statusAuthor: 'panel-reviewer' });
+  await until(() => queueOps(ghc8c).length === 0, 'reject notice flush');
+  ok('rejected: issue stays OPEN (work continues)', issue?.state === 'open', `state=${issue?.state}`);
+  ok('rejected: the notice comment lands on the issue', issue?.comments.some((c) => c.body.includes('rejected — the fix was not accepted')), 'notice missing');
+  const tRej = store.list().find((x) => x.id === 'th_rej');
+  ok('rejected: upward transition stamps NO event', tRej?.status === 'rejected' && !tRej?.reopenedAt, `event=${tRej?.reopenedAt}`);
+  // reviewer confirms ON GitHub (close from rejected) → resolved + event cleared
+  const later = () => new Date(Date.now() + 5000).toISOString();
+  issue.state = 'closed';
+  issue.closed_at = later();
+  issue.closed_by = { login: 'human' };
+  issue.updated_at = later();
+  await store.gh?.syncNow();
+  const tRes = store.list().find((x) => x.id === 'th_rej');
+  ok('remote close confirms FROM rejected → resolved', tRes?.status === 'resolved' && Boolean(tRes?.resolvedAt), `${tRes?.status}`);
+  ok('confirm clears the event (both doors)', !tRes?.reopenedAt, `event=${tRes?.reopenedAt}`);
+  // remote reopen (a human reopens the issue) → the pull MUST land the row
+  // event-carrying — the static door re-stamps on the rank decrease (the
+  // engine's pullStartedAt is advisory; presence is what the merge reads)
+  issue.state = 'open';
+  delete issue.closed_at;
+  delete issue.closed_by;
+  issue.updated_at = later();
+  await store.gh?.syncNow();
+  const tRe = store.list().find((x) => x.id === 'th_rej');
+  ok('remote reopen → back to open + reopenedAt stamped (DD-42 pull parity)', tRe?.status === 'open' && typeof tRe?.reopenedAt === 'string', `status=${tRe?.status} event=${tRe?.reopenedAt}`);
+  ok('reopen system comment', tRe?.comments.some((c) => c.body === 'reopened on GitHub' && c.source === 'github'));
+}
+
 /* 9 — follower doc: enqueue only, no flush (leader election) */
 {
   const ghc9 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });

@@ -1,6 +1,6 @@
 {
   "name": "storybook-annotakit",
-  "version": "0.6.9",
+  "version": "0.6.12",
   "description": "AnnotaKit, reborn inside Storybook: zero-setup pin comments on live stories with React component awareness. Dev-server-embedded store, lean agent digests, GitHub issue publishing.",
   "license": "MIT",
   "author": "melodietexoss",
@@ -11,12 +11,14 @@
   },
   "files": [
     "dist",
+    "AGENTS.md",
     "preset.js",
     "README.md",
     "LICENSE",
     "scripts/bake-static-threads.mjs",
     "scripts/serve-static.py",
-    "scripts/heal-mirrors.mjs"
+    "scripts/heal-mirrors.mjs",
+    "scripts/detach-run.py"
   ],
   "keywords": [
     "storybook",
@@ -39,6 +41,7 @@
     "@storybook/react": "^10.6.0",
     "@types/node": "^26.4.1",
     "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tsup": "^8.5.0",

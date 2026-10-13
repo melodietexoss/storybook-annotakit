@@ -39,7 +39,26 @@
  * Usage: node scripts/bake-static-threads.mjs <outDir> [--store path]
  *        [--config-dir dir] [--gh-token t] [--gh-repo owner/name]
  *        [--gh-labels a,b] [--gh-poll-sec 60] [--env-file path]
+ *        [--base /storybook/]
  *        (outDir default: examples/nimbus/dist-storybook)
+ *
+ * --base <href> (v0.6.9): make the static build servable UNDER A SUBPATH of
+ *        another server (the canonical case: Next.js on the only public port,
+ *        review surface at /storybook). Storybook 10 emits RELATIVE refs
+ *        (./sb-manager/...), which only resolve when the page URL ends in "/" —
+ *        and e.g. Next 308-strips trailing slashes. Injecting
+ *        <base href="<base>"> as the FIRST child of <head> re-anchors every
+ *        relative ref. Contract:
+ *          - root-relative only ("/x/"), no scheme; normalized to a trailing
+ *            slash; anything else exits 1 with the accepted form.
+ *          - refuses to touch a build whose refs are root-absolute and not
+ *            already under <base> (SB ref shape changed — loud exit 1, agents
+ *            don't read warnings).
+ *          - idempotent (same base → byte-identical) and re-targetable
+ *            (different base → replaced, logged).
+ *          - never touches iframe.html (the manager loads it base-resolved and
+ *            its own refs are sibling-relative — verified).
+ *          - prints the matching next.config rewrite + the entry URL.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -53,7 +72,7 @@ const args = process.argv.slice(2);
  *  (secret-as-pathname in ls/backups) while the real outDir silently missed
  *  its static-mode marker. Walk argv properly: consume --flag value pairs
  *  (and --flag=value), then the first REMAINING token is the positional. */
-const FLAG_NAMES = ['config-dir', 'gh-token', 'gh-repo', 'gh-labels', 'gh-poll-sec', 'env-file', 'store'];
+const FLAG_NAMES = ['config-dir', 'gh-token', 'gh-repo', 'gh-labels', 'gh-poll-sec', 'env-file', 'store', 'base'];
 const positional = (() => {
   const rest = [...args];
   for (let i = 0; i < rest.length; i++) {
@@ -104,7 +123,47 @@ function parseDotEnv(text) {
   return out;
 }
 
-/** Resolve the GH client config: flags → process env → .env file. */
+/** Resolve the GH client config: flags → process env → .env file →
+ * git-origin autodetect (S7-AUDIT-A2 — the v0.6.12 fix: "rely on git-origin
+ * autodetect" was documented but never implemented on the bake path; the
+ * dev server's detectGithubRepo never ran here, silently disarming the
+ * mirror for consumers who trusted the doc). */
+function parseGithubRepoUrl(url) {
+  // Mirrors src/server/env.ts parseGithubRepo (standalone .mjs — no TS
+  // imports; keep the accepted shapes in sync): https/ssh/git+ssh github
+  // URLs (with optional .git suffix / trailing paths) + the `github:` shorthand.
+  if (!url) return null;
+  const m =
+    String(url).match(/github\.com[/:]([^/\s]+)\/([^\s#?]+?)(?:\.git)?(?:[/\s?#].*)?$/i) ??
+    String(url).match(/^github:([^/\s]+)\/([^\s]+)$/i);
+  if (!m) return null;
+  const [, owner, name] = m;
+  if (!owner || !name) return null;
+  return `${owner}/${name}`;
+}
+
+function detectGhRepo(configDir) {
+  const root = path.dirname(path.resolve(configDir));
+  try {
+    const remote = execFileSync('git', ['-C', root, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const repo = parseGithubRepoUrl(remote);
+    if (repo) return { repo, source: 'git remote origin' };
+  } catch {
+    /* no git / no origin remote */
+  }
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const repoUrl = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url;
+    if (repoUrl) {
+      const repo = parseGithubRepoUrl(repoUrl);
+      if (repo) return { repo, source: 'package.json repository' };
+    }
+  } catch {
+    /* no package.json / no repository field */
+  }
+  return { repo: null, source: 'not found' };
+}
+
 function resolveGhConfig() {
   let token = flagValue('gh-token') || process.env.ANNOTAKIT_GH_TOKEN;
   let repo = flagValue('gh-repo') || process.env.ANNOTAKIT_GH_REPO;
@@ -130,6 +189,17 @@ function resolveGhConfig() {
         break;
       } catch {
         /* unreadable — next candidate */
+      }
+    }
+    // git-origin autodetect LAST (explicit config always wins); only when a
+    // token exists — a detected repo without a token cannot arm the mirror
+    // and would only churn the log.
+    if (token && !repo) {
+      const configDir2 = optValue('config-dir') ?? path.resolve('.storybook');
+      const det = detectGhRepo(configDir2);
+      if (det.repo) {
+        repo = det.repo;
+        console.log(`[bake-static] gh config: repo autodetected from ${det.source} → ${repo}`);
       }
     }
   }
@@ -188,6 +258,63 @@ async function readStoreThreads() {
   return null;
 }
 
+/* ---- v0.6.9: --base <href> — subpath serving (see header contract) ---- */
+function applyBase(outDir) {
+  const raw = flagValue('base');
+  if (raw === undefined) return;
+  if (!raw.startsWith('/') || /^[a-zA-Z]+:/.test(raw) || !raw.trim()) {
+    console.error(`[bake-static] --base must be a root-relative path like /storybook/ (got ${JSON.stringify(raw)})`);
+    process.exit(1);
+  }
+  const base = raw.endsWith('/') ? raw : `${raw}/`;
+  if (base !== raw) console.log(`[bake-static] --base normalized to trailing slash: ${base} (a slashless base is silently catastrophic)`);
+  const indexPath = path.join(outDir, 'index.html');
+  if (!existsSync(indexPath)) {
+    console.error(`[bake-static] --base needs <outDir>/index.html — not a storybook build output? (${indexPath})`);
+    process.exit(1);
+  }
+  const html = readFileSync(indexPath, 'utf8');
+  const existing = html.match(/<base\s+href=["']([^"']*)["']\s*\/?>/i);
+  if (existing && existing[1] === base) {
+    console.log(`[bake-static] <base href="${base}"> already present — nothing to do (idempotent)`);
+    return;
+  }
+  if (existing) console.log(`[bake-static] replacing existing <base href="${existing[1]}"> with "${base}"`);
+  // Ref-shape gate: <base> only fixes RELATIVE refs. If SB ever emits
+  // root-absolute refs, injection silently stops working — fail LOUD so a
+  // version drift surfaces here instead of as mystery 404s in the browser.
+  const headEnd = html.search(/<\/head>/i);
+  const head = html.slice(0, headEnd < 0 ? html.length : headEnd);
+  const refs = [...head.matchAll(/(?:src|href)=["']([^"']*)["']/gi)].map((m) => m[1]);
+  const urlish = refs.filter((r) => r && r !== '#' && !/^(data:|https?:|mailto:)/i.test(r));
+  const absolute = urlish.filter((r) => r.startsWith('/'));
+  const outsideBase = absolute.filter((r) => !r.startsWith(base));
+  if (absolute.length && absolute.length === urlish.length && !outsideBase.length) {
+    console.log(`[bake-static] all head refs are already absolute under ${base} — nothing to do`);
+    return;
+  }
+  if (outsideBase.length) {
+    console.error(
+      `[bake-static] --base cannot fix root-absolute refs outside ${base}: ${outsideBase.slice(0, 3).join(', ')}${outsideBase.length > 3 ? ' …' : ''}\n` +
+        `  Storybook's ref shape may have changed — report to the kit. Workaround: serve the review surface at the origin root (setup C) or behind a prefix-strip proxy (setup B).`,
+    );
+    process.exit(1);
+  }
+  const headOpen = html.match(/<head[^>]*>/i);
+  if (!headOpen || headOpen.index === undefined) {
+    console.error('[bake-static] no <head> element found in index.html — cannot inject <base>');
+    process.exit(1);
+  }
+  const at = headOpen.index + headOpen[0].length;
+  let out = html.slice(0, at) + `\n    <base href="${base}">` + html.slice(at);
+  if (existing) out = out.replace(existing[0], '');
+  writeFileSync(indexPath, out);
+  const clean = base.replace(/\/$/, '');
+  console.log(`[bake-static] injected <base href="${base}"> into index.html — the build now serves under any subpath`);
+  console.log(`[bake-static] next.config.ts rewrite for the pretty URL:  { source: "${clean}", destination: "${clean}/index.html" }`);
+  console.log(`[bake-static] entry URL: <origin>${clean}  (servers that strip trailing slashes redirect ${clean}/ → ${clean} — expected)`);
+}
+
 const found = await readStoreThreads();
 const threads = found ? found.threads : [];
 if (!found) {
@@ -199,8 +326,10 @@ if (!found) {
 mkdirSync(outDir, { recursive: true });
 const out = path.join(outDir, 'annotakit-threads.json');
 writeFileSync(out, JSON.stringify({ threads }, null, 2));
+// v0.6.11 (S7-A): rejected joins the operator smoke signal (re-work-heavy bakes)
 const open = threads.filter((t) => t.status === 'open').length;
-console.log(`[bake-static] wrote ${out} (${threads.length} threads, ${open} open) — static-mode marker + seed`);
+const rejected = threads.filter((t) => t.status === 'rejected').length;
+console.log(`[bake-static] wrote ${out} (${threads.length} threads, ${open} open${rejected > 0 ? `, ${rejected} rejected` : ''}) — static-mode marker + seed`);
 
 /* ---- v0.5.3: bake the client-side GitHub publishing config ---- */
 const gh = resolveGhConfig();
@@ -217,3 +346,5 @@ if (gh.token && gh.repo) {
     console.log('[bake-static] no GH token+repo resolved — NOT writing annotakit-gh.json (local-only build; the panel settings can configure publishing at runtime)');
   }
 }
+
+applyBase(outDir);

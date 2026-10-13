@@ -19,15 +19,31 @@ import { probeSeed } from './staticStore';
 
 export type KitMode = 'dev' | 'static' | 'down';
 
-async function healthOk(): Promise<boolean> {
+async function healthOkAt(url: string): Promise<boolean> {
   try {
-    const res = await fetch('/annotakit/api/health', { cache: 'no-store' });
+    const res = await fetch(url, { cache: 'no-store' });
     if (!res.ok) return false;
     const body = (await res.json()) as { ok?: boolean };
     return body?.ok === true;
   } catch {
     return false;
   }
+}
+
+/** v0.6.9 subpath truth: probe the baseURI directory FIRST (a static build
+ * served under a subpath — or a proxy that only forwards /storybook — keeps
+ * the API under the page's dir), then the origin root (dev-at-root, and
+ * proxies that forward /annotakit/api at the root). Same ladder shape as
+ * probeSeed: first hit wins; a static build 404s both in milliseconds. */
+async function healthOk(): Promise<boolean> {
+  const candidates = [
+    new URL('annotakit/api/health', document.baseURI).href,
+    new URL('/annotakit/api/health', window.location.origin).href,
+  ];
+  for (const url of [...new Set(candidates)]) {
+    if (await healthOkAt(url)) return true;
+  }
+  return false;
 }
 
 /** Single mode probe. Callers add their own retry/backoff policy (the preview

@@ -2,20 +2,34 @@ import {
   API_BASE,
   FOCUS_THREAD,
   LAYER_STATE,
+  RECALL_THREAD,
   THREADS_CHANGED,
   THREAD_FOCUSED,
+  THREAD_RECALLED,
   TOGGLE_LAYER,
+  TOGGLE_THREADS_PANEL,
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-6F4R4EGJ.mjs";
+} from "./chunk-N6VBNK7S.mjs";
 import {
   getGhLinkedStaticStore
-} from "./chunk-QN5WRF3H.mjs";
+} from "./chunk-NI2PFIAZ.mjs";
 import {
   MAX_BODY_CHARS,
   elementSummary
-} from "./chunk-X5NLCX4D.mjs";
+} from "./chunk-MHG5WIGU.mjs";
+import {
+  DEFAULT_HOTKEYS,
+  altMatches,
+  hotkeyMatches,
+  isTypingTarget,
+  parseHotkey
+} from "./chunk-F7IFSFQY.mjs";
+import {
+  GreyedGate,
+  hitTest
+} from "./chunk-MSQAPIXL.mjs";
 
 // src/preview/index.ts
 import React2 from "react";
@@ -838,6 +852,7 @@ function propValueToString(value) {
   }
 }
 function inspectComponent(el) {
+  if (el.closest?.("[data-annota-frozen]")) return null;
   let fiber = closestFiber(el);
   if (!fiber) fiber = react18Fallback(el);
   if (!fiber) return null;
@@ -892,24 +907,28 @@ function fromDebugSourceObject(fiber) {
 // src/preview/story-meta.ts
 var indexCache = null;
 async function loadIndex() {
-  try {
-    const res = await fetch("/index.json", { cache: "no-store" });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
+  const candidates = [new URL("index.json", document.baseURI).href, new URL("/index.json", window.location.origin).href];
+  for (const url of [...new Set(candidates)]) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) continue;
+      return await res.json();
+    } catch {
+    }
   }
+  return null;
 }
 function indexPromise() {
   indexCache ??= loadIndex();
   return indexCache;
 }
 async function buildStoryRef(storyId, context = {}) {
+  const managerDir = new URL(".", document.baseURI);
   const ref = {
     storyId,
     title: context.title,
     name: context.name,
-    url: `${window.location.origin}/?path=/story/${storyId}`
+    url: new URL(`?path=/story/${storyId}`, managerDir).href
   };
   const index = await indexPromise();
   const entry = index?.entries?.[storyId];
@@ -951,12 +970,12 @@ async function createThread(input) {
     })
   );
 }
-async function patchThread(thread) {
+async function patchThread(thread, statusAuthor) {
   return await json(
     await fetch(`${API_BASE}/threads/${encodeURIComponent(thread.id)}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(thread)
+      body: JSON.stringify(statusAuthor ? { ...thread, statusAuthor } : thread)
     })
   );
 }
@@ -978,24 +997,55 @@ async function postSnapshot(threadId, snapshot) {
     })
   );
 }
+async function getSnapshot(threadId) {
+  return await json(await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/snapshot`, { cache: "no-store" }));
+}
 
 // src/preview/snapshot.ts
 var CAP = 32768;
 var MARK = "data-annota-snap";
+function perfMark(name, fn) {
+  const start = `${name}:start`;
+  const end = `${name}:end`;
+  try {
+    performance.mark(start);
+  } catch {
+  }
+  try {
+    fn();
+    try {
+      performance.mark(end);
+      performance.measure(name, start, end);
+    } catch {
+    }
+  } catch (err) {
+    try {
+      performance.mark(`${name}:failed`);
+    } catch {
+    }
+    throw err;
+  }
+}
+function stripSecretValueAttrs(el) {
+  el.querySelectorAll("input[type=password], input[type=hidden]").forEach((n) => n.removeAttribute("value"));
+}
 function captureSnapshot(root, pinned) {
   const rect = root.getBoundingClientRect();
-  let html;
   if (pinned) {
     try {
       pinned.setAttribute(MARK, "1");
-      html = root.outerHTML;
+    } catch {
+    }
+  }
+  const temp = root.cloneNode(true);
+  if (pinned) {
+    try {
       pinned.removeAttribute(MARK);
     } catch {
-      html = root.outerHTML;
     }
-  } else {
-    html = root.outerHTML;
   }
+  stripSecretValueAttrs(temp);
+  let html = temp.outerHTML;
   let clipped = false;
   if (html.length > CAP) {
     html = html.replace(/\sstyle="[^"]*"/g, "");
@@ -1012,6 +1062,287 @@ function captureSnapshot(root, pinned) {
     width: Math.max(1, Math.round(rect.width)),
     height: Math.max(1, Math.round(rect.height))
   };
+}
+var FROZEN_BUDGET = 9e4;
+var PORTAL_SKIP_TAGS = /* @__PURE__ */ new Set(["SCRIPT", "STYLE", "LINK", "META", "TITLE", "NOSCRIPT"]);
+function opaqueBg(el) {
+  const bg = getComputedStyle(el).backgroundColor;
+  return bg && bg !== "transparent" && bg !== "rgba(0, 0, 0, 0)" ? bg : null;
+}
+function frozenBackground(liveRoot) {
+  return opaqueBg(liveRoot) ?? opaqueBg(document.body) ?? opaqueBg(document.documentElement) ?? "#ffffff";
+}
+function stripDangerousAttrs(el) {
+  const jsUrl = /^\s*javascript:/i;
+  for (const attr2 of Array.from(el.attributes)) {
+    if (/^on/i.test(attr2.name)) el.removeAttribute(attr2.name);
+    else if ((attr2.name === "href" || attr2.name === "src") && jsUrl.test(attr2.value)) el.setAttribute(attr2.name, "#");
+  }
+}
+function cleanCloneTree(root) {
+  root.querySelectorAll("[data-annota-overlay]").forEach((n) => n.remove());
+  root.querySelectorAll("[inert]").forEach((n) => n.removeAttribute("inert"));
+  if (root.hasAttribute("inert")) root.removeAttribute("inert");
+  root.querySelectorAll("*").forEach(stripDangerousAttrs);
+  stripDangerousAttrs(root);
+}
+function buildFrozenContainer(liveRoot) {
+  const container = document.createElement("div");
+  container.setAttribute("data-annota-frozen", "1");
+  container.style.cssText = `position:fixed;inset:0;z-index:2147482000;pointer-events:auto;overflow:auto;background:${frozenBackground(liveRoot)};`;
+  const stopDefault = (e) => {
+    e.preventDefault();
+  };
+  container.addEventListener("pointerdown", stopDefault, true);
+  container.addEventListener("mousedown", stopDefault, true);
+  container.addEventListener("click", stopDefault, true);
+  container.addEventListener(
+    "focusin",
+    (e) => {
+      const t = e.target;
+      if (t instanceof HTMLElement) t.blur();
+    },
+    true
+  );
+  return container;
+}
+function captureFrozenView(liveRoot) {
+  let mount;
+  perfMark("annotakit:freeze", () => {
+    mount = captureFrozenViewInner(liveRoot);
+  });
+  return mount;
+}
+function captureFrozenViewInner(liveRoot) {
+  const rect = liveRoot.getBoundingClientRect();
+  const storyClone = liveRoot.cloneNode(true);
+  cleanCloneTree(storyClone);
+  storyClone.setAttribute("data-annota-frozen-story", "1");
+  storyClone.style.position = "absolute";
+  storyClone.style.left = `${rect.left}px`;
+  storyClone.style.top = `${rect.top}px`;
+  storyClone.style.width = `${Math.max(1, rect.width)}px`;
+  storyClone.style.height = `${Math.max(1, rect.height)}px`;
+  storyClone.style.margin = "0";
+  const portalClones = [];
+  const portalPairs = [];
+  for (const child of Array.from(document.body.children)) {
+    if (!(child instanceof HTMLElement)) continue;
+    if (child === liveRoot) continue;
+    if (PORTAL_SKIP_TAGS.has(child.tagName)) continue;
+    if (child.closest("[data-annota-overlay]")) continue;
+    if (child.closest("[data-annota-frozen]")) continue;
+    if (child.hasAttribute("aria-live") || child.hasAttribute("data-sb-error")) continue;
+    if (child.id === "storybook-docs" || child.id === "storybook-highlights-root") continue;
+    if ([...child.classList].some((c) => c.startsWith("sb-"))) continue;
+    const cr = child.getBoundingClientRect();
+    if (cr.width < 1 || cr.height < 1) continue;
+    const pc = child.cloneNode(true);
+    cleanCloneTree(pc);
+    portalClones.push(pc);
+    portalPairs.push([child, pc]);
+  }
+  const container = buildFrozenContainer(liveRoot);
+  container.appendChild(storyClone);
+  for (const pc of portalClones) container.appendChild(pc);
+  document.body.appendChild(container);
+  copyDynamicState(liveRoot, storyClone);
+  for (const [livePortal, pc] of portalPairs) copyDynamicState(livePortal, pc);
+  requestAnimationFrame(() => copyScroll(liveRoot, storyClone));
+  return { container, storyClone, portalClones, teardown: () => container.remove() };
+}
+function copyScroll(liveRoot, cloneRoot) {
+  try {
+    const filter = {
+      acceptNode: (n) => n.closest?.("[data-annota-overlay]") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+    };
+    const liveWalker = document.createTreeWalker(liveRoot, NodeFilter.SHOW_ELEMENT, filter);
+    const cloneWalker = document.createTreeWalker(cloneRoot, NodeFilter.SHOW_ELEMENT);
+    let a = liveWalker.nextNode();
+    let b = cloneWalker.nextNode();
+    while (a && b) {
+      if (a.scrollTop > 0 || a.scrollLeft > 0) {
+        try {
+          b.scrollTop = a.scrollTop;
+          b.scrollLeft = a.scrollLeft;
+        } catch {
+        }
+      }
+      a = liveWalker.nextNode();
+      b = cloneWalker.nextNode();
+    }
+  } catch {
+  }
+}
+function copyFormState(live, clone) {
+  try {
+    if (live instanceof HTMLTextAreaElement && clone instanceof HTMLTextAreaElement) {
+      clone.value = live.value;
+      clone.textContent = live.value;
+      return;
+    }
+    if (live instanceof HTMLSelectElement && clone instanceof HTMLSelectElement) {
+      for (let i = 0; i < live.options.length && i < clone.options.length; i++) {
+        const lo = live.options[i];
+        const co = clone.options[i];
+        co.selected = lo.selected;
+        if (lo.selected) co.setAttribute("selected", "");
+        else co.removeAttribute("selected");
+      }
+      if (!clone.multiple) clone.selectedIndex = live.selectedIndex;
+      return;
+    }
+    if (live instanceof HTMLInputElement && clone instanceof HTMLInputElement) {
+      if (live.type === "checkbox" || live.type === "radio") {
+        clone.checked = live.checked;
+        if (live.checked) clone.setAttribute("checked", "");
+        else clone.removeAttribute("checked");
+        return;
+      }
+      if (live.type === "file" || live.type === "image") return;
+      clone.value = live.value;
+      if (live.type === "password" || live.type === "hidden") {
+        clone.removeAttribute("value");
+        return;
+      }
+      clone.setAttribute("value", live.value);
+    }
+  } catch {
+  }
+}
+function copyCanvasBitmap(live, clone) {
+  if (!(live instanceof HTMLCanvasElement && clone instanceof HTMLCanvasElement)) return;
+  clone.setAttribute("data-annota-canvas", `${live.width}x${live.height}`);
+  try {
+    const ctx = clone.getContext("2d");
+    if (ctx) ctx.drawImage(live, 0, 0);
+  } catch {
+  }
+}
+function copyShadowRoot(live, clone) {
+  if (!(live instanceof HTMLElement && clone instanceof HTMLElement)) return;
+  const liveShadow = live.shadowRoot;
+  if (!liveShadow || clone.shadowRoot) return;
+  try {
+    const cs = clone.attachShadow({ mode: "open" });
+    for (const child of Array.from(liveShadow.childNodes)) {
+      cs.appendChild(child.cloneNode(true));
+    }
+    cs.querySelectorAll("*").forEach(stripDangerousAttrs);
+  } catch {
+  }
+}
+function copyDynamicState(liveRoot, cloneRoot) {
+  const walk = (liveParent, cloneParent) => {
+    const liveKids = Array.from(liveParent.childNodes).filter(
+      (n2) => !(n2 instanceof Element && n2.closest("[data-annota-overlay]"))
+    );
+    const cloneKids = Array.from(cloneParent.childNodes);
+    const n = Math.min(liveKids.length, cloneKids.length);
+    for (let i = 0; i < n; i++) {
+      const a = liveKids[i];
+      const b = cloneKids[i];
+      if (!(a instanceof Element && b instanceof Element)) continue;
+      copyFormState(a, b);
+      copyCanvasBitmap(a, b);
+      copyShadowRoot(a, b);
+      walk(a, b);
+      if (a.shadowRoot && b.shadowRoot && a.shadowRoot.childNodes.length === b.shadowRoot.childNodes.length) {
+        walk(a.shadowRoot, b.shadowRoot);
+      }
+    }
+  };
+  try {
+    walk(liveRoot, cloneRoot);
+  } catch {
+  }
+}
+function captureFrozenSnapshot(mount, pinned) {
+  let snap;
+  perfMark("annotakit:frozen-snapshot", () => {
+    snap = captureFrozenSnapshotInner(mount, pinned);
+  });
+  return snap;
+}
+function captureFrozenSnapshotInner(mount, pinned) {
+  const rect = mount.storyClone.getBoundingClientRect();
+  let marked = false;
+  if (pinned) {
+    try {
+      pinned.setAttribute(MARK, "1");
+      marked = true;
+    } catch {
+    }
+  }
+  const temp = mount.container.cloneNode(true);
+  if (marked) {
+    try {
+      pinned?.removeAttribute(MARK);
+    } catch {
+    }
+  }
+  let html = temp.outerHTML;
+  if (html.length > FROZEN_BUDGET) {
+    temp.querySelectorAll("[data-annota-frozen-story] *").forEach((n) => {
+      if (n instanceof HTMLElement) n.removeAttribute("style");
+    });
+    html = temp.outerHTML;
+  }
+  if (html.length > FROZEN_BUDGET) {
+    while (html.length > FROZEN_BUDGET && temp.children.length > 1) {
+      temp.lastElementChild?.remove();
+      html = temp.outerHTML;
+    }
+  }
+  let clipped = false;
+  if (html.length > FROZEN_BUDGET) {
+    html = html.slice(0, FROZEN_BUDGET);
+    clipped = true;
+  }
+  return {
+    format: "dom",
+    html,
+    clipped,
+    capturedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    width: Math.max(1, Math.round(rect.width)),
+    height: Math.max(1, Math.round(rect.height)),
+    surface: "frozen"
+  };
+}
+function sanitizeMountedView(el) {
+  el.querySelectorAll("[data-annota-overlay]").forEach((n) => n.remove());
+  el.querySelectorAll("script").forEach((n) => n.remove());
+  el.querySelectorAll("[inert]").forEach((n) => n.removeAttribute("inert"));
+  if (el.hasAttribute("inert")) el.removeAttribute("inert");
+  el.querySelectorAll("*").forEach(stripDangerousAttrs);
+  stripDangerousAttrs(el);
+  stripSecretValueAttrs(el);
+}
+function mountRecalledView(snap, liveRoot) {
+  let mount;
+  perfMark("annotakit:recall", () => {
+    mount = mountRecalledViewInner(snap, liveRoot);
+  });
+  return mount;
+}
+function mountRecalledViewInner(snap, liveRoot) {
+  const rect = liveRoot.getBoundingClientRect();
+  const container = buildFrozenContainer(liveRoot);
+  if (snap.surface === "frozen") {
+    container.innerHTML = snap.html;
+  } else {
+    const holder = document.createElement("div");
+    holder.style.cssText = `position:absolute;left:${rect.left}px;top:${rect.top}px;width:${Math.max(1, Math.round(snap.width || rect.width))}px;`;
+    holder.innerHTML = snap.html;
+    container.appendChild(holder);
+  }
+  sanitizeMountedView(container);
+  document.body.appendChild(container);
+  const storyClone = container.querySelector("[data-annota-frozen-story]") ?? container.querySelector("#storybook-root") ?? container.firstElementChild ?? container;
+  const portalClones = Array.from(container.children).filter(
+    (c) => c instanceof HTMLElement && c !== storyClone && !c.hasAttribute("data-annota-frozen")
+  );
+  return { container, storyClone, portalClones, teardown: () => container.remove() };
 }
 
 // src/preview/styles.ts
@@ -1042,8 +1373,9 @@ var OVERLAY_CSS = `
  *        none (toast: none on the container, auto on its dismiss button),
  *        so they can neither hide nor swallow a pin
  *   20 = pins + regions \u2014 ALWAYS on top of passive chrome
- *   30 = deliberate interactive surfaces (composer card, drawer, help) \u2014
- *        invoked contexts, allowed above pins while open */
+ *   30 = deliberate interactive surfaces (composer card, thread card,
+ *        help, the frozen pill) \u2014 invoked contexts, allowed above pins
+ *        while open */
 
 /* ---------- pin markers ---------- */
 .annota-pin {
@@ -1069,6 +1401,9 @@ var OVERLAY_CSS = `
 .annota-pin:hover { transform: scale(1.15); }
 .annota-pin.is-resolved { background: #94a3b8; }
 .annota-pin.is-fixed { background: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.25); }
+/* v0.6.11 (S7-A): rejected = the fix was NOT accepted \u2014 red, distinct from
+ * open (amber default) and fixed (blue). */
+.annota-pin.is-rejected { background: #dc2626; box-shadow: 0 0 0 3px rgba(220,38,38,.25); }
 .annota-pin.is-orphan { background: #fff; color: #94a3b8; border-style: dashed; }
 .annota-pin.is-active { outline: 2px solid var(--annota-accent); outline-offset: 2px; }
 
@@ -1084,6 +1419,7 @@ var OVERLAY_CSS = `
 }
 .annota-region.is-resolved { border-color: #94a3b8; background: rgba(148,163,184,.06); }
 .annota-region.is-fixed { border-color: #2563eb; background: rgba(37,99,235,.08); }
+.annota-region.is-rejected { border-color: #dc2626; background: rgba(220,38,38,.08); }
 .annota-region .annota-region-tag {
   position: absolute;
   top: -20px;
@@ -1097,6 +1433,7 @@ var OVERLAY_CSS = `
 }
 .annota-region.is-resolved .annota-region-tag { background: #94a3b8; }
 .annota-region.is-fixed .annota-region-tag { background: #2563eb; }
+.annota-region.is-rejected .annota-region-tag { background: #dc2626; }
 
 /* ---------- capture mode ---------- */
 .annota-capture-hint {
@@ -1113,6 +1450,30 @@ var OVERLAY_CSS = `
   font-weight: 600;
   pointer-events: none;
   box-shadow: 0 4px 14px rgba(0,0,0,.3);
+}
+
+/* v0.6.9 (S3/S5): frozen/recall state pill \u2014 z 30 informational surface.
+   Never blocks (pointer-events: none) and stays a PILL, not a banner (the
+   canvas stays overlay-free by user directive). */
+.annota-frozen-pill {
+  position: fixed;
+  z-index: 30;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #0c4a6e;
+  color: #e0f2fe;
+  border: 1px solid #38bdf8;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+  box-shadow: 0 4px 14px rgba(0,0,0,.3);
+  max-width: min(92vw, 640px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .annota-hover-box {
   position: fixed;
@@ -1134,7 +1495,7 @@ body.annota-cursor * { cursor: crosshair !important; }
   border-radius: 3px;
 }
 
-/* ---------- cards (composer / popover / drawer / help) ---------- */
+/* ---------- cards (composer / popover / thread card / help) ---------- */
 .annota-card {
   position: fixed;
   z-index: 30;
@@ -1268,35 +1629,9 @@ body.annota-cursor * { cursor: crosshair !important; }
   white-space: pre-wrap;
 }
 
-/* ---------- drawer ---------- */
-.annota-drawer {
-  position: fixed;
-  z-index: 30;
-  right: 18px;
-  /* v0.5.0: no more in-canvas launcher below it \u2014 dock to the corner */
-  bottom: 18px;
-  width: 340px;
-  max-height: 65vh;
-  overflow: auto;
-}
-.annota-thread-row { padding: 10px 12px; border-bottom: 1px solid #f1f3f7; cursor: pointer; }
-.annota-thread-row:hover { background: #f8fafc; }
-.annota-thread-row.is-active { background: #eef2ff; }
-.annota-thread-row .annota-thread-title { font-weight: 600; font-size: 12.5px; }
-.annota-thread-row .annota-thread-sub { font-size: 11px; color: #64748b; margin-top: 2px; }
-.annota-thread-row.is-resolved .annota-thread-title { text-decoration: line-through; color: #94a3b8; }
-.annota-thread-row.is-fixed .annota-thread-title { color: #2563eb; }
-.annota-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--annota-warn);
-  margin-right: 5px;
-}
-.annota-dot.is-resolved { background: var(--annota-ok); }
-.annota-dot.is-fixed { background: #2563eb; }
-.annota-dot.is-orphan { background: #cbd5e1; }
+/* v0.6.11 (S7-B): drawer CSS DELETED with DrawerCard (.annota-drawer,
+ * .annota-thread-row*, .annota-dot*) \u2014 the threads surface is the SB bottom
+ * panel now. */
 
 /* ---------- help ---------- */
 .annota-help {
@@ -1391,45 +1726,13 @@ function getAuthor() {
 function uid(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
-function isTypingTarget(t) {
-  if (!(t instanceof HTMLElement)) return false;
-  return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable;
-}
 function storyRoot() {
   return document.getElementById("storybook-root") ?? document.body;
 }
 function clamp(v, min, max) {
   return Math.min(Math.max(v, min), max < min ? min : max);
 }
-var DEFAULT_HOTKEYS = { pin: "alt+c", region: "alt+r", layer: "alt+l", drawer: "alt+d", help: "?" };
-var warnedLegacyKeys = /* @__PURE__ */ new Set();
-function warnLegacyHotkey(userSpec, raw, withAlt) {
-  if (!userSpec || withAlt) return;
-  if (raw === "?") return;
-  if (warnedLegacyKeys.has(raw)) return;
-  warnedLegacyKeys.add(raw);
-  console.info(
-    `[storybook-annotakit] hotkey "${userSpec}" is a plain-key spec: since v0.5 plain keys collide with story interactions, so it fires with \u2325/Alt held \u2014 "${raw}" now means \u2325${raw.toUpperCase()}. Set parameters.annotakit.hotkeys to "alt+${raw}" to make the intent explicit (this fires on the physical key via e.code, so macOS Option composition is fine).`
-  );
-}
-function parseHotkey(spec, fallback2) {
-  const raw = (spec || fallback2).trim().toLowerCase();
-  const altPrefix = /^(?:alt|option|opt|⌥)\+?\s*/;
-  const withAlt = altPrefix.test(raw);
-  warnLegacyHotkey(spec, raw, withAlt);
-  const key = raw.replace(altPrefix, "");
-  const collidablePlainKey = !withAlt && /^[a-z0-9]$/.test(key);
-  return { key: key || fallback2, alt: withAlt || collidablePlainKey };
-}
-function hotkeyMatches(e, spec) {
-  const codeKey = e.code.startsWith("Key") ? e.code.slice(3).toLowerCase() : null;
-  const isLetterSpec = spec.key.length === 1 && spec.key >= "a" && spec.key <= "z";
-  const keyOk = isLetterSpec ? codeKey === spec.key : e.key.toLowerCase() === spec.key;
-  if (!keyOk) return false;
-  if (e.ctrlKey || e.metaKey) return false;
-  return e.altKey === spec.alt;
-}
-function AnnotaLayer({ storyId, title, name, hotkeys }) {
+function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
   const [apiOk, setApiOk] = useState(null);
   const [staticMode, setStaticMode] = useState(false);
   const [modeResolved, setModeResolved] = useState(false);
@@ -1458,7 +1761,47 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     };
   }, [composer]);
   const [activeThread, setActiveThread] = useState(null);
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [frozen, setFrozen] = useState(null);
+  const frozenRef = useRef(frozen);
+  frozenRef.current = frozen;
+  const frozenMountRef = useRef(null);
+  const inertedRef = useRef([]);
+  useEffect(() => {
+    const open = !!composer || !!activeThread;
+    if (open && inertedRef.current.length === 0) {
+      const overlays = Array.from(document.querySelectorAll("[data-annota-overlay]"));
+      const onPath = (el) => overlays.some((o) => o === el || el.contains(o));
+      const inerted = [];
+      const walk = (parent) => {
+        for (const child of Array.from(parent.children)) {
+          if (onPath(child)) {
+            if (child !== overlays[0]) walk(child);
+            continue;
+          }
+          if (!child.hasAttribute("inert")) {
+            child.setAttribute("inert", "");
+            inerted.push(child);
+          }
+        }
+      };
+      walk(document.body);
+      inertedRef.current = inerted;
+      requestAnimationFrame(() => {
+        const focusable = document.querySelector(".annota-root .annota-textarea, .annota-root .annota-input") ?? document.querySelector(".annota-root .annota-btn, .annota-root button");
+        focusable?.focus();
+      });
+    } else if (!open && inertedRef.current.length > 0) {
+      inertedRef.current.forEach((el) => el.removeAttribute("inert"));
+      inertedRef.current = [];
+    }
+  }, [composer, activeThread]);
+  useEffect(
+    () => () => {
+      inertedRef.current.forEach((el) => el.removeAttribute("inert"));
+      inertedRef.current = [];
+    },
+    []
+  );
   const [helpOpen, setHelpOpen] = useState(false);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -1485,6 +1828,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
   const hkLayer = useMemo(() => parseHotkey(hk.layer, DEFAULT_HOTKEYS.layer), [hk.layer]);
   const hkDrawer = useMemo(() => parseHotkey(hk.drawer, DEFAULT_HOTKEYS.drawer), [hk.drawer]);
   const hkHelp = useMemo(() => parseHotkey(hk.help, DEFAULT_HOTKEYS.help), [hk.help]);
+  const hkFreeze = useMemo(() => parseHotkey(hk.freeze, DEFAULT_HOTKEYS.freeze), [hk.freeze]);
   const modeRef = useRef(mode);
   modeRef.current = mode;
   const dragStart = useRef(null);
@@ -1493,6 +1837,45 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
   const retryTimer = useRef(null);
   const retryCount = useRef(0);
   const mountedRef = useRef(true);
+  const greyedGateRef = useRef(null);
+  if (!greyedGateRef.current) greyedGateRef.current = new GreyedGate();
+  const lastActRef = useRef(null);
+  const pDownRef = useRef(null);
+  const frozenVeilRef = useRef([]);
+  const liftFrozenVeil = useCallback(() => {
+    frozenVeilRef.current.forEach((el) => el.removeAttribute("inert"));
+    frozenVeilRef.current = [];
+  }, []);
+  const applyFrozenVeil = useCallback(() => {
+    liftFrozenVeil();
+    const overlays = Array.from(document.querySelectorAll("[data-annota-overlay]"));
+    const fm = frozenMountRef.current;
+    const onPath = (el) => overlays.some((o) => o === el || el.contains(o)) || fm != null && (el === fm.container || el.contains(fm.container));
+    const inerted = [];
+    const walk = (parent) => {
+      for (const child of Array.from(parent.children)) {
+        if (onPath(child)) {
+          if (!overlays.includes(child) && child !== fm?.container) walk(child);
+          continue;
+        }
+        if (!child.hasAttribute("inert")) {
+          child.setAttribute("inert", "");
+          inerted.push(child);
+        }
+      }
+    };
+    walk(document.body);
+    frozenVeilRef.current = inerted;
+  }, [liftFrozenVeil]);
+  const activeRoot = useCallback(() => frozenMountRef.current?.storyClone ?? storyRoot(), []);
+  const frozenCaptureRootFor = useCallback(
+    (el) => {
+      const fm = frozenMountRef.current;
+      if (fm && !el.closest("[data-annota-frozen-story]") && fm.container.contains(el)) return fm.container;
+      return activeRoot();
+    },
+    [activeRoot]
+  );
   useEffect(() => {
     injectOverlayCss();
   }, []);
@@ -1501,6 +1884,10 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     return () => {
       mountedRef.current = false;
       if (retryTimer.current) clearTimeout(retryTimer.current);
+      frozenMountRef.current?.teardown();
+      frozenMountRef.current = null;
+      liftFrozenVeil();
+      greyedGateRef.current?.invalidate();
       document.body.classList.remove("annota-cursor");
     };
   }, []);
@@ -1602,7 +1989,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
         list: (s) => Promise.resolve(store.list(s)),
         create: (input) => store.create(input),
         comment: (id, body, author) => store.addComment(id, body, author),
-        patch: (t) => store.patch(t),
+        patch: (t, who) => store.patch(t, { statusAuthor: who }),
         // static builds keep snapshots OFF: 5MB localStorage quota, and the
         // evidence URL (dev-server route) doesn't exist without the server.
         snapshot: async () => void 0
@@ -1623,14 +2010,17 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     };
   }, [staticMode, refresh]);
   const resolveAll = useCallback(() => {
-    const root = storyRoot();
+    const fm = frozenMountRef.current;
+    const primary = fm ? fm.storyClone : storyRoot();
+    const secondary = fm ? fm.container : null;
     const map = /* @__PURE__ */ new Map();
     for (const t of threads) {
       if (t.target.kind === "region") {
         map.set(t.id, { el: null, status: "resolved", strategy: "none" });
         continue;
       }
-      const r = resolveAnchor(t.target, root);
+      let r = resolveAnchor(t.target, primary);
+      if (r.status === "orphan" && secondary) r = resolveAnchor(t.target, secondary);
       map.set(t.id, { el: r.element, status: r.status, strategy: r.strategy });
     }
     setAnchors(map);
@@ -1653,7 +2043,10 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     const root = storyRoot();
     let timer;
     const obs = new MutationObserver((records) => {
-      if (records.length && records.every((r) => r.target.closest?.("[data-annota-overlay]"))) return;
+      if (records.length && records.every((r) => r.target.closest?.("[data-annota-overlay]"))) {
+        return;
+      }
+      greyedGateRef.current?.invalidate();
       clearTimeout(timer);
       timer = setTimeout(resolveAll, 350);
     });
@@ -1684,21 +2077,32 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
   }, [visible, emitLayerState]);
   const openCountMemo = threads.filter((t) => t.status === "open").length;
   const fixedCountMemo = threads.filter((t) => t.status === "fixed").length;
+  const rejectedCountMemo = threads.filter((t) => t.status === "rejected").length;
+  const anchorsResolved = anchors.size > 0 || threads.length === 0;
+  const orphanCountMemo = anchorsResolved ? threads.filter((t) => (anchors.get(t.id)?.status ?? "orphan") === "orphan").length : 0;
   useEffect(() => {
     const state = {
       apiOk,
       visible,
       mode,
-      drawerOpen,
       open: openCountMemo,
       fixed: fixedCountMemo,
-      total: threads.length
+      rejected: rejectedCountMemo,
+      orphan: orphanCountMemo,
+      total: threads.length,
+      frozen: !!frozen,
+      // v0.6.10 (S6-D3d/D7): the ACTIVE hotkey map rides UI_STATE so the
+      // manager-side bridge + tool titles render the real config (null while
+      // hotkeys === false — the bridge goes inert); frozenViewEnabled gates
+      // the manager's freeze button.
+      hotkeys: hotkeys === false ? null : hk,
+      frozenViewEnabled: frozenView
     };
     try {
       sbChannel().emit(UI_STATE, state);
     } catch {
     }
-  }, [apiOk, visible, mode, drawerOpen, openCountMemo, fixedCountMemo, threads.length]);
+  }, [apiOk, visible, mode, openCountMemo, fixedCountMemo, rejectedCountMemo, orphanCountMemo, threads.length, frozen, hk, hotkeys, frozenView, anchors]);
   const focusThread = useCallback(
     (threadId) => {
       setActiveThread(threadId);
@@ -1713,6 +2117,103 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     },
     [anchors]
   );
+  const exitFrozenView = useCallback(() => {
+    frozenMountRef.current?.teardown();
+    frozenMountRef.current = null;
+    liftFrozenVeil();
+    greyedGateRef.current?.invalidate();
+    if (frozenRef.current) setFrozen(null);
+    resolveAll();
+  }, [resolveAll, liftFrozenVeil]);
+  const enterFreeze = useCallback(() => {
+    frozenMountRef.current = captureFrozenView(storyRoot());
+    applyFrozenVeil();
+    setFrozen({ kind: "freeze" });
+    resolveAll();
+  }, [resolveAll, applyFrozenVeil]);
+  const toggleFreeze = useCallback(() => {
+    if (frozenView === false) {
+      showHint("Frozen views are disabled for this story (parameters.annotakit.frozenView: false)");
+      return;
+    }
+    if (composer) {
+      showHint("Submit or cancel the open comment first (Esc)");
+      return;
+    }
+    if (activeThread) {
+      showHint("Close the open thread card first (Esc)");
+      return;
+    }
+    if (apiOk === false) {
+      showHint("AnnotaKit has no store \u2014 run `storybook dev`, or bake the static build (see the Annotakit panel)");
+      return;
+    }
+    if (frozenMountRef.current) {
+      if (frozenRef.current?.kind === "freeze") {
+        exitFrozenView();
+        return;
+      }
+      frozenMountRef.current.teardown();
+      frozenMountRef.current = null;
+      setFrozen(null);
+    }
+    enterFreeze();
+  }, [composer, apiOk, showHint, exitFrozenView, enterFreeze, frozenView, activeThread]);
+  const recallThread = useCallback(
+    async (threadId) => {
+      if (composer) {
+        showHint("Submit or cancel the open comment first (Esc)");
+        return;
+      }
+      if (activeThread) {
+        showHint("Close the open thread card first (Esc)");
+        return;
+      }
+      if (frozenMountRef.current) {
+        frozenMountRef.current.teardown();
+        frozenMountRef.current = null;
+        liftFrozenVeil();
+      }
+      setFrozen(null);
+      let mounted = false;
+      try {
+        const snap = await getSnapshot(threadId);
+        if (!mountedRef.current) return;
+        if (!snap?.html || !snap.html.trim() || snap.clipped) throw new Error("snapshot missing or clipped");
+        frozenMountRef.current = mountRecalledView(snap, storyRoot());
+        applyFrozenVeil();
+        mounted = true;
+      } catch {
+        mounted = false;
+      }
+      try {
+        sbChannel().emit(THREAD_RECALLED, threadId);
+      } catch {
+      }
+      if (!mounted) {
+        showHint("No recoverable snapshot for this thread \u2014 flashing the pin on the live view");
+        focusThread(threadId);
+        return;
+      }
+      setFrozen({ kind: "recall", threadId });
+      setVisible(true);
+      setActiveThread(threadId);
+      resolveAll();
+    },
+    [showHint, focusThread, resolveAll, composer, activeThread, liftFrozenVeil, applyFrozenVeil]
+  );
+  useEffect(() => {
+    if (!frozen || frozen.kind !== "recall" || !frozen.threadId) return;
+    const id = frozen.threadId;
+    const raf = requestAnimationFrame(() => {
+      const el = anchors.get(id)?.el;
+      if (!el || !el.closest("[data-annota-frozen]")) return;
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+      el.setAttribute("data-annota-flash", "1");
+      window.setTimeout(() => el.removeAttribute("data-annota-flash"), 3400);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [frozen, anchors]);
   const enterMode = useCallback((m) => {
     setMode(m);
     setComposer(null);
@@ -1740,7 +2241,11 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       if (!cmd?.command) return;
       if (cmd.command === "pin" || cmd.command === "region") {
         if (apiOk === false) {
-          showHint("AnnotaKit is offline \u2014 pinning is unavailable (see the badge)");
+          showHint("AnnotaKit has no store \u2014 run `storybook dev`, or bake the static build (see the Annotakit panel)");
+          return;
+        }
+        if (frozenRef.current?.kind === "recall") {
+          showHint("This is the recalled past \u2014 Esc to return to the live view");
           return;
         }
         if (!composer) {
@@ -1749,50 +2254,95 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
         } else {
           showHint("Submit or cancel the open comment first (Esc)");
         }
-      } else if (cmd.command === "drawer") {
-        setDrawerOpen((d) => !d);
       } else if (cmd.command === "layer") {
         setVisible((v) => !v);
       } else if (cmd.command === "help") {
         setHelpOpen((h) => !h);
+      } else if (cmd.command === "freeze") {
+        toggleFreeze();
       }
+    };
+    const onRecall = (threadId) => {
+      if (typeof threadId === "string" && threadId) void recallThread(threadId);
     };
     ch.on(FOCUS_THREAD, onFocus);
     ch.on(TOGGLE_LAYER, onToggle);
     ch.on(UI_COMMAND, onCommand);
+    ch.on(RECALL_THREAD, onRecall);
     return () => {
       ch.removeListener(FOCUS_THREAD, onFocus);
       ch.removeListener(TOGGLE_LAYER, onToggle);
       ch.removeListener(UI_COMMAND, onCommand);
+      ch.removeListener(RECALL_THREAD, onRecall);
     };
   };
-  useEffect(channelEffect, [focusThread, visible, composer, mode, enterMode, apiOk]);
+  useEffect(channelEffect, [focusThread, visible, composer, mode, enterMode, apiOk, toggleFreeze, recallThread]);
   useEffect(() => {
     if (mode === "idle") return void 0;
-    const skipOverlay = (el) => {
-      if (!el) return null;
-      if (el.closest("[data-annota-overlay]")) return null;
-      return el;
+    const hitScope = () => frozenMountRef.current?.container ?? storyRoot();
+    const gate = greyedGateRef.current;
+    let lastRaw = null;
+    let lastFullAt = 0;
+    const actOnHit = (x, y, el) => {
+      const target = el ?? hitTest(x, y, hitScope(), gate);
+      if (!target) return;
+      const root = frozenCaptureRootFor(target);
+      const anchor = captureAnchor(target, root);
+      setComposer({
+        x,
+        y,
+        target: { kind: "pin", ...anchor },
+        element: target
+      });
+      exitMode();
     };
     const onClick = (e) => {
       if (mode !== "pin") return;
       e.preventDefault();
       e.stopPropagation();
-      const el = skipOverlay(document.elementFromPoint(e.clientX, e.clientY));
-      if (!el) return;
-      const root = storyRoot();
-      const anchor = captureAnchor(el, root);
-      setComposer({
-        x: e.clientX,
-        y: e.clientY,
-        target: { kind: "pin", ...anchor },
-        element: el
-      });
-      exitMode();
+      const la = lastActRef.current;
+      if (la && Math.abs(e.clientX - la.x) < 8 && Math.abs(e.clientY - la.y) < 8 && Date.now() - la.t < 50) return;
+      actOnHit(e.clientX, e.clientY);
+    };
+    const onPointerDown = (e) => {
+      pDownRef.current = { x: e.clientX, y: e.clientY, t: Date.now(), pointerId: e.pointerId };
+      if (mode !== "region") return;
+      if (e.button !== 0) return;
+      if (e.target?.closest?.("[data-annota-overlay]")) return;
+      e.preventDefault();
+      if (!dragStart.current) dragStart.current = { x: e.clientX, y: e.clientY };
+    };
+    const onPointerUp = (e) => {
+      if (mode === "region" && dragStart.current) {
+        if (e.button !== 0) return;
+        completeRegion(e.clientX, e.clientY);
+        return;
+      }
+      if (mode !== "pin") return;
+      const d = pDownRef.current;
+      pDownRef.current = null;
+      if (!d || e.pointerId !== d.pointerId || e.button !== 0) return;
+      const dist = Math.hypot(e.clientX - d.x, e.clientY - d.y);
+      if (dist > 10 || Date.now() - d.t > 1e3) return;
+      const el = hitTest(e.clientX, e.clientY, hitScope(), gate);
+      if (!el || !el.matches(":disabled")) return;
+      lastActRef.current = { x: e.clientX, y: e.clientY, t: Date.now() };
+      actOnHit(e.clientX, e.clientY, el);
+    };
+    const onPointerCancel = () => {
+      pDownRef.current = null;
+      if (mode === "region" && dragStart.current) {
+        dragStart.current = null;
+        setDragRect(null);
+      }
     };
     const onMove = (e) => {
       if (mode === "pin") {
-        const el = skipOverlay(document.elementFromPoint(e.clientX, e.clientY));
+        const raw = document.elementFromPoint(e.clientX, e.clientY);
+        if (raw === lastRaw && performance.now() - lastFullAt < 120) return;
+        lastRaw = raw;
+        lastFullAt = performance.now();
+        const el = hitTest(e.clientX, e.clientY, hitScope(), gate);
         if (el) {
           const r = el.getBoundingClientRect();
           setHoverBox({ x: r.left, y: r.top, w: r.width, h: r.height });
@@ -1808,17 +2358,16 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       if (mode !== "region") return;
       if (e.target?.closest?.("[data-annota-overlay]")) return;
       e.preventDefault();
-      dragStart.current = { x: e.clientX, y: e.clientY };
+      if (!dragStart.current) dragStart.current = { x: e.clientX, y: e.clientY };
     };
-    const onUp = (e) => {
-      if (mode !== "region" || !dragStart.current) return;
+    const completeRegion = (x, y) => {
       const s = dragStart.current;
-      const rect = { x: Math.min(s.x, e.clientX), y: Math.min(s.y, e.clientY), w: Math.abs(e.clientX - s.x), h: Math.abs(e.clientY - s.y) };
+      if (!s) return;
+      const rect = { x: Math.min(s.x, x), y: Math.min(s.y, y), w: Math.abs(x - s.x), h: Math.abs(y - s.y) };
       dragStart.current = null;
       setDragRect(null);
       if (rect.w < 8 || rect.h < 8) return;
-      const root = storyRoot();
-      const rootRect = root.getBoundingClientRect();
+      const rootRect = activeRoot().getBoundingClientRect();
       const target = {
         kind: "region",
         selector: { fragment: { x: Math.round(rect.x - rootRect.left), y: Math.round(rect.y - rootRect.top), w: Math.round(rect.w), h: Math.round(rect.h) } },
@@ -1829,17 +2378,27 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       setComposer({ x: rect.x + rect.w / 2, y: rect.y + 8, target, element: null });
       exitMode();
     };
+    const onUp = (e) => {
+      if (mode !== "region" || !dragStart.current) return;
+      completeRegion(e.clientX, e.clientY);
+    };
     document.addEventListener("click", onClick, { capture: true });
+    document.addEventListener("pointerdown", onPointerDown, { capture: true });
+    document.addEventListener("pointerup", onPointerUp, { capture: true });
+    document.addEventListener("pointercancel", onPointerCancel, { capture: true });
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mousedown", onDown, { capture: true });
     document.addEventListener("mouseup", onUp);
     return () => {
       document.removeEventListener("click", onClick, { capture: true });
+      document.removeEventListener("pointerdown", onPointerDown, { capture: true });
+      document.removeEventListener("pointerup", onPointerUp, { capture: true });
+      document.removeEventListener("pointercancel", onPointerCancel, { capture: true });
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mousedown", onDown, { capture: true });
       document.removeEventListener("mouseup", onUp);
     };
-  }, [mode, exitMode]);
+  }, [mode, exitMode, frozenCaptureRootFor, activeRoot]);
   useEffect(() => {
     const onKey = (e) => {
       if (isTypingTarget(e.target)) {
@@ -1856,16 +2415,11 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
               return;
             }
             setComposer(null);
-          }
+          } else if (frozen) exitFrozenView();
         }
         return;
       }
-      const altOf = (spec) => hotkeyMatches(e, spec) || // legacy plain-key configs still respond to alt+same-key (e.code match —
-      // macOS Option composes characters, e.key would be "ç")
-      (() => {
-        const codeKey = e.code.startsWith("Key") ? e.code.slice(3).toLowerCase() : null;
-        return !!e.altKey && !spec.alt && codeKey === spec.key;
-      })();
+      const altOf = (spec) => altMatches(e, spec);
       if (hotkeyMatches(e, hkHelp)) {
         setHelpOpen((h) => !h);
         return;
@@ -1880,37 +2434,48 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
           }
           setComposer(null);
         } else if (activeThread) setActiveThread(null);
-        else if (drawerOpen) setDrawerOpen(false);
+        else if (frozen) exitFrozenView();
         else if (helpOpen) setHelpOpen(false);
         return;
       }
       if (altOf(hkPin)) {
-        if (apiOk === false) showHint("AnnotaKit is offline \u2014 pinning is unavailable (see the badge)");
+        if (apiOk === false) showHint("AnnotaKit has no store \u2014 run `storybook dev`, or bake the static build (see the Annotakit panel)");
+        else if (frozenRef.current?.kind === "recall") showHint("This is the recalled past \u2014 Esc to return to the live view");
         else if (!composer) enterMode(mode === "pin" ? "idle" : "pin");
         else showHint("Submit or cancel the open comment first (Esc)");
       } else if (altOf(hkRegion)) {
-        if (apiOk === false) showHint("AnnotaKit is offline \u2014 pinning is unavailable (see the badge)");
+        if (apiOk === false) showHint("AnnotaKit has no store \u2014 run `storybook dev`, or bake the static build (see the Annotakit panel)");
+        else if (frozenRef.current?.kind === "recall") showHint("This is the recalled past \u2014 Esc to return to the live view");
         else if (!composer) enterMode(mode === "region" ? "idle" : "region");
         else showHint("Submit or cancel the open comment first (Esc)");
       } else if (altOf(hkLayer)) {
         setVisible((v) => !v);
       } else if (altOf(hkDrawer)) {
-        setDrawerOpen((d) => !d);
+        if (!e.repeat) {
+          try {
+            sbChannel().emit(TOGGLE_THREADS_PANEL);
+          } catch {
+          }
+        }
+      } else if (altOf(hkFreeze)) {
+        toggleFreeze();
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [mode, composer, activeThread, drawerOpen, helpOpen, enterMode, exitMode, hkPin, hkRegion, hkLayer, hkDrawer, hkHelp, hotkeys, apiOk, showHint]);
+  }, [mode, composer, activeThread, helpOpen, frozen, enterMode, exitMode, exitFrozenView, toggleFreeze, hkPin, hkRegion, hkLayer, hkDrawer, hkHelp, hkFreeze, hotkeys, apiOk, showHint]);
   const submitThread = useCallback(
     async (body) => {
       if (!composer) return;
       setBusy(true);
       try {
-        const snap = staticMode ? null : captureSnapshot(
+        const fm = frozenMountRef.current;
+        const frozenPin = !!fm && frozenRef.current?.kind === "freeze";
+        const snap = staticMode ? null : frozenPin && fm ? captureFrozenSnapshot(fm, composer.target.kind === "pin" ? composer.element ?? null : null) : captureSnapshot(
           storyRoot(),
           composer.target.kind === "pin" ? composer.element ?? null : null
         );
-        const raw = composer.target.kind === "pin" && composer.element ? inspectComponent(composer.element) : null;
+        const raw = !frozenPin && composer.target.kind === "pin" && composer.element ? inspectComponent(composer.element) : null;
         const component = raw?.source ? await correctComponent(raw) : raw;
         const story = await buildStoryRef(storyId, { title, name });
         const comment = { id: uid("c"), author: getAuthor(), body, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
@@ -1919,7 +2484,8 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
           story,
           component,
           target: composer.target,
-          comments: [comment]
+          comments: [comment],
+          ...frozenPin ? { transient: true } : {}
         });
         setComposer(null);
         setThreads((prev) => [created, ...prev.filter((t) => t.id !== created.id)]);
@@ -1960,7 +2526,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
           status,
           resolvedAt: status === "resolved" ? thread.resolvedAt ?? (/* @__PURE__ */ new Date()).toISOString() : void 0
         };
-        const updated = await dataRef.current.patch(next);
+        const updated = await dataRef.current.patch(next, getAuthor());
         setThreads((prev) => prev.map((t) => t.id === updated.id ? updated : t));
         void refresh();
       } catch (e) {
@@ -1975,11 +2541,13 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     void tick;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
+    const soloId = frozen?.kind === "recall" ? frozen.threadId ?? null : null;
     const out = [];
     for (const t of threads) {
+      if (soloId && t.id !== soloId) continue;
       const pin = anchors.get(t.id) ?? { el: null, status: "orphan", strategy: "none" };
       if (t.target.kind === "region") {
-        const rootRect = storyRoot().getBoundingClientRect();
+        const rootRect = activeRoot().getBoundingClientRect();
         const f = t.target.selector.fragment ?? t.target.bbox;
         out.push({
           thread: t,
@@ -1992,7 +2560,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
         const r = pin.el.getBoundingClientRect();
         out.push({ thread: t, fixed: { x: r.left, y: r.top, w: r.width, h: r.height }, status: pin.status });
       } else {
-        const rootRect = storyRoot().getBoundingClientRect();
+        const rootRect = activeRoot().getBoundingClientRect();
         const f = t.target.selector.fragment ?? t.target.bbox;
         out.push({ thread: t, fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h }, status: "orphan" });
       }
@@ -2000,17 +2568,17 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
     void vw;
     void vh;
     return out;
-  }, [threads, anchors, tick]);
+  }, [threads, anchors, tick, frozen]);
   if (apiOk === false) {
-    return /* @__PURE__ */ React.createElement("div", { "data-annota-overlay": "1", className: "annota-root" }, /* @__PURE__ */ React.createElement("div", { className: "annota-badge", title: "Annotakit requires `storybook dev` (the review API lives on the dev server) \u2014 pin buttons live in the Storybook toolbar" }, "\u{1F4CC} Annotakit \u2014 dev only"));
+    return null;
   }
   const activeT = threads.find((t) => t.id === activeThread) ?? null;
-  return /* @__PURE__ */ React.createElement("div", { "data-annota-overlay": "1", className: "annota-root" }, visible && pinViews.map(
+  return /* @__PURE__ */ React.createElement("div", { "data-annota-overlay": "1", className: "annota-root" }, frozen && /* @__PURE__ */ React.createElement("div", { className: "annota-frozen-pill", role: "status" }, frozen.kind === "freeze" ? "\u2744 frozen \u2014 \u2325C to pin what you see \xB7 Esc to thaw" : `\u2744 recalling #${threads.find((t) => t.id === frozen.threadId)?.number ?? "?"} \u2014 read-only \xB7 Esc to return`), visible && pinViews.map(
     ({ thread, fixed, status }) => thread.target.kind === "region" ? /* @__PURE__ */ React.createElement(
       "div",
       {
         key: thread.id,
-        className: `annota-region${thread.status === "resolved" ? " is-resolved" : ""}${thread.status === "fixed" ? " is-fixed" : ""}${thread.id === activeThread ? " is-active" : ""}`,
+        className: `annota-region${thread.status === "resolved" ? " is-resolved" : ""}${thread.status === "fixed" ? " is-fixed" : ""}${thread.status === "rejected" ? " is-rejected" : ""}${thread.id === activeThread ? " is-active" : ""}`,
         style: { left: clamp(fixed.x, 0, Math.max(window.innerWidth - fixed.w, 0)), top: clamp(fixed.y, 0, Math.max(window.innerHeight - fixed.h, 0)), width: fixed.w, height: fixed.h },
         onClick: () => setActiveThread(thread.id),
         title: `#${thread.number}`
@@ -2024,6 +2592,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
           "annota-pin",
           thread.status === "resolved" ? "is-resolved" : "",
           thread.status === "fixed" ? "is-fixed" : "",
+          thread.status === "rejected" ? "is-rejected" : "",
           status === "orphan" ? "is-orphan" : "",
           thread.id === activeThread ? "is-active" : ""
         ].filter(Boolean).join(" "),
@@ -2041,7 +2610,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
         tabIndex: 0,
         role: "button",
         "aria-label": `Open thread #${thread.number} (${thread.status})`,
-        title: `#${thread.number} \u2014 Enter/Space opens${status === "orphan" ? " (orphaned \u2014 element not found)" : ""}`
+        title: `#${thread.number} \u2014 Enter/Space opens${status === "orphan" ? " (orphaned \u2014 element not found)" : ""}${thread.transient ? " \xB7 frozen capture" : ""}`
       },
       thread.number
     )
@@ -2058,12 +2627,14 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
   )), hoverBox && /* @__PURE__ */ React.createElement("div", { className: "annota-hover-box", style: { left: hoverBox.x, top: hoverBox.y, width: hoverBox.w, height: hoverBox.h } }), dragRect && /* @__PURE__ */ React.createElement("div", { className: "annota-drag-rect", style: { left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h } }), error && !composer && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, error, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: () => setError(null) }, "\u2715")), composer && /* @__PURE__ */ React.createElement(
     ComposerCard,
     {
+      storageWarning: staticMode && storageError ? storageError : null,
       x: composer.x,
       y: composer.y,
       busy,
       error,
       component: composerMeta,
       context: composer.target.context,
+      frozenView: frozen?.kind === "freeze" && !!frozenMountRef.current,
       onSubmit: submitThread,
       onCancel: () => setComposer(null),
       onDraftChange: (b) => {
@@ -2082,19 +2653,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys }) {
       onSetStatus: setStatus,
       onClose: () => setActiveThread(null)
     }
-  ), drawerOpen && !composer && /* @__PURE__ */ React.createElement(
-    DrawerCard,
-    {
-      threads,
-      anchors,
-      activeThread,
-      busy,
-      hotkeys: hk,
-      onSelect: (id) => focusThread(id),
-      onSetStatus: setStatus,
-      onClose: () => setDrawerOpen(false)
-    }
-  ), helpOpen && /* @__PURE__ */ React.createElement(HelpCard, { hotkeys: hk, onClose: () => setHelpOpen(false) }));
+  ), helpOpen && /* @__PURE__ */ React.createElement(HelpCard, { hotkeys: hk, frozenView, onClose: () => setHelpOpen(false) }));
 }
 function useClampedPosition(x, y) {
   const ref = useRef(null);
@@ -2129,7 +2688,7 @@ function ComposerCard(props) {
   const [discardArmed, setDiscardArmed] = React.useState(false);
   const { ref, style } = useClampedPosition(props.x, props.y);
   const summary = elementSummary(props.context);
-  return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card annota-composer", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "New comment"), /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-meta" }, "<", props.context.tag, ">")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, /* @__PURE__ */ React.createElement("div", { className: "annota-element-summary", title: props.context.outerHTML }, /* @__PURE__ */ React.createElement("b", null, "element:"), " ", summary), props.component && prettyName(props.component.name) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "component:"), " ", prettyName(props.component.name), props.component.key != null && /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-meta" }, 'key="', props.component.key, '"')), props.component?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", props.component.source.file, props.component.source.line ? `:${props.component.source.line}` : "")), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), discardArmed && body.trim() && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info", role: "status" }, "Press Esc again to discard this comment."), /* @__PURE__ */ React.createElement("div", { style: { padding: "10px 12px" } }, /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card annota-composer", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "New comment"), /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-meta" }, "<", props.context.tag, ">")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, /* @__PURE__ */ React.createElement("div", { className: "annota-element-summary", title: props.context.outerHTML }, /* @__PURE__ */ React.createElement("b", null, "element:"), " ", summary), props.component && prettyName(props.component.name) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "component:"), " ", prettyName(props.component.name), props.component.key != null && /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-meta" }, 'key="', props.component.key, '"')), props.component?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", props.component.source.file, props.component.source.line ? `:${props.component.source.line}` : ""), props.frozenView && !props.component && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "view:"), " \u2744 frozen capture (static \u2014 no live component data)")), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), props.storageWarning && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error", role: "alert" }, props.storageWarning), discardArmed && body.trim() && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info", role: "status" }, "Press Esc again to discard this comment."), /* @__PURE__ */ React.createElement("div", { style: { padding: "10px 12px" } }, /* @__PURE__ */ React.createElement(
     "textarea",
     {
       className: "annota-textarea",
@@ -2165,7 +2724,7 @@ function ThreadCard(props) {
   const near = props.pin?.fixed;
   const { ref, style } = useClampedPosition(near ? near.x + (near.x > window.innerWidth / 2 ? -120 : 120) : 40, near ? near.y : 60);
   const comp = t.component;
-  return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "#", t.number, " ", t.status === "open" ? "" : t.status === "fixed" ? "(fixed \u2014 awaiting your review)" : "(resolved)"), t.gh?.url && /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "#", t.number, " ", t.status === "open" ? "" : t.status === "fixed" ? "(fixed \u2014 awaiting your review)" : t.status === "rejected" ? "(rejected \u2014 re-work expected)" : "(resolved)"), t.gh?.url && /* @__PURE__ */ React.createElement(
     "a",
     {
       className: "annota-chip is-gh",
@@ -2176,7 +2735,14 @@ function ThreadCard(props) {
     },
     "\u2934 #",
     t.gh.issue
-  ), comp?.name && prettyName(comp.name) && /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-component" }, prettyName(comp.name)), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, t.story.importPath && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "story:"), " ", t.story.title, "/", t.story.name, " \u2014 ", t.story.importPath), comp?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", comp.source.file, comp.source.line ? `:${comp.source.line}` : ""), comp && comp.chain?.length > 1 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "chain:"), " ", comp.chain.slice(0, 5).filter((n) => Boolean(prettyName(n))).join(" > ")), t.target.selector.cssSelector && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "selector:"), " ", t.target.selector.cssSelector)), t.comments.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.id, className: "annota-comment" }, /* @__PURE__ */ React.createElement("div", { className: "annota-comment-head" }, /* @__PURE__ */ React.createElement("b", null, c.author, c.source === "github" ? " \xB7 from GitHub" : ""), /* @__PURE__ */ React.createElement("span", null, c.createdAt.slice(0, 16).replace("T", " "))), /* @__PURE__ */ React.createElement("p", null, c.body))), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), /* @__PURE__ */ React.createElement("div", { className: "annota-reply-row" }, /* @__PURE__ */ React.createElement(
+  ), comp?.name && prettyName(comp.name) && /* @__PURE__ */ React.createElement("span", { className: "annota-chip is-component" }, prettyName(comp.name)), t.transient && /* @__PURE__ */ React.createElement(
+    "span",
+    {
+      className: "annota-chip is-meta",
+      title: "Pinned inside a frozen view \u2014 the stored snapshot is the exact state; use the panel's view action to recall it"
+    },
+    "\u2744 frozen"
+  ), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, t.story.importPath && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "story:"), " ", t.story.title, "/", t.story.name, " \u2014 ", t.story.importPath), comp?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", comp.source.file, comp.source.line ? `:${comp.source.line}` : ""), comp && comp.chain?.length > 1 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "chain:"), " ", comp.chain.slice(0, 5).filter((n) => Boolean(prettyName(n))).join(" > ")), t.target.selector.cssSelector && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "selector:"), " ", t.target.selector.cssSelector)), t.comments.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.id, className: "annota-comment" }, /* @__PURE__ */ React.createElement("div", { className: "annota-comment-head" }, /* @__PURE__ */ React.createElement("b", null, c.author, c.source === "github" ? " \xB7 from GitHub" : ""), /* @__PURE__ */ React.createElement("span", null, c.createdAt.slice(0, 16).replace("T", " "))), /* @__PURE__ */ React.createElement("p", null, c.body))), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), /* @__PURE__ */ React.createElement("div", { className: "annota-reply-row" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       className: "annota-input",
@@ -2192,89 +2758,7 @@ function ThreadCard(props) {
         }
       }
     }
-  ), t.status === "open" && /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Resolve (reviewer-confirmed)" }, "Resolve"), t.status === "fixed" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Confirm the fix \u2014 the agent addressed this, you verified it" }, "\u2713 Confirm"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "open"), title: "Reject \u2014 back to open (reply with why)" }, "Reject")), t.status === "resolved" && /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "open") }, "Reopen")));
-}
-function DrawerCard(props) {
-  const [filter, setFilter] = useState("all");
-  const shown = props.threads.filter(
-    (t) => filter === "all" ? true : filter === "open" ? t.status === "open" : t.status === "fixed"
-  );
-  const openCount = props.threads.filter((t) => t.status === "open").length;
-  const fixedCount = props.threads.filter((t) => t.status === "fixed").length;
-  const filterBtn = (key, label, title) => /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      className: `annota-btn is-small${filter === key ? " is-primary" : ""}`,
-      onClick: () => setFilter(key),
-      title
-    },
-    label
-  );
-  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-drawer" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow", title: "Press ? for all keyboard shortcuts" }, "Threads \u2014 this story (", openCount, " open", fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : "", ")"), filterBtn("open", "open", "Show only open threads (agent work queue)"), filterBtn("review", "to review", "Show threads the agent marked fixed \u2014 awaiting your verification"), filterBtn("all", "all", "Show all threads"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), props.threads.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info" }, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, props.hotkeys.pin.toUpperCase()), " and click an element (or", " ", /* @__PURE__ */ React.createElement("b", null, props.hotkeys.region.toUpperCase()), " to drag a region)."), props.threads.length > 0 && shown.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-info" }, filter === "open" ? "Nothing open \u2014 everything is fixed or resolved." : filter === "review" ? "Nothing awaiting review \u2014 no agent fixes pending." : "All threads resolved \u{1F389}."), shown.map((t) => {
-    const status = props.anchors.get(t.id)?.status ?? "orphan";
-    return /* @__PURE__ */ React.createElement(
-      "div",
-      {
-        key: t.id,
-        className: `annota-thread-row${t.id === props.activeThread ? " is-active" : ""}${t.status === "resolved" ? " is-resolved" : ""}${t.status === "fixed" ? " is-fixed" : ""}`,
-        onClick: () => props.onSelect(t.id)
-      },
-      /* @__PURE__ */ React.createElement("div", { className: "annota-thread-title" }, /* @__PURE__ */ React.createElement(
-        "span",
-        {
-          className: `annota-dot${t.status === "resolved" ? " is-resolved" : t.status === "fixed" ? " is-fixed" : status === "orphan" ? " is-orphan" : ""}`
-        }
-      ), "#", t.number, " ", t.comments[0]?.body?.split("\n")[0]?.slice(0, 60) ?? "(no text)"),
-      /* @__PURE__ */ React.createElement("div", { className: "annota-thread-sub" }, t.component?.name ? `${t.component.name} \xB7 ` : "", t.comments.length - 1 > 0 ? `${t.comments.length - 1} replies \xB7 ` : "", t.author, " \xB7 ", t.createdAt.slice(0, 10)),
-      /* @__PURE__ */ React.createElement("div", { style: { marginTop: 4 } }, t.status === "open" && /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          className: "annota-btn is-small is-ok",
-          disabled: props.busy,
-          onClick: (e) => {
-            e.stopPropagation();
-            props.onSetStatus(t, "resolved");
-          }
-        },
-        "Resolve"
-      ), t.status === "fixed" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          className: "annota-btn is-small is-ok",
-          disabled: props.busy,
-          title: "Confirm the fix \u2014 you verified it",
-          onClick: (e) => {
-            e.stopPropagation();
-            props.onSetStatus(t, "resolved");
-          }
-        },
-        "\u2713 Confirm"
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          className: "annota-btn is-small is-danger",
-          disabled: props.busy,
-          title: "Reject \u2014 back to open (reply with why)",
-          onClick: (e) => {
-            e.stopPropagation();
-            props.onSetStatus(t, "open");
-          }
-        },
-        "Reject"
-      )), t.status === "resolved" && /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          className: "annota-btn is-small is-danger",
-          disabled: props.busy,
-          onClick: (e) => {
-            e.stopPropagation();
-            props.onSetStatus(t, "open");
-          }
-        },
-        "Reopen"
-      ))
-    );
-  }));
+  ), t.status === "open" && /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Resolve (reviewer-confirmed)" }, "Resolve"), t.status === "fixed" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Confirm the fix \u2014 the agent addressed this, you verified it" }, "\u2713 Confirm"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "rejected"), title: "Reject \u2014 the fix is not accepted (reply with why); the thread stays marked rejected until re-addressed" }, "Reject")), t.status === "rejected" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Confirm after all \u2014 you re-verified and accept the fix" }, "\u2713 Confirm"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "open"), title: "Clear the rejection \u2014 back to plain open (the verdict is erased)" }, "\u21A9 Clear")), t.status === "resolved" && /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "open") }, "Reopen")));
 }
 function HelpCard(props) {
   const k = (spec) => {
@@ -2282,7 +2766,7 @@ function HelpCard(props) {
     const key = s.key === "?" ? "?" : s.key.toUpperCase();
     return s.alt ? `\u2325${key}` : key;
   };
-  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-help" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "Annotakit shortcuts"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("table", null, /* @__PURE__ */ React.createElement("tbody", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.pin))), /* @__PURE__ */ React.createElement("td", null, "pin an element (click it)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.region))), /* @__PURE__ */ React.createElement("td", null, "mark a region (drag)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.layer))), /* @__PURE__ */ React.createElement("td", null, "show / hide pins")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.drawer))), /* @__PURE__ */ React.createElement("td", null, "threads drawer")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, "Esc")), /* @__PURE__ */ React.createElement("td", null, "cancel / close")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, "\u2318/Ctrl+\u21B5")), /* @__PURE__ */ React.createElement("td", null, "submit comment")))), /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px", fontSize: 11, color: "#64748b" } }, "Shortcuts are ", /* @__PURE__ */ React.createElement("b", null, "Alt/\u2325-prefixed"), " (SB convention \u2014 plain single letters belong to story key handlers). Legacy plain-key configs still respond with \u2325 held. Customize via ", /* @__PURE__ */ React.createElement("code", null, "parameters.annotakit.hotkeys"), " in the story file. Toolbar buttons (native SB toolbar) trigger the same actions. Threads persist in the Storybook dev server's embedded store \u2014 export from the Annotakit panel (bottom dock)."));
+  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-help" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "Annotakit shortcuts"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("table", null, /* @__PURE__ */ React.createElement("tbody", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.pin))), /* @__PURE__ */ React.createElement("td", null, "pin an element (click it)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.region))), /* @__PURE__ */ React.createElement("td", null, "mark a region (drag)")), props.frozenView !== false && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.freeze))), /* @__PURE__ */ React.createElement("td", null, "freeze / thaw the current view \u2014 works without moving the mouse (catches hover-driven UI)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.layer))), /* @__PURE__ */ React.createElement("td", null, "show / hide pins")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.drawer))), /* @__PURE__ */ React.createElement("td", null, "open the threads panel (bottom dock \u2014 SB docks it left/right too)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, "Esc")), /* @__PURE__ */ React.createElement("td", null, "cancel / close")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, "\u2318/Ctrl+\u21B5")), /* @__PURE__ */ React.createElement("td", null, "submit comment")))), /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px", fontSize: 11, color: "#64748b" } }, "Shortcuts are ", /* @__PURE__ */ React.createElement("b", null, "Alt/\u2325-prefixed"), " (SB convention \u2014 plain single letters belong to story key handlers). Legacy plain-key configs still respond with \u2325 held. Customize via ", /* @__PURE__ */ React.createElement("code", null, "parameters.annotakit.hotkeys"), " in the story file. Toolbar buttons (native SB toolbar) trigger the same actions. Threads persist in the Storybook dev server's embedded store \u2014 export from the Annotakit panel (bottom dock)."));
 }
 
 // src/preview/index.ts
@@ -2300,7 +2784,8 @@ var decorators = [
         storyId,
         title: context?.title,
         name: context?.name,
-        hotkeys: params?.hotkeys
+        hotkeys: params?.hotkeys,
+        frozenView: params?.frozenView !== false
       })
     );
   }

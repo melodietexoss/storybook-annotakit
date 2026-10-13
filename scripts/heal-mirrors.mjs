@@ -185,6 +185,9 @@ function devIssueBody(t) {
         counts: {
           open: t.status === 'open' ? 1 : 0,
           fixed: t.status === 'fixed' ? 1 : 0,
+          // S7-AUDIT-B2: four-way parity with ghsync.ts issueBody — a rejected
+          // thread's healed mirror must not claim "0 rejected (re-work)"
+          rejected: t.status === 'rejected' ? 1 : 0,
           resolved: t.status === 'resolved' ? 1 : 0,
         },
         threads: [t],

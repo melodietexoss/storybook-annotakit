@@ -31,8 +31,9 @@ export const OVERLAY_CSS = `
  *        none (toast: none on the container, auto on its dismiss button),
  *        so they can neither hide nor swallow a pin
  *   20 = pins + regions — ALWAYS on top of passive chrome
- *   30 = deliberate interactive surfaces (composer card, drawer, help) —
- *        invoked contexts, allowed above pins while open */
+ *   30 = deliberate interactive surfaces (composer card, thread card,
+ *        help, the frozen pill) — invoked contexts, allowed above pins
+ *        while open */
 
 /* ---------- pin markers ---------- */
 .annota-pin {
@@ -58,6 +59,9 @@ export const OVERLAY_CSS = `
 .annota-pin:hover { transform: scale(1.15); }
 .annota-pin.is-resolved { background: #94a3b8; }
 .annota-pin.is-fixed { background: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.25); }
+/* v0.6.11 (S7-A): rejected = the fix was NOT accepted — red, distinct from
+ * open (amber default) and fixed (blue). */
+.annota-pin.is-rejected { background: #dc2626; box-shadow: 0 0 0 3px rgba(220,38,38,.25); }
 .annota-pin.is-orphan { background: #fff; color: #94a3b8; border-style: dashed; }
 .annota-pin.is-active { outline: 2px solid var(--annota-accent); outline-offset: 2px; }
 
@@ -73,6 +77,7 @@ export const OVERLAY_CSS = `
 }
 .annota-region.is-resolved { border-color: #94a3b8; background: rgba(148,163,184,.06); }
 .annota-region.is-fixed { border-color: #2563eb; background: rgba(37,99,235,.08); }
+.annota-region.is-rejected { border-color: #dc2626; background: rgba(220,38,38,.08); }
 .annota-region .annota-region-tag {
   position: absolute;
   top: -20px;
@@ -86,6 +91,7 @@ export const OVERLAY_CSS = `
 }
 .annota-region.is-resolved .annota-region-tag { background: #94a3b8; }
 .annota-region.is-fixed .annota-region-tag { background: #2563eb; }
+.annota-region.is-rejected .annota-region-tag { background: #dc2626; }
 
 /* ---------- capture mode ---------- */
 .annota-capture-hint {
@@ -102,6 +108,30 @@ export const OVERLAY_CSS = `
   font-weight: 600;
   pointer-events: none;
   box-shadow: 0 4px 14px rgba(0,0,0,.3);
+}
+
+/* v0.6.9 (S3/S5): frozen/recall state pill — z 30 informational surface.
+   Never blocks (pointer-events: none) and stays a PILL, not a banner (the
+   canvas stays overlay-free by user directive). */
+.annota-frozen-pill {
+  position: fixed;
+  z-index: 30;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #0c4a6e;
+  color: #e0f2fe;
+  border: 1px solid #38bdf8;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+  box-shadow: 0 4px 14px rgba(0,0,0,.3);
+  max-width: min(92vw, 640px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .annota-hover-box {
   position: fixed;
@@ -123,7 +153,7 @@ body.annota-cursor * { cursor: crosshair !important; }
   border-radius: 3px;
 }
 
-/* ---------- cards (composer / popover / drawer / help) ---------- */
+/* ---------- cards (composer / popover / thread card / help) ---------- */
 .annota-card {
   position: fixed;
   z-index: 30;
@@ -257,35 +287,9 @@ body.annota-cursor * { cursor: crosshair !important; }
   white-space: pre-wrap;
 }
 
-/* ---------- drawer ---------- */
-.annota-drawer {
-  position: fixed;
-  z-index: 30;
-  right: 18px;
-  /* v0.5.0: no more in-canvas launcher below it — dock to the corner */
-  bottom: 18px;
-  width: 340px;
-  max-height: 65vh;
-  overflow: auto;
-}
-.annota-thread-row { padding: 10px 12px; border-bottom: 1px solid #f1f3f7; cursor: pointer; }
-.annota-thread-row:hover { background: #f8fafc; }
-.annota-thread-row.is-active { background: #eef2ff; }
-.annota-thread-row .annota-thread-title { font-weight: 600; font-size: 12.5px; }
-.annota-thread-row .annota-thread-sub { font-size: 11px; color: #64748b; margin-top: 2px; }
-.annota-thread-row.is-resolved .annota-thread-title { text-decoration: line-through; color: #94a3b8; }
-.annota-thread-row.is-fixed .annota-thread-title { color: #2563eb; }
-.annota-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--annota-warn);
-  margin-right: 5px;
-}
-.annota-dot.is-resolved { background: var(--annota-ok); }
-.annota-dot.is-fixed { background: #2563eb; }
-.annota-dot.is-orphan { background: #cbd5e1; }
+/* v0.6.11 (S7-B): drawer CSS DELETED with DrawerCard (.annota-drawer,
+ * .annota-thread-row*, .annota-dot*) — the threads surface is the SB bottom
+ * panel now. */
 
 /* ---------- help ---------- */
 .annota-help {

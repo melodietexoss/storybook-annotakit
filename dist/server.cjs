@@ -133,7 +133,11 @@ function sqliteStore(db, storePath) {
       },
       component: input.component ?? null,
       target: input.target,
-      comments: input.comments
+      comments: input.comments,
+      // v0.6.9 (S3): transient (frozen-capture) flag plumb-through — explicit
+      // row builders drop unknown ThreadInput fields, so every create site
+      // carries it (sqlite here, json store, staticStore).
+      transient: input.transient === true ? true : void 0
     };
     db.prepare("INSERT INTO threads (id, number, story_id, status, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?)").run(
       id,
@@ -375,7 +379,9 @@ function jsonStore(storePath) {
         story: { storyId: input.storyId, ...input.story },
         component: input.component ?? null,
         target: input.target,
-        comments: input.comments
+        comments: input.comments,
+        // v0.6.9 (S3): transient plumb-through (json store create).
+        transient: input.transient === true ? true : void 0
       };
       doc.threads.push(thread);
       return thread;
@@ -811,7 +817,7 @@ function clip2(body) {
 function threadBlock(t, snapshotUrl, full) {
   const first = t.comments[0];
   const headline = first ? full ? firstLine(first.body) || "(no text)" : clip2(first.body) : "(no text)";
-  const status = t.status === "fixed" ? "FIXED" : t.status === "resolved" ? "RESOLVED" : "OPEN";
+  const status = t.status === "fixed" ? "FIXED" : t.status === "resolved" ? "RESOLVED" : t.status === "rejected" ? "REJECTED" : "OPEN";
   const out = [];
   out.push(`### Thread ${t.number} \xB7 ${status} \u2014 ${headline}`);
   out.push("");
@@ -862,7 +868,9 @@ function threadBlock(t, snapshotUrl, full) {
   if (t.status === "resolved" && t.resolvedAt) {
     out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
   } else if (t.status === "fixed") {
-    out.push("  - fixed: addressed, awaiting reviewer verification (confirm \u2192 resolved, reject \u2192 open)");
+    out.push("  - fixed: addressed, awaiting reviewer verification (confirm \u2192 resolved, reject \u2192 rejected)");
+  } else if (t.status === "rejected") {
+    out.push("  - rejected: the fix was NOT accepted \u2014 re-work expected (re-address \u2192 fixed re-enters review)");
   }
   out.push("");
   return out;
@@ -871,11 +879,12 @@ function renderDigest(stories, opts) {
   const out = [];
   const open = stories.reduce((n, s) => n + (Number(s.counts.open) || 0), 0);
   const fixed = stories.reduce((n, s) => n + (Number(s.counts.fixed) || 0), 0);
+  const rejected = stories.reduce((n, s) => n + (Number(s.counts.rejected) || 0), 0);
   const resolved = stories.reduce((n, s) => n + (Number(s.counts.resolved) || 0), 0);
   const title = stories.length === 1 ? `UI review \u2014 ${metaLine(stories[0].story.title ?? stories[0].story.storyId, 120)}` : `UI review \u2014 ${stories.length} stories`;
   out.push(`# ${title}`);
   out.push("");
-  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${resolved} resolved \xB7 ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " ")}`);
+  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${rejected} rejected (re-work) / ${resolved} resolved \xB7 ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " ")}`);
   if (opts?.origin) out.push(`storybook: ${opts.origin}`);
   out.push("");
   for (const s of stories) {
@@ -893,8 +902,9 @@ function renderDigest(stories, opts) {
       out.push("");
       continue;
     }
-    const openThreads = s.threads.filter((t) => t.status !== "fixed" && t.status !== "resolved");
+    const openThreads = s.threads.filter((t) => t.status !== "fixed" && t.status !== "rejected" && t.status !== "resolved");
     const reviewThreads = s.threads.filter((t) => t.status === "fixed");
+    const reworkThreads = s.threads.filter((t) => t.status === "rejected");
     const done = s.threads.filter((t) => t.status === "resolved");
     const snapUrl = (t) => !opts?.mirror && opts?.snapshotIds?.has(t.id) ? `${opts?.origin ?? ""}/annotakit/api/threads/${encodeURIComponent(t.id)}/snapshot` : void 0;
     for (const t of openThreads) out.push(...threadBlock(t, snapUrl(t), opts?.fullText));
@@ -902,6 +912,11 @@ function renderDigest(stories, opts) {
       out.push(`**${reviewThreads.length} awaiting review (agent marked fixed):**`);
       out.push("");
       for (const t of reviewThreads) out.push(...threadBlock(t, snapUrl(t), opts?.fullText));
+    }
+    if (reworkThreads.length) {
+      out.push(`**${reworkThreads.length} rejected \u2014 re-work (the reviewer did not accept the fix):**`);
+      out.push("");
+      for (const t of reworkThreads) out.push(...threadBlock(t, snapUrl(t), opts?.fullText));
     }
     if (done.length) {
       out.push(`<details><summary>${done.length} resolved</summary>`);
@@ -913,10 +928,89 @@ function renderDigest(stories, opts) {
   }
   out.push("---");
   out.push("");
-  const footer = opts?.mirror ? "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED \u2014 do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node." : `Agent loop: fix the code at the \`jsx:\`/\`component file:\` paths, then PATCH ${opts?.origin ?? ""}/annotakit/api/threads/<id> with {"status":"fixed"} (addressed, awaiting the reviewer's verification \u2014 {"status":"resolved"} is the reviewer's confirmation, not yours). Note: \`jsx: file:line\` points at the component definition (may be a few lines off); the \`element:\`/\`selector:\` lines pinpoint the exact pinned node.`;
+  const footer = opts?.mirror ? "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED \u2014 do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). A REJECTED thread means the fix was not accepted: re-work it and comment evidence again, then mark it FIXED again for re-verification. Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node." : `Agent loop: fix the code at the \`jsx:\`/\`component file:\` paths, then PATCH ${opts?.origin ?? ""}/annotakit/api/threads/<id> with {"status":"fixed"} (addressed, awaiting the reviewer's verification \u2014 {"status":"resolved"} is the reviewer's confirmation, not yours; a REJECTED thread needs re-work: fix again, then PATCH {"status":"fixed"} to re-enter review). Note: \`jsx: file:line\` points at the component definition (may be a few lines off); the \`element:\`/\`selector:\` lines pinpoint the exact pinned node.`;
   out.push(footer);
   out.push("");
   return out.join("\n");
+}
+
+// src/server/merge.ts
+function cloneThread(t) {
+  return { ...t, comments: t.comments.map((c) => ({ ...c })) };
+}
+function later(a, b) {
+  const at = Date.parse(a.updatedAt ?? "");
+  const bt = Date.parse(b.updatedAt ?? "");
+  const aOk = Number.isFinite(at);
+  const bOk = Number.isFinite(bt);
+  if (aOk && bOk) return at >= bt ? a : b;
+  if (aOk) return a;
+  if (bOk) return b;
+  return a;
+}
+function unionComments(a, b) {
+  const out = a.comments.map((c) => ({ ...c }));
+  const byId = new Map(out.map((c) => [c.id, c]));
+  for (const rc of b.comments) {
+    const existing = byId.get(rc.id);
+    if (!existing) {
+      out.push({ ...rc });
+      byId.set(rc.id, rc);
+    } else {
+      if (!existing.body && rc.body) existing.body = rc.body;
+      if (!existing.ghId && rc.ghId) existing.ghId = rc.ghId;
+      if (!existing.source && rc.source) existing.source = rc.source;
+    }
+  }
+  out.sort((x, y) => String(x.createdAt ?? "").localeCompare(String(y.createdAt ?? "")));
+  return out;
+}
+var STATUS_RANK = { open: 0, fixed: 1, rejected: 2, resolved: 3 };
+function mergeThread(local, remote) {
+  if (!local) return remote ? cloneThread(remote) : null;
+  if (!remote) return cloneThread(local);
+  const newer = later(local, remote);
+  const older = newer === local ? remote : local;
+  const merged = cloneThread(newer);
+  const rankL = STATUS_RANK[local.status];
+  const rankR = STATUS_RANK[remote.status];
+  const hi = rankL >= rankR ? local : remote;
+  const lo = rankL >= rankR ? remote : local;
+  const hiT = Date.parse(hi.updatedAt ?? "");
+  const eventFresh = !Number.isFinite(hiT) || Date.parse(lo.reopenedAt ?? "") > hiT;
+  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo && eventFresh;
+  merged.status = downgradeProven ? lo.status : hi.status;
+  merged.reopenedAt = downgradeProven ? lo.reopenedAt : rankL === rankR && merged.status !== "resolved" ? hi.reopenedAt ?? lo.reopenedAt : hi.reopenedAt;
+  if (merged.status === "resolved") {
+    if (!merged.resolvedAt) merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
+  } else {
+    delete merged.resolvedAt;
+  }
+  if (!merged.gh?.issue) {
+    const gh = local.gh?.issue ? local.gh : remote.gh?.issue ? remote.gh : null;
+    if (gh) merged.gh = { ...gh };
+  }
+  merged.comments = unionComments(newer, older);
+  merged.updatedAt = String(newer.updatedAt ?? "") >= String(older.updatedAt ?? "") ? newer.updatedAt : older.updatedAt;
+  merged.createdAt = older.createdAt ?? newer.createdAt;
+  return merged;
+}
+function logicalMerge(local, remote) {
+  const deleted = /* @__PURE__ */ new Set([...local.deletedIds, ...remote.deletedIds]);
+  const ids = /* @__PURE__ */ new Set();
+  for (const t of local.threads) ids.add(t.id);
+  for (const t of remote.threads) ids.add(t.id);
+  const threads = [];
+  for (const id of ids) {
+    if (deleted.has(id)) continue;
+    const merged = mergeThread(
+      local.threads.find((t) => t.id === id),
+      remote.threads.find((t) => t.id === id)
+    );
+    if (merged) threads.push(merged);
+  }
+  threads.sort((a, b) => a.storyId !== b.storyId ? a.storyId < b.storyId ? -1 : 1 : (a.number ?? 0) - (b.number ?? 0));
+  return { threads, deletedIds: deleted };
 }
 
 // src/server/gh.ts
@@ -1317,7 +1411,7 @@ function createGhSync(opts) {
     const origin = opts.origin();
     const storyUrl = t.story?.url ?? `${origin}/?path=/story/${t.storyId}`;
     const body = renderDigest(
-      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === "open" ? 1 : 0, fixed: t.status === "fixed" ? 1 : 0, resolved: t.status === "resolved" ? 1 : 0 }, threads: [t] }],
+      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === "open" ? 1 : 0, fixed: t.status === "fixed" ? 1 : 0, rejected: t.status === "rejected" ? 1 : 0, resolved: t.status === "resolved" ? 1 : 0 }, threads: [t] }],
       { origin, mirror: true, fullText: true }
     );
     if (body.length > ISSUE_BODY_LIMIT) {
@@ -1848,85 +1942,6 @@ thread deleted in Storybook \u2014 closing.`);
   };
   return { enqueue, enqueueDelete, syncAll, pullOnce: () => run(pullOnceRaw), status, start, stop };
 }
-
-// src/server/merge.ts
-function cloneThread(t) {
-  return { ...t, comments: t.comments.map((c) => ({ ...c })) };
-}
-function later(a, b) {
-  const at = Date.parse(a.updatedAt ?? "");
-  const bt = Date.parse(b.updatedAt ?? "");
-  const aOk = Number.isFinite(at);
-  const bOk = Number.isFinite(bt);
-  if (aOk && bOk) return at >= bt ? a : b;
-  if (aOk) return a;
-  if (bOk) return b;
-  return a;
-}
-function unionComments(a, b) {
-  const out = a.comments.map((c) => ({ ...c }));
-  const byId = new Map(out.map((c) => [c.id, c]));
-  for (const rc of b.comments) {
-    const existing = byId.get(rc.id);
-    if (!existing) {
-      out.push({ ...rc });
-      byId.set(rc.id, rc);
-    } else {
-      if (!existing.body && rc.body) existing.body = rc.body;
-      if (!existing.ghId && rc.ghId) existing.ghId = rc.ghId;
-      if (!existing.source && rc.source) existing.source = rc.source;
-    }
-  }
-  out.sort((x, y) => String(x.createdAt ?? "").localeCompare(String(y.createdAt ?? "")));
-  return out;
-}
-var STATUS_RANK = { open: 0, fixed: 1, resolved: 2 };
-function mergeThread(local, remote) {
-  if (!local) return remote ? cloneThread(remote) : null;
-  if (!remote) return cloneThread(local);
-  const newer = later(local, remote);
-  const older = newer === local ? remote : local;
-  const merged = cloneThread(newer);
-  const rankL = STATUS_RANK[local.status];
-  const rankR = STATUS_RANK[remote.status];
-  const hi = rankL >= rankR ? local : remote;
-  const lo = rankL >= rankR ? remote : local;
-  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo;
-  merged.status = downgradeProven ? lo.status : hi.status;
-  merged.reopenedAt = (downgradeProven ? lo : hi).reopenedAt;
-  if (merged.status === "resolved") {
-    if (!merged.resolvedAt) merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
-  } else {
-    delete merged.resolvedAt;
-  }
-  if (!merged.gh?.issue) {
-    const gh = local.gh?.issue ? local.gh : remote.gh?.issue ? remote.gh : null;
-    if (gh) merged.gh = { ...gh };
-  }
-  merged.comments = unionComments(newer, older);
-  merged.updatedAt = String(newer.updatedAt ?? "") >= String(older.updatedAt ?? "") ? newer.updatedAt : older.updatedAt;
-  merged.createdAt = older.createdAt ?? newer.createdAt;
-  return merged;
-}
-function logicalMerge(local, remote) {
-  const deleted = /* @__PURE__ */ new Set([...local.deletedIds, ...remote.deletedIds]);
-  const ids = /* @__PURE__ */ new Set();
-  for (const t of local.threads) ids.add(t.id);
-  for (const t of remote.threads) ids.add(t.id);
-  const threads = [];
-  for (const id of ids) {
-    if (deleted.has(id)) continue;
-    const merged = mergeThread(
-      local.threads.find((t) => t.id === id),
-      remote.threads.find((t) => t.id === id)
-    );
-    if (merged) threads.push(merged);
-  }
-  threads.sort((a, b) => a.storyId !== b.storyId ? a.storyId < b.storyId ? -1 : 1 : (a.number ?? 0) - (b.number ?? 0));
-  return { threads, deletedIds: deleted };
-}
-
-// src/server/sync.ts
 var DEBOUNCE_MS = 6e3;
 var BOOT_MS = Date.now();
 var README_MARKER = "annotakit-store: v1";
@@ -2557,7 +2572,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.9";
+var VERSION = "0.6.12";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2905,7 +2920,7 @@ function groupByStory(threads, origin) {
     if (!entry) {
       entry = {
         story: { ...t.story, url: t.story.url ?? `${origin}/?path=/story/${t.storyId}` },
-        counts: { open: 0, fixed: 0, resolved: 0 },
+        counts: { open: 0, fixed: 0, rejected: 0, resolved: 0 },
         threads: []
       };
       map.set(t.storyId, entry);
@@ -2913,6 +2928,7 @@ function groupByStory(threads, origin) {
     entry.threads.push(t);
     if (t.status === "open") entry.counts.open++;
     else if (t.status === "fixed") entry.counts.fixed++;
+    else if (t.status === "rejected") entry.counts.rejected++;
     else entry.counts.resolved++;
   }
   const out = [...map.values()];
@@ -2939,13 +2955,13 @@ async function handleApi(req, res, url, configDir, origin) {
         ["GET", `${API_BASE}/health`, "agentSurfaces, store, gh + git state \u2014 detect your path here first"],
         ["GET", `${API_BASE}/schema`, "this document"],
         ["GET", `${API_BASE}/threads`, "ALL threads \u2014 envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array)"],
-        ["GET", `${API_BASE}/threads?storyId=<id>&status=<open|fixed|resolved>`, "filtered (an EMPTY storyId param is treated as absent, not a filter)"],
+        ["GET", `${API_BASE}/threads?storyId=<id>&status=<open|fixed|rejected|resolved>`, "filtered (an EMPTY storyId param is treated as absent, not a filter)"],
         ["POST", `${API_BASE}/threads`, "create \u2192 201; idempotent replay (same id) \u2192 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only \u2014 amend via PATCH"],
         ["GET", `${API_BASE}/threads/<id>`, "one thread doc"],
         ["PATCH", `${API_BASE}/threads/<id>`, "partial {status} (JSON-merge) or full doc \u2014 see PATCH below"],
         ["POST", `${API_BASE}/threads/<id>/comments`, "reply \u2192 201 with the FULL updated thread doc (not the new comment); key comments by thread id, never by your own comment id (ids are re-hashed)"],
         ["DELETE", `${API_BASE}/threads/<id>`, "delete (path form; legacy DELETE /threads?id=<id> equivalent)"],
-        ["GET|PUT", `${API_BASE}/threads/<id>/snapshot`, "plan-b DOM evidence \u2014 GET \u2192 JSON, GET ?format=html \u2192 human view; PUT replaces (idempotent, 96KB cap)"],
+        ["GET|PUT", `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence \u2014 GET \u2192 JSON, GET ?format=html \u2192 human view; PUT replaces (idempotent, 96KB cap) and broadcasts THREADS_CHANGED {reason:"snapshot"} so live panels re-fetch'],
         ["GET", `${API_BASE}/export?format=md|json`, "digest \u2014 json keeps FULL bodies (envelope {generatedAt, stories:[...]}, story-grouped, NOT the {threads:[...]} shape of GET /threads). md default is the LEAN digest (200-char clips for token economy); add ?mode=full for VERBATIM bodies (the panel export uses this \u2014 a hand-off artifact must never shorten a note)"],
         ["GET|POST", `${API_BASE}/sync`, "mirror status / force reconcile \u2014 POST also forces one git store cycle first (v0.6.1)"],
         ["POST", `${API_BASE}/gh/reload`, "re-read .env and apply token changes WITHOUT a restart (v0.6.6) \u2014 response lists applied/requiresRestart; the PAT is never echoed"]
@@ -2958,7 +2974,7 @@ async function handleApi(req, res, url, configDir, origin) {
       PATCH: {
         url: `${API_BASE}/threads/<id>`,
         partialBody: { status: "resolved" },
-        note: 'partial (JSON-merge) or full-document both accepted; status must be "open", "fixed" or "resolved" (case-insensitive, normalized \u2014 anything else is a 400). "fixed" = addressed by the agent, awaiting reviewer verification (the agent Path B terminal state; the GitHub issue stays OPEN). "resolved" = reviewer-confirmed \u2014 server stamps resolvedAt on ANY \u2192resolved transition and clears it on demotion out of resolved; PATCHing "fixed" onto a resolved thread is a 400 (reopen first \u2014 a stale full-doc PATCH must never demote a confirmation). comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt)'
+        note: 'partial (JSON-merge) or full-document both accepted; status must be "open", "fixed", "rejected" or "resolved" (case-insensitive, normalized \u2014 anything else is a 400). "fixed" = addressed by the agent, awaiting reviewer verification (the agent Path B terminal state; the GitHub issue stays OPEN). "rejected" = the reviewer did NOT accept the fix (re-work expected; DURABLE \u2014 the verdict survives reloads; the GitHub issue stays OPEN and the server appends a system notice comment, the agent-visible re-work signal). "resolved" = reviewer-confirmed \u2014 server stamps resolvedAt on ANY \u2192resolved transition and clears it on demotion out of resolved; PATCHing "fixed" or "rejected" onto a resolved thread is a 400 (reopen first \u2014 a stale full-doc PATCH must never demote a confirmation); PATCHing "rejected" onto an OPEN thread is a 400 (reject is a verdict on a fix). From rejected: "fixed" (agent re-addresses \u2014 re-enters review), "resolved" (reviewer confirms after all), "open" (reviewer clears the verdict). comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt). reopenedAt is server-owned (stamped on every downward transition, cleared on the next resolved \u2014 never send it)'
       },
       COMMENT: {
         url: `${API_BASE}/threads/<id>/comments`,
@@ -3101,9 +3117,9 @@ async function handleApi(req, res, url, configDir, origin) {
       }
       if ("status" in body && full.status !== void 0) {
         const norm = String(full.status).toLowerCase();
-        if (norm !== "open" && norm !== "fixed" && norm !== "resolved") {
+        if (norm !== "open" && norm !== "fixed" && norm !== "rejected" && norm !== "resolved") {
           throw Object.assign(
-            new Error(`status must be "open", "fixed" or "resolved" (got ${JSON.stringify(full.status)}) \u2014 {"status":"fixed"} = addressed, awaiting review; {"status":"resolved"} = reviewer-confirmed (server stamps resolvedAt); {"status":"open"} reopens`),
+            new Error(`status must be "open", "fixed", "rejected" or "resolved" (got ${JSON.stringify(full.status)}) \u2014 {"status":"fixed"} = addressed, awaiting review; {"status":"rejected"} = reviewer rejected the fix (re-work); {"status":"resolved"} = reviewer-confirmed (server stamps resolvedAt); {"status":"open"} reopens`),
             { status: 400 }
           );
         }
@@ -3115,6 +3131,14 @@ async function handleApi(req, res, url, configDir, origin) {
           { status: 400 }
         );
       }
+      if (full.status === "rejected" && prev.status !== "fixed" && prev.status !== "rejected") {
+        throw Object.assign(
+          new Error(
+            `reject applies to a fix \u2014 thread is ${prev.status} (reject is only valid from "fixed"${prev.status === "resolved" ? '; reopen to "open" first' : "; nothing to reject yet"})`
+          ),
+          { status: 400 }
+        );
+      }
       if (prev.status !== "resolved" && full.status === "resolved" && !full.resolvedAt) {
         full.resolvedAt = nowIso();
       }
@@ -3122,7 +3146,7 @@ async function handleApi(req, res, url, configDir, origin) {
         delete full.resolvedAt;
       }
       full.reopenedAt = prev.reopenedAt;
-      if (prev.status !== "open" && full.status === "open") {
+      if (STATUS_RANK[prev.status] > STATUS_RANK[full.status]) {
         full.reopenedAt = nowIso();
       }
       if (full.status === "resolved") {
@@ -3147,12 +3171,31 @@ async function handleApi(req, res, url, configDir, origin) {
           throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars \u2014 new/changed comments only; stored bodies are exempt)`), { status: 413 });
         }
       }
+      const verdictAuthor = typeof body.statusAuthor === "string" && body.statusAuthor.trim() ? body.statusAuthor.trim() : "reviewer";
+      delete full.statusAuthor;
+      if (prev.status === "fixed" && full.status === "rejected") {
+        const at = nowIso();
+        full.comments.push({
+          id: "c_" + crypto.createHash("sha256").update(`${verdictAuthor}|annotakit-rejected|${full.id}|${at}`).digest("base64url").slice(0, 12),
+          author: verdictAuthor,
+          body: `rejected \u2014 the fix was not accepted. Re-addressed fixes re-enter review.`,
+          createdAt: at
+        });
+      } else if (prev.status === "rejected" && full.status === "open") {
+        const at = nowIso();
+        full.comments.push({
+          id: "c_" + crypto.createHash("sha256").update(`${verdictAuthor}|annotakit-verdict-cleared|${full.id}|${at}`).digest("base64url").slice(0, 12),
+          author: verdictAuthor,
+          body: `verdict cleared \u2014 back to open.`,
+          createdAt: at
+        });
+      }
       const updated = await store.updateThread(full);
       if (!updated) return notFound(res, THREAD_404_HINT), true;
       afterMutation(rt, {
         storyId: updated.storyId,
         threadId: updated.id,
-        reason: prev.status === "open" && updated.status === "resolved" ? "resolved" : prev.status === "open" && updated.status === "fixed" ? "fixed" : prev.status === "resolved" && updated.status === "open" ? "reopened" : "updated"
+        reason: prev.status === "open" && updated.status === "resolved" ? "resolved" : prev.status === "open" && updated.status === "fixed" ? "fixed" : prev.status === "fixed" && updated.status === "rejected" ? "rejected" : prev.status === "resolved" && updated.status === "open" ? "reopened" : "updated"
       });
       await sendMutationJson(rt, res, 200, updated);
       return true;
@@ -3203,9 +3246,13 @@ async function handleApi(req, res, url, configDir, origin) {
         clipped: body.clipped === true,
         capturedAt: typeof body.capturedAt === "string" ? body.capturedAt : nowIso(),
         width: Math.round(Number(body.width) || 800),
-        height: Math.round(Number(body.height) || 600)
+        height: Math.round(Number(body.height) || 600),
+        // v0.6.9 (S3): the frozen-container shape marker — additive; the
+        // legacy story-root shape simply lacks it (old snapshots).
+        surface: body.surface === "frozen" ? "frozen" : void 0
       };
       await store.putSnapshot(id, snap);
+      broadcast({ storyId: thread.storyId, threadId: id, reason: "snapshot" });
       sendJson(res, 200, { ok: true, threadId: id, bytes: html.length, clipped: snap.clipped });
       return true;
     }

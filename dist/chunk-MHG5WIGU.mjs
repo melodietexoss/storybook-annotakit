@@ -29,7 +29,7 @@ function unionComments(a, b) {
   out.sort((x, y) => String(x.createdAt ?? "").localeCompare(String(y.createdAt ?? "")));
   return out;
 }
-var STATUS_RANK = { open: 0, fixed: 1, resolved: 2 };
+var STATUS_RANK = { open: 0, fixed: 1, rejected: 2, resolved: 3 };
 function mergeThread(local, remote) {
   if (!local) return remote ? cloneThread(remote) : null;
   if (!remote) return cloneThread(local);
@@ -40,9 +40,11 @@ function mergeThread(local, remote) {
   const rankR = STATUS_RANK[remote.status];
   const hi = rankL >= rankR ? local : remote;
   const lo = rankL >= rankR ? remote : local;
-  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo;
+  const hiT = Date.parse(hi.updatedAt ?? "");
+  const eventFresh = !Number.isFinite(hiT) || Date.parse(lo.reopenedAt ?? "") > hiT;
+  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo && eventFresh;
   merged.status = downgradeProven ? lo.status : hi.status;
-  merged.reopenedAt = (downgradeProven ? lo : hi).reopenedAt;
+  merged.reopenedAt = downgradeProven ? lo.reopenedAt : rankL === rankR && merged.status !== "resolved" ? hi.reopenedAt ?? lo.reopenedAt : hi.reopenedAt;
   if (merged.status === "resolved") {
     if (!merged.resolvedAt) merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
   } else {
@@ -257,7 +259,10 @@ function getStaticStore() {
           story: { storyId: input.storyId, ...input.story },
           component: input.component ?? null,
           target: input.target,
-          comments: input.comments
+          comments: input.comments,
+          // v0.6.9 (S3): transient (frozen-capture) plumb-through — this
+          // builder drops unknown fields, so the flag needs an explicit line.
+          transient: input.transient === true ? true : void 0
         };
         const existing = find(thread.id);
         if (existing) return Promise.resolve(existing);
@@ -266,24 +271,33 @@ function getStaticStore() {
         for (const cb of listeners) cb();
         return Promise.resolve(thread);
       },
-      patch(next) {
+      patch(next, opts) {
         const idx = threads.findIndex((t) => t.id === next.id);
         if (idx === -1) throw new Error(`annotakit(static): no thread ${next.id}`);
         const prev = threads[idx];
         const patched = { ...next };
+        delete patched.statusAuthor;
         patched.reopenedAt = prev.reopenedAt;
         if (patched.status !== void 0) {
           const norm = String(patched.status).toLowerCase();
-          if (norm !== "open" && norm !== "fixed" && norm !== "resolved") {
-            throw new Error(`annotakit(static): status must be "open", "fixed" or "resolved" (got ${JSON.stringify(patched.status)})`);
+          if (norm !== "open" && norm !== "fixed" && norm !== "rejected" && norm !== "resolved") {
+            throw new Error(`annotakit(static): status must be "open", "fixed", "rejected" or "resolved" (got ${JSON.stringify(patched.status)})`);
           }
           if (prev.status === "resolved" && norm === "fixed") {
             throw new Error('annotakit(static): thread is resolved (reviewer-confirmed) \u2014 reopen to "open" first');
           }
+          if (prev.status === "resolved" && norm === "rejected") {
+            throw new Error('annotakit(static): thread is resolved (reviewer-confirmed) \u2014 reopen to "open" first if you want to reject a new fix');
+          }
+          if (norm === "rejected" && prev.status !== "fixed" && prev.status !== "rejected") {
+            throw new Error(`annotakit(static): reject applies to a fix \u2014 thread is ${prev.status} (reject is only valid from "fixed")`);
+          }
           patched.status = norm;
           if (prev.status !== "resolved" && norm === "resolved" && !patched.resolvedAt) patched.resolvedAt = nowIso();
           if (prev.status === "resolved" && norm !== "resolved") delete patched.resolvedAt;
-          if (prev.status !== "open" && norm === "open") patched.reopenedAt = nowIso();
+          if (STATUS_RANK[prev.status] > STATUS_RANK[norm]) {
+            patched.reopenedAt = nowIso();
+          }
           if (norm === "resolved") delete patched.reopenedAt;
         }
         const merged = { ...prev, ...patched, updatedAt: nowIso() };
@@ -303,6 +317,19 @@ function getStaticStore() {
           if (!newIds.has(pc.id)) unioned.push(pc);
         }
         merged.comments = unioned;
+        if (merged.status === "rejected" && prev.status === "fixed") {
+          const who = opts?.statusAuthor?.trim() || "reviewer";
+          merged.comments = [
+            ...merged.comments,
+            { id: newCommentId(), author: who, body: "rejected \u2014 the fix was not accepted. Re-addressed fixes re-enter review.", createdAt: nowIso() }
+          ];
+        } else if (merged.status === "open" && prev.status === "rejected") {
+          const who = opts?.statusAuthor?.trim() || "reviewer";
+          merged.comments = [
+            ...merged.comments,
+            { id: newCommentId(), author: who, body: "verdict cleared \u2014 back to open.", createdAt: nowIso() }
+          ];
+        }
         if (!merged.gh && prev.gh) merged.gh = prev.gh;
         if (prev.status === "resolved" && merged.status !== "resolved") {
           delete merged.resolvedAt;
@@ -382,7 +409,7 @@ function clip2(body) {
 function threadBlock(t, storageNote, full) {
   const first = t.comments[0];
   const headline = first ? full ? firstLine(first.body) || "(no text)" : clip2(first.body) : "(no text)";
-  const status = t.status === "fixed" ? "FIXED" : t.status === "resolved" ? "RESOLVED" : "OPEN";
+  const status = t.status === "fixed" ? "FIXED" : t.status === "resolved" ? "RESOLVED" : t.status === "rejected" ? "REJECTED" : "OPEN";
   const out = [];
   out.push(`### Thread ${t.number} \xB7 ${status} \u2014 ${headline}`);
   out.push("");
@@ -419,6 +446,7 @@ function threadBlock(t, storageNote, full) {
   }
   if (t.status === "resolved" && t.resolvedAt) out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
   else if (t.status === "fixed") out.push("  - fixed: addressed, awaiting reviewer verification");
+  else if (t.status === "rejected") out.push("  - rejected: the fix was NOT accepted \u2014 re-work expected (re-address \u2192 fixed re-enters review)");
   out.push("");
   return out;
 }
@@ -431,12 +459,13 @@ function groupStories(threads) {
     const story = t.story ?? { storyId: t.storyId };
     let entry = map.get(t.storyId);
     if (!entry) {
-      entry = { story, counts: { open: 0, fixed: 0, resolved: 0 }, threads: [] };
+      entry = { story, counts: { open: 0, fixed: 0, rejected: 0, resolved: 0 }, threads: [] };
       map.set(t.storyId, entry);
     }
     entry.threads.push(t);
     if (t.status === "open") entry.counts.open += 1;
     else if (t.status === "fixed") entry.counts.fixed += 1;
+    else if (t.status === "rejected") entry.counts.rejected += 1;
     else entry.counts.resolved += 1;
   }
   return [...map.values()];
@@ -445,12 +474,13 @@ function renderStaticDigest(threads, opts) {
   const stories = groupStories(threads);
   const open = stories.reduce((n, s) => n + (Number(s.counts.open) || 0), 0);
   const fixed = stories.reduce((n, s) => n + (Number(s.counts.fixed) || 0), 0);
+  const rejected = stories.reduce((n, s) => n + (Number(s.counts.rejected) || 0), 0);
   const resolved = stories.reduce((n, s) => n + (Number(s.counts.resolved) || 0), 0);
   const title = stories.length === 1 ? `UI review \u2014 ${stories[0].story.title ?? stories[0].story.storyId}` : `UI review \u2014 ${stories.length} stories`;
   const out = [];
   out.push(`# ${title}`);
   out.push("");
-  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${resolved} resolved \xB7 ${nowIso().slice(0, 16).replace("T", " ")} \xB7 static build (local storage)`);
+  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${rejected} rejected (re-work) / ${resolved} resolved \xB7 ${nowIso().slice(0, 16).replace("T", " ")} \xB7 static build (local storage)`);
   out.push("");
   for (const s of stories) {
     const st = s.story;
@@ -464,8 +494,14 @@ function renderStaticDigest(threads, opts) {
       out.push("");
       continue;
     }
-    for (const t of s.threads.filter((x) => x.status !== "fixed" && x.status !== "resolved")) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
+    for (const t of s.threads.filter((x) => x.status !== "fixed" && x.status !== "rejected" && x.status !== "resolved")) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
     for (const t of s.threads.filter((x) => x.status === "fixed")) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
+    const rejectedThreads = s.threads.filter((x) => x.status === "rejected");
+    if (rejectedThreads.length > 0) {
+      out.push(`**${rejectedThreads.length} rejected \u2014 re-work (the fix was not accepted; re-address \u2192 fixed re-enters review):**`);
+      out.push("");
+    }
+    for (const t of rejectedThreads) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
     for (const t of s.threads.filter((x) => x.status === "resolved")) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
   }
   return out.join("\n");

@@ -322,6 +322,11 @@ function propValueToString(value: unknown): string | null {
  * Returns null when React metadata is unavailable (prod build, non-React tree).
  */
 export function inspectComponent(el: HTMLElement): ComponentRef | null {
+  // v0.6.9 (S3): frozen-clone elements carry no fiber of their own, and the
+  // closestFiber ancestor walk would report the overlay/portal-host fiber —
+  // a lie. Pins captured inside a frozen view honestly carry no component
+  // meta (the composer says so explicitly).
+  if (el.closest?.('[data-annota-frozen]')) return null;
   let fiber = closestFiber(el);
   if (!fiber) fiber = react18Fallback(el);
   if (!fiber) return null;

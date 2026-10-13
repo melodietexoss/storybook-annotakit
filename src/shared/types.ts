@@ -8,20 +8,31 @@
  * not the identity.
  */
 
-/** v0.6.3 review-flow triage (design/2026-09-13): 'fixed' = addressed by the
- *  agent, awaiting reviewer verification — the agent's Path B terminal state.
- *  Workflow: open → fixed (agent) → resolved (reviewer confirms; the ONLY path
- *  to resolved for agent-touched threads); direct open → resolved stays legal
- *  (trivial fixes / reviewer's own threads); fixed → open = reviewer rejects.
- *  On the GitHub mirror: resolved → closed, open|fixed → open. */
-export type ThreadStatus = 'open' | 'fixed' | 'resolved';
+/** v0.6.3 review-flow triage (design/2026-09-13) + v0.6.11 (S7-A) durable
+ *  rejected: 'fixed' = addressed by the agent, awaiting reviewer verification
+ *  — the agent's Path B terminal state. 'rejected' = the reviewer did NOT
+ *  accept the fix — re-work expected; the verdict is DURABLE (survives
+ *  reloads/recalls; the old fixed→open reject erased it). 'resolved' =
+ *  reviewer-confirmed.
+ *  Workflow: open → fixed (agent) → resolved (reviewer confirms; the ONLY
+ *  path to resolved for agent-touched threads) | rejected (reviewer rejects);
+ *  rejected → fixed (agent re-addresses — re-enters review) | resolved
+ *  (reviewer confirms after all) | open (reviewer clears the verdict);
+ *  direct open → resolved stays legal (trivial fixes / reviewer's own
+ *  threads); resolved → open = reopen. Guards: →rejected only FROM fixed;
+ *  resolved→fixed and resolved→rejected are 400s (reopen first).
+ *  On the GitHub mirror: resolved → closed; open|fixed|rejected → open (a
+ *  rejection posts a system notice comment — the agent-visible re-work
+ *  signal). */
+export type ThreadStatus = 'open' | 'fixed' | 'rejected' | 'resolved';
 export type ThreadKind = 'pin' | 'region';
 
 /** v0.6.3: the GitHub-mirror state a thread status maps to (resolved → closed;
- *  open|fixed → open — a thread awaiting reviewer verification is OPEN on
- *  GitHub, closing = reviewer-confirmed). ONE source shared by both engines
- *  (server ghsync + browser ghClient): push `want`, pull drift detection and
- *  the stalled sweep must all agree. */
+ *  open|fixed|rejected → open — a thread awaiting reviewer verification OR
+ *  rejected-and-awaiting-rework is OPEN on GitHub; closing = reviewer-
+ *  confirmed). ONE source shared by both engines (server ghsync + browser
+ *  ghClient): push `want`, pull drift detection and the stalled sweep must
+ *  all agree. */
 export const mirrorStateOf = (status: ThreadStatus): 'open' | 'closed' => (status === 'resolved' ? 'closed' : 'open');
 
 /** Hard cap on ONE comment body, enforced at every capture door (server
@@ -176,6 +187,11 @@ export interface DomSnapshot {
   /** Story-root box at capture time — sizing for the SVG wrapper view. */
   width: number;
   height: number;
+  /** v0.6.9 (S3): 'frozen' = the FROZEN CONTAINER's html (story clone at its
+   *  rect + portal clones as children — recall mounts it verbatim). Absent =
+   *  the legacy story-root shape (recall positions it at the live root's
+   *  rect). Additive: old snapshots simply lack it. */
+  surface?: 'story' | 'frozen';
 }
 
 /** The pinned element anchor package (ported multi-selector engine). */
@@ -222,12 +238,16 @@ export interface Thread {
   createdAt: string;
   updatedAt: string;
   resolvedAt?: string;
-  /** v0.6.9 (DD-42): server-stamped on every DOWNWARD transition
-   * (resolved→open, fixed→open — the reviewer's reject/reopen and the
-   * helper's reopen). Cleared again on the next →resolved. This is the
-   * EVENT PROOF the store merge needs to honor a deliberate reopen over a
-   * stale higher-ranked copy: a stale replica cannot synthesize it (the
-   * transition itself is guarded), so the disagreement loop survives sync. */
+  /** v0.6.12 (DD-42 fold, extends public v0.6.9): store-owned EVENT PROOF,
+   *  stamped on every DOWNWARD status transition (any rank decrease on
+   *  open < fixed < rejected < resolved: resolved→open, fixed→open,
+   *  rejected→open the verdict-clear, rejected→fixed the resubmit), cleared
+   *  again on the next →resolved. The store merge honors a deliberate
+   *  downgrade against a stale higher-ranked copy ONLY with this event (plus
+   *  recency + freshness — see merge.ts); a stale replica cannot synthesize
+   *  it (the transitions are guarded, the PATCH doors normalize it away).
+   *  Never rendered; rides exports/seeds verbatim (the seed is an
+   *  operator-trusted build artifact). */
   reopenedAt?: string;
   /** Author of the first comment (thread owner). */
   author: string;
@@ -237,6 +257,12 @@ export interface Thread {
   comments: Comment[];
   /** GitHub issue mirror (absent until the thread is synced to GitHub once). */
   gh?: ThreadGhRef;
+  /** v0.6.9 (S3): captured while the view was FROZEN — the anchor was taken
+   *  against the frozen clone (no live fiber: component meta is honestly
+   *  absent) and the stored snapshot is the source of truth for review
+   *  (recall). Advisory UI metadata: a third-party full-document PATCH may
+   *  drop it; no engine behavior keys on it. */
+  transient?: boolean;
 }
 
 /** Store info surfaced by /health. */
@@ -386,6 +412,8 @@ export interface ThreadInput {
   component?: ComponentRef | null;
   target: ThreadTarget;
   comments: Comment[];
+  /** v0.6.9 (S3): true when pinned inside a frozen view. */
+  transient?: boolean;
 }
 
 /** Lean JSON export envelope. */
@@ -398,8 +426,10 @@ export interface ExportBundle {
 export interface ExportedStory {
   story: StoryRef;
   /** v0.6.3: three-way (additive — old consumers computing open+resolved as
-   *  the total under-count; fixed threads are NOT done, they await review). */
-  counts: { open: number; fixed: number; resolved: number };
+   *  the total under-count; fixed threads are NOT done, they await review).
+   *  v0.6.11 (S7-A): four-way — rejected = fixes the reviewer did not accept
+   *  (re-work expected; NOT resolved). */
+  counts: { open: number; fixed: number; rejected: number; resolved: number };
   threads: Thread[];
 }
 

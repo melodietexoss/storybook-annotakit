@@ -588,7 +588,7 @@ export function mirrorIssueBody(t: Thread, cfg: { repo: string; labels: string[]
   out.push('---');
   out.push('');
   out.push(
-    'Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED — do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). ' +
+    'Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED — do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). A `rejected — the fix was not accepted` notice means re-work is expected (the thread stays in the re-work queue until you re-address it and they confirm). ' +
       'Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.',
   );
   out.push('');
@@ -1363,12 +1363,18 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
         // reopen fires from resolved ONLY — fixed+open is the natural state
         next.status = 'open';
         delete next.resolvedAt;
-        // v0.6.9 (DD-42, review F4): event parity — a GitHub-side reopen must
-        // carry the same merge proof the PATCH door stamps, or rank eats it.
+        // v0.6.12 (DD-42 fold, public-v0.6.9 review F4): event parity — a
+        // GitHub-side reopen must carry the same merge proof the PATCH door
+        // stamps, or rank eats it. ADVISORY here (unlike ghsync): this write
+        // flows through the staticStore patch door, whose normalize wipes
+        // this value and re-stamps nowIso() — only event PRESENCE matters to
+        // the merge; the stamp survives as defense-in-depth.
         next.reopenedAt = pullStartedAt;
         next.comments = [...next.comments, systemComment(`gh-reopen-${mir.issue}`, 'github', 'reopened on GitHub')];
       }
-      if (next.status === 'resolved') delete next.reopenedAt; // confirm supersedes the event (both doors)
+      // confirm supersedes the event (both doors — incl. a confirm from
+      // rejected carrying a resubmit event)
+      if (next.status === 'resolved') delete next.reopenedAt;
       const knownNow = new Set(next.comments.map((c) => c.ghId).filter((x): x is string => Boolean(x)));
       const imported: Comment[] = [];
       for (const c of fresh) {
@@ -1629,8 +1635,8 @@ export async function getGhLinkedStaticStore(): Promise<LinkedStaticStore> {
       enqueue('sync', t.id);
       return t;
     });
-  linked.patch = (next) =>
-    base.patch(next).then((t) => {
+  linked.patch = (next, opts) =>
+    base.patch(next, opts).then((t) => {
       enqueue('sync', t.id);
       return t;
     });

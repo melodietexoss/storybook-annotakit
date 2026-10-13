@@ -17,8 +17,9 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { addons, types, useStorybookApi, useStorybookState } from 'storybook/manager-api';
 import { useTheme } from 'storybook/theming';
 import { BoxIcon, CameraIcon, CheckIcon, CommentIcon, CommentsIcon, EyeIcon, EyeCloseIcon, LinkIcon, PinIcon, SyncIcon } from '@storybook/icons';
-import { API_BASE, FOCUS_THREAD, THREADS_CHANGED, THREAD_FOCUSED, UI_COMMAND, UI_STATE, type ThreadsChangedPayload, type UiCommand, type UiState } from '../shared/events';
-import { probeMode } from '../shared/mode';
+import { API_BASE, FOCUS_THREAD, RECALL_THREAD, THREADS_CHANGED, THREAD_FOCUSED, THREAD_RECALLED, TOGGLE_THREADS_PANEL, UI_COMMAND, UI_STATE, type ThreadsChangedPayload, type UiCommand, type UiState } from '../shared/events';
+import { DEFAULT_HOTKEYS, parseHotkey, hotkeyLabel, hotkeyMatches, isTypingTarget, type Hotkeys } from '../shared/hotkeys';
+import { probeMode, type KitMode } from '../shared/mode';
 import { getGhLinkedStaticStore, ghClientStatus, type GhClientSettings, type GhClientStatus } from '../shared/ghClient';
 import { renderStaticDigest } from '../shared/staticStore';
 import type { GhSyncStatus, GhSyncSummary, Thread } from '../shared/types';
@@ -28,6 +29,24 @@ const ADDON_ID = 'annotakit';
 const PANEL_ID = `${ADDON_ID}/panel`;
 const TOOL_ID = `${ADDON_ID}/tool`;
 const AUTHOR_KEY = 'annotakit:author';
+
+/** v0.6.11 (S7-B): toggle the SB bottom panel with OUR panel selected — the
+ *  threads surface (the floating drawer is DELETED). One shared helper for
+ *  the three entry points (toolbar button, manager-focus ⌥P bridge, preview
+ *  ⌥P via the TOGGLE_THREADS_PANEL channel event). SB facts (verified
+ *  against 10.6 manager runtime): setSelectedPanel does NOT auto-show the
+ *  panel — call BOTH, in that order; togglePanel(false) when hidden is a
+ *  no-op; live visibility derives from panel HEIGHTS (layout.showPanel never
+ *  flips — it is startup-only), hence getIsPanelShown(); our toggle-off only
+ *  fires when OUR panel is the selected AND shown one (never closes someone
+ *  else's); selectedPanel persists — the next native open shows ours.
+ *  v0.6.12 (S7-AUDIT-C7): the implementation lives in src/shared/panelToggle
+ *  (node unit-testable; the truth table + degrade cells are pinned there). */
+import { toggleThreadsPanel as sharedToggleThreadsPanel, type PanelToggleApi } from '../shared/panelToggle';
+
+const toggleThreadsPanel = (api: PanelToggleApi): void => {
+  sharedToggleThreadsPanel(api, PANEL_ID);
+};
 
 interface HealthInfo {
   ok?: boolean;
@@ -131,9 +150,13 @@ function ReviewPanel(): React.ReactElement {
   const storybookApi = useStorybookApi();
   const state = useStorybookState();
   const storyId = state.storyId as string | undefined;
+  // v0.6.10 (S6-D3e): empty-state strings render the ACTIVE hotkey map —
+  // hardcoded key letters go stale the moment a story customizes (or the
+  // defaults change, as they just did).
+  const { hk: hkMap, hotkeysOn: hotkeysOnMap, ui: uiState } = useAnnotaHotkeys();
 
   const [scope, setScope] = useState<'story' | 'all'>('story');
-  const [filter, setFilter] = useState<'open' | 'review' | 'all'>('all');
+  const [filter, setFilter] = useState<'open' | 'review' | 'rejected' | 'all'>('all');
   /** v0.6.3: list order — 'story' = stable (resolving never reorders);
    * 'recent' = updatedAt DESC (every reply/status flip bumps it — the
    * "what was addressed since my last visit" view; opt-in because it moves). */
@@ -175,11 +198,15 @@ function ReviewPanel(): React.ReactElement {
  *  error plus dev chrome on every panel open). The REST fetches only start
    *  once the mode is known; static mode links the store instead. */
   const [modeResolved, setModeResolved] = useState(false);
+  /** v0.6.9: the probed mode, kept — 'down' drives the panel's honest
+   *  no-store notice (the canvas badge is gone by user directive). */
+  const [probeResult, setProbeResult] = useState<KitMode | null>(null);
   useEffect(() => {
     let alive = true;
     void probeMode().then((m) => {
       if (!alive) return;
       if (m === 'static') setStaticMode(true);
+      setProbeResult(m);
       setModeResolved(true); // dev/down: the REST path runs (and may error honestly)
     });
     return () => {
@@ -320,6 +347,31 @@ function ReviewPanel(): React.ReactElement {
     setActiveThread(t.id);
   };
 
+  /** v0.6.9 (S5): recall a thread — re-create the exact view at pin time and
+   *  show this pin ALONE (focused one-pin-at-a-time review). Same cross-story
+   *  retry-until-ack pattern as focusThread; THREAD_RECALLED fires when the
+   *  view mounted + the pin flashed, or the honest live-flash fallback ran
+   *  (missing/clipped snapshot — the preview says so). */
+  const recallThread = (t: Thread): void => {
+    if (t.storyId !== storyId) {
+      storybookApi.selectStory(t.storyId);
+      const ch = addons.getChannel();
+      let attempts = 0;
+      const ack = () => { attempts = 99; ch.removeListener(THREAD_RECALLED, ack); };
+      ch.on(THREAD_RECALLED, ack);
+      const emitOnce = () => {
+        if (attempts >= 5) { ch.removeListener(THREAD_RECALLED, ack); return; }
+        attempts += 1;
+        ch.emit(RECALL_THREAD, t.id);
+        window.setTimeout(emitOnce, 400);
+      };
+      window.setTimeout(emitOnce, 400);
+    } else {
+      addons.getChannel().emit(RECALL_THREAD, t.id);
+    }
+    setActiveThread(t.id);
+  };
+
   const reply = async (t: Thread, body: string): Promise<boolean> => {
     if (!body.trim()) return false;
     setBusy(true);
@@ -346,25 +398,29 @@ function ReviewPanel(): React.ReactElement {
   };
 
   /** v0.6.3 generalized status setter (was toggleResolve) — reviewer actions:
-   *  confirm (fixed→resolved), reject (fixed→open), direct resolve, reopen. */
+   *  confirm (fixed→resolved), reject (fixed→rejected — DURABLE, v0.6.11/S7-A),
+   *  direct resolve, reopen, clear (rejected→open). */
   const setStatus = async (t: Thread, status: Thread['status']): Promise<void> => {
     setBusy(true);
     try {
-      const next: Thread = {
-        ...t,
-        status,
-        resolvedAt: status === 'resolved' ? (t.resolvedAt ?? new Date().toISOString()) : undefined,
-      };
       if (staticMode) {
         const store = await getGhLinkedStaticStore();
-        await store.patch(next);
+        // v0.6.11 (S7-A): statusAuthor names the acting reviewer for the
+        // system notice comment the store door appends on verdict flips.
+        await store.patch(
+          { ...t, status, resolvedAt: status === 'resolved' ? (t.resolvedAt ?? new Date().toISOString()) : undefined },
+          { statusAuthor: author },
+        );
         await refresh();
         return;
       }
+      // v0.6.11 (S7-A): PARTIAL patch for status flips — strictly safer than
+      // the stale full-doc form (no comments/status race), and statusAuthor
+      // is a control field (never stored). The server stamps resolvedAt.
       await jfetch(`${API_BASE}/threads/${encodeURIComponent(t.id)}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(next),
+        body: JSON.stringify({ status, statusAuthor: author }),
       });
       await refresh();
     } catch (e) {
@@ -583,11 +639,25 @@ function ReviewPanel(): React.ReactElement {
     [threads, sortMode],
   );
   const shown = useMemo(
-    () => ordered.filter((t) => (filter === 'all' ? true : filter === 'open' ? t.status === 'open' : t.status === 'fixed')),
+    () =>
+      ordered.filter((t) =>
+        filter === 'all'
+          ? true
+          : filter === 'open'
+            ? t.status === 'open'
+            : filter === 'review'
+              ? t.status === 'fixed'
+              : t.status === 'rejected',
+      ),
     [ordered, filter],
   );
   const openCount = ordered.filter((t) => t.status === 'open').length;
   const fixedCount = ordered.filter((t) => t.status === 'fixed').length;
+  const rejectedCount = ordered.filter((t) => t.status === 'rejected').length;
+  // v0.6.11 (S7-B): orphan threads (anchor unresolvable in the live DOM) —
+  // the drawer's dot was the only list-surface indicator. The preview
+  // computes it per CURRENT story, so only show it in story scope.
+  const uiOrphan = scope === 'story' ? uiState?.orphan ?? 0 : 0;
   const chip = (bg: string, color: string): React.CSSProperties => ({
     background: bg,
     color,
@@ -630,6 +700,9 @@ function ReviewPanel(): React.ReactElement {
           <button style={miniBtn(theme.colorSecondary, filter === 'review')} onClick={() => setFilter('review')} title="Threads the agent marked fixed — awaiting your verification (the check-latest-batch view)">
             to review
           </button>
+          <button style={miniBtn(theme.colorSecondary, filter === 'rejected')} onClick={() => setFilter('rejected')} title="Fixes you rejected — awaiting the agent's re-work (the verdict is durable)">
+            rejected
+          </button>
         </div>
         <div style={{ display: 'flex', gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: 'hidden' }}>
           <button style={miniBtn(theme.colorSecondary, sortMode === 'story')} onClick={() => setSortMode('story')} title="Stable order: story title, then thread number — resolving never reorders the list">
@@ -641,7 +714,7 @@ function ReviewPanel(): React.ReactElement {
         </div>
         <span style={{ fontSize: 11, color: theme.textMutedColor }}>
           {threads.length
-            ? `${openCount} open${fixedCount > 0 ? ` · ${fixedCount} to review` : ''} / ${threads.length} threads`
+            ? `${openCount} open${fixedCount > 0 ? ` · ${fixedCount} to review` : ''}${rejectedCount > 0 ? ` · ${rejectedCount} rejected` : ''}${uiOrphan > 0 ? ` · ${uiOrphan} orphan` : ''} / ${threads.length} threads`
             : 'no threads'}
         </span>
         <span style={{ flex: 1 }} />
@@ -879,6 +952,14 @@ function ReviewPanel(): React.ReactElement {
           {error}
         </div>
       )}
+      {/* v0.6.9 (user directive "not block my actual view"): the down state
+          moved OFF the canvas (the old 📌 badge is gone) — the panel is where
+          the state + fix live now. */}
+      {probeResult === 'down' && (
+        <div style={{ margin: '6px 0', padding: '6px 8px', fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: 'pre-wrap' }}>
+          No AnnotaKit store reachable — pinning is paused. Fixes: run the review surface under <b>storybook dev</b> (the API lives on the dev server), or bake the static build (<code>node node_modules/storybook-annotakit/scripts/bake-static-threads.mjs &lt;sb-output-dir&gt;</code>). The canvas stays overlay-free either way.
+        </div>
+      )}
       {notice && (
         <div style={{ margin: '6px 0', padding: '5px 8px', fontSize: 11, borderRadius: 6, background: `${positiveColor}22`, color: positiveColor }}>
           {notice}
@@ -890,13 +971,19 @@ function ReviewPanel(): React.ReactElement {
         <div style={{ padding: '12px 4px', fontSize: 12, color: theme.textMutedColor }}>
           {threads.length === 0
             ? scope === 'story'
-              ? <>No threads for this story. Press <b>⌥C</b> (Alt+C) in the canvas and click an element — or <b>⌥R</b> to drag a region. Everything saves automatically to the dev-server store.</>
-              : <>No threads yet. Press <b>⌥C</b> (Alt+C) in the canvas and click an element.</>
+              ? hotkeysOnMap
+                ? <>No threads for this story. Press <b>{hotkeyLabel(hkMap.pin)}</b> in the canvas and click an element — or <b>{hotkeyLabel(hkMap.region)}</b> to drag a region. Everything saves automatically to the dev-server store.</>
+                : <>No threads for this story. Click an element with the toolbar Pin button — or drag a region with the toolbar Box button. Everything saves automatically to the dev-server store.</>
+              : hotkeysOnMap
+                ? <>No threads yet. Press <b>{hotkeyLabel(hkMap.pin)}</b> in the canvas and click an element.</>
+                : <>No threads yet. Use the toolbar Pin button, then click an element in the canvas.</>
             : filter === 'open'
-              ? <>Nothing open — everything is fixed (awaiting review) or resolved. Switch the filter to “to review” or “all”.</>
+              ? <>Nothing open — everything is fixed (awaiting review), rejected (awaiting re-work) or resolved. Switch the filter to “to review”, “rejected” or “all”.</>
               : filter === 'review'
                 ? <>Nothing awaiting review — no agent fixes pending.</>
-                : <>All threads resolved 🎉.</>}
+                : filter === 'rejected'
+                  ? <>Nothing rejected — no fixes awaiting re-work.</>
+                  : <>All threads resolved 🎉.</>}
         </div>
       )}
       {shown.map((t) => {
@@ -918,12 +1005,18 @@ function ReviewPanel(): React.ReactElement {
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <span
                 style={chip(
-                  t.status === 'open' ? '#f59e0b22' : t.status === 'fixed' ? '#2563eb22' : '#16a34a22',
-                  t.status === 'open' ? '#b45309' : t.status === 'fixed' ? '#1d4ed8' : '#15803d',
+                  t.status === 'open' ? '#f59e0b22' : t.status === 'fixed' ? '#2563eb22' : t.status === 'rejected' ? '#dc262622' : '#16a34a22',
+                  t.status === 'open' ? '#b45309' : t.status === 'fixed' ? '#1d4ed8' : t.status === 'rejected' ? '#b91c1c' : '#15803d',
                 )}
-                title={t.status === 'fixed' ? 'addressed by the agent — awaiting your verification' : t.status}
+                title={
+                  t.status === 'fixed'
+                    ? 'addressed by the agent — awaiting your verification'
+                    : t.status === 'rejected'
+                      ? 'you rejected the fix — re-work expected (durable verdict)'
+                      : t.status
+                }
               >
-                #{t.number} {t.status === 'open' ? 'open' : t.status === 'fixed' ? 'fixed' : 'resolved'}
+                #{t.number} {t.status === 'open' ? 'open' : t.status === 'fixed' ? 'fixed' : t.status === 'rejected' ? 'rejected' : 'resolved'}
               </span>
               {t.gh?.url && /^(https?:)?\/\//i.test(t.gh.url) && (
                 <a
@@ -938,6 +1031,14 @@ function ReviewPanel(): React.ReactElement {
                 </a>
               )}
               {t.component?.name && <span style={chip(`${theme.colorSecondary}18`, theme.colorSecondary)}>{t.component.name}</span>}
+              {t.transient && (
+                <span
+                  style={chip('#0c4a6e18', '#0369a1')}
+                  title="Pinned inside a frozen view — recall (view) shows the exact state"
+                >
+                  ❄
+                </span>
+              )}
               {snapshotIds.has(t.id) && (
                 <a
                   href={`${API_BASE}/threads/${encodeURIComponent(t.id)}/snapshot?format=html`}
@@ -949,6 +1050,18 @@ function ReviewPanel(): React.ReactElement {
                 >
                   <CameraIcon width={10} height={10} /> dom
                 </a>
+              )}
+              {snapshotIds.has(t.id) && (
+                <button
+                  title="Recall — re-create the exact view at pin time and show this pin alone (read-only; Esc returns to the live view)"
+                  style={{ ...chip('#0c4a6e18', '#0369a1'), border: 'none', font: 'inherit', textDecoration: 'none', display: 'inline-flex', gap: 3, alignItems: 'center', cursor: 'pointer' }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    recallThread(t);
+                  }}
+                >
+                  <EyeIcon width={10} height={10} /> view
+                </button>
               )}
               {scope === 'all' && t.story.name && <span style={chip('#64748b18', theme.textMutedColor)}>{t.story.name}</span>}
               <span style={{ flex: 1 }} />
@@ -1057,10 +1170,31 @@ function ThreadActions(props: {
           <button
             style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: '1px solid #fecaca', background: 'transparent', color: '#b91c1c', display: 'inline-flex', gap: 4, alignItems: 'center' }}
             disabled={props.busy}
-            onClick={() => props.onSetStatus(props.thread, 'open')}
-            title="Reject — back to open (reply with why)"
+            onClick={() => props.onSetStatus(props.thread, 'rejected')}
+            title="Reject — the fix is not accepted (reply with why); stays rejected until re-addressed"
           >
             reject
+          </button>
+        </>
+      )}
+      {props.thread.status === 'rejected' && (
+        <>
+          <button
+            style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: '1px solid #86efac', background: 'transparent', color: '#15803d', display: 'inline-flex', gap: 4, alignItems: 'center' }}
+            disabled={props.busy}
+            onClick={() => props.onSetStatus(props.thread, 'resolved')}
+            title="Confirm after all — you re-verified and accept the fix"
+          >
+            <CheckIcon width={11} height={11} />
+            confirm
+          </button>
+          <button
+            style={{ padding: '3px 9px', fontSize: 11, fontWeight: 600, cursor: props.busy ? 'default' : 'pointer', borderRadius: 6, border: '1px solid #fecaca', background: 'transparent', color: '#b91c1c', display: 'inline-flex', gap: 4, alignItems: 'center' }}
+            disabled={props.busy}
+            onClick={() => props.onSetStatus(props.thread, 'open')}
+            title="Clear the rejection — back to plain open (the verdict is erased)"
+          >
+            ↩ clear
           </button>
         </>
       )}
@@ -1106,15 +1240,11 @@ function MiniButton(props: { theme: ReturnType<typeof useTheme>; onClick: () => 
 
 /* ------------------------------------ tool ------------------------------------ */
 
-/** Native SB-toolbar button group — v0.5.0 THE entry point for pinning (the
- *  in-canvas launcher is GONE: nothing in the canvas DOM is altered). Commands
- *  travel over the addon channel to the preview layer; the layer reports back
- *  via UI_STATE so the buttons always reflect reality (armed mode, drawer open,
- *  visibility, thread counts, API up/down) instead of manager-local guesses. */
-function AnnotaKitTool(): React.ReactElement {
-  const theme = useTheme();
+/** v0.6.10 (S6-D3e): the ACTIVE hotkey map + flags from UI_STATE — the
+ *  manager's strings render the REAL config (per-story customizations flow
+ *  through), falling back to the defaults before the first state lands. */
+function useAnnotaHotkeys(): { hk: Hotkeys; hotkeysOn: boolean; frozenViewEnabled: boolean; ui: UiState | null } {
   const [ui, setUi] = useState<UiState | null>(null);
-
   useEffect(() => {
     const ch = addons.getChannel();
     const onState = (s: UiState | undefined) => {
@@ -1125,10 +1255,69 @@ function AnnotaKitTool(): React.ReactElement {
       ch.removeListener(UI_STATE, onState);
     };
   }, []);
+  return {
+    hk: ui?.hotkeys ?? DEFAULT_HOTKEYS,
+    hotkeysOn: ui?.hotkeys !== null, // null while hotkeys === false (the bridge goes inert)
+    frozenViewEnabled: ui?.frozenViewEnabled !== false,
+    ui,
+  };
+}
+
+/** Native SB-toolbar button group — v0.5.0 THE entry point for pinning (the
+ *  in-canvas launcher is GONE: nothing in the canvas DOM is altered). Commands
+ *  travel over the addon channel to the preview layer; the layer reports back
+ *  via UI_STATE so the buttons always reflect reality (armed mode, visibility,
+ *  thread counts, API up/down) instead of manager-local guesses.
+ *  v0.6.11 (S7-B): the threads button opens the SB bottom PANEL (ours
+ *  selected) instead of the deleted floating drawer — panel visibility is SB
+ *  manager state (derived from panel heights; layout.showPanel never flips). */
+function AnnotaKitTool(): React.ReactElement {
+  const theme = useTheme();
+  const { hk, hotkeysOn, frozenViewEnabled, ui } = useAnnotaHotkeys();
+  const storybookApi = useStorybookApi();
+  const sbState = useStorybookState();
 
   const emit = useCallback((command: UiCommand['command']): void => {
     addons.getChannel().emit(UI_COMMAND, { command });
   }, []);
+
+  // v0.6.10 (S6-D3d): the manager-side hotkey BRIDGE — our hotkeys work with
+  // ANY focus (manager, sidebar, addon panel, canvas). Native keydowns only
+  // (isTrusted): SB forwards preview keydowns to its shortcut system over the
+  // CHANNEL, they never appear as manager DOM events (verified live), so the
+  // bridge can never double-fire with the preview's own listener. The
+  // isTypingTarget guard (shared kernel) keeps panel inputs, the SB search
+  // palette, and every other text field from arming anything; hotkeys:false
+  // (hotkeysOn false) makes the bridge inert.
+  const hkSpecs = useMemo(
+    () => ({
+      pin: parseHotkey(hk.pin, DEFAULT_HOTKEYS.pin),
+      region: parseHotkey(hk.region, DEFAULT_HOTKEYS.region),
+      layer: parseHotkey(hk.layer, DEFAULT_HOTKEYS.layer),
+      drawer: parseHotkey(hk.drawer, DEFAULT_HOTKEYS.drawer),
+      freeze: parseHotkey(hk.freeze, DEFAULT_HOTKEYS.freeze),
+    }),
+    [hk],
+  );
+  useEffect(() => {
+    if (!hotkeysOn) return undefined;
+    const onKey = (e: KeyboardEvent): void => {
+      if (!e.isTrusted) return; // synthetic dispatches (incl. SB's channel-forwarded keys)
+      if (isTypingTarget(e.target)) return;
+      if (hotkeyMatches(e, hkSpecs.pin)) emit('pin');
+      else if (hotkeyMatches(e, hkSpecs.region)) emit('region');
+      else if (hotkeyMatches(e, hkSpecs.layer)) emit('layer');
+      // v0.6.11 (S7-B): ⌥P from ANY manager focus opens our panel (the
+      // any-focus contract survives the drawer's deletion); e.repeat guard —
+      // a held key must not flap the panel.
+      else if (!e.repeat && hotkeyMatches(e, hkSpecs.drawer)) toggleThreadsPanel(storybookApi);
+      else if (frozenViewEnabled && hotkeyMatches(e, hkSpecs.freeze)) emit('freeze');
+    };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [hkSpecs, hotkeysOn, frozenViewEnabled, emit, storybookApi]);
 
   const apiDown = ui?.apiOk === false;
   const armed = (on: boolean): React.CSSProperties => ({
@@ -1160,17 +1349,55 @@ function AnnotaKitTool(): React.ReactElement {
 
   const open = ui?.open ?? 0;
   const fixed = ui?.fixed ?? 0;
+  const rejected = ui?.rejected ?? 0;
   const total = ui?.total ?? 0;
-  const drawerOn = ui?.drawerOpen === true;
+  // v0.6.11 (S7-B): active = our panel selected AND shown AND story view.
+  // Live visibility derives from panel HEIGHTS (SB's togglePanel writes
+  // bottomPanelHeight/rightPanelWidth; layout.showPanel is startup-only and
+  // never flips — verified against SB 10.6). Degrade to unlit if the fields
+  // are absent (older SB) — an honest fallback.
+  const layout = (sbState as { layout?: { bottomPanelHeight?: number; rightPanelWidth?: number } }).layout;
+  const panelShown =
+    sbState.selectedPanel === PANEL_ID &&
+    ((layout?.bottomPanelHeight ?? 0) > 0 || (layout?.rightPanelWidth ?? 0) > 0) &&
+    sbState.viewMode === 'story';
+  // v0.6.10 (audit C-P1-1/C-P2-2): every letter renders from the ACTIVE map,
+  // and NO letter renders while hotkeys === false (the keys are dead then —
+  // advertising them is the lie the truth-rendering exists to prevent).
+  const kPin = hotkeysOn ? ` (${hotkeyLabel(hk.pin)})` : '';
+  const kRegion = hotkeysOn ? ` (${hotkeyLabel(hk.region)})` : '';
+  const kLayer = hotkeysOn ? ` (${hotkeyLabel(hk.layer)})` : '';
+  const kDrawer = hotkeysOn ? ` (${hotkeyLabel(hk.drawer)})` : '';
+  const kFreeze = hotkeysOn ? hotkeyLabel(hk.freeze) : '';
   return (
     <div key="annotakit-tool" style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-      {btn('Pin a comment to an element (⌥C)', <PinIcon width={14} height={14} />, ui?.mode === 'pin', () => emit('pin'))}
-      {btn('Mark a region (⌥R)', <BoxIcon width={14} height={14} />, ui?.mode === 'region', () => emit('region'))}
+      {btn(`Pin a comment to an element${kPin}`, <PinIcon width={14} height={14} />, ui?.mode === 'pin', () => emit('pin'))}
+      {btn(`Mark a region${kRegion}`, <BoxIcon width={14} height={14} />, ui?.mode === 'region', () => emit('region'))}
+      {/* v0.6.10 (S6-D7): the freeze button is GATED by frozenViewEnabled —
+          parameters.annotakit.frozenView: false hides it (the bridge omits
+          freeze too). One-render staleness on story switch is the existing
+          UI_STATE pattern. */}
+      {frozenViewEnabled &&
+        btn(
+          ui?.frozen === true
+            ? 'Thaw the frozen view (Esc) — pin what you see while it lasts'
+            : kFreeze
+            ? `Freeze the current view (${kFreeze} — best-effort from the toolbar; the hotkey is the reliable path: no mouse movement, so hover-driven UI cannot close)`
+            : 'Freeze the current view (best-effort from the toolbar)',
+          <span style={{ fontSize: 14, lineHeight: '14px' }} aria-hidden>
+            ❄
+          </span>,
+          ui?.frozen === true,
+          () => emit('freeze'),
+        )}
       <button
-        key="annotakit-drawer"
-        title={apiDown ? 'Annotakit: dev server API down — run `storybook dev`' : 'Threads drawer (⌥D)'}
-        aria-label="Annotakit threads drawer"
-        disabled={apiDown}
+        key="annotakit-threads"
+        title={
+          apiDown
+            ? 'Open the Annotakit threads panel (dev server API down — the panel explains the state)'
+            : `Open the Annotakit threads panel${kDrawer} — the bottom dock; SB docks it left/right too`
+        }
+        aria-label="Annotakit threads panel"
         style={{
           background: 'transparent',
           border: 'none',
@@ -1178,25 +1405,26 @@ function AnnotaKitTool(): React.ReactElement {
           display: 'inline-flex',
           alignItems: 'center',
           gap: 4,
-          cursor: apiDown ? 'default' : 'pointer',
-          ...armed(drawerOn),
+          cursor: 'pointer',
+          ...armed(panelShown),
         }}
-        onClick={() => emit('drawer')}
+        onClick={() => toggleThreadsPanel(storybookApi)}
       >
         <CommentsIcon width={14} height={14} />
         {total > 0 && (
           <span
             title={
-              open > 0
-                ? `${open} open · ${fixed} fixed (awaiting review) · ${total} total`
-                : fixed > 0
-                  ? `${fixed} fixed — awaiting your review (${total} total)`
-                  : `${total} threads, all resolved`
+              open > 0 || fixed > 0 || rejected > 0
+                ? `${open} open · ${fixed} fixed (awaiting review) · ${rejected} rejected (re-work) · ${total} total`
+                : `${total} threads, all resolved`
             }
             style={{
               // v0.6.3: amber = agent work queued, blue = fixes awaiting the
-              // reviewer's verification (0 open + N fixed is NOT "nothing to do")
-              background: open > 0 ? '#d97706' : fixed > 0 ? '#2563eb' : '#94a3b8',
+              // reviewer's verification (0 open + N fixed is NOT "nothing to
+              // do"). v0.6.11 (S7-A): red = rejected re-work. Priority keeps
+              // the existing open-first semantics (the agent work queue);
+              // rejected shows once open+fixed are clear.
+              background: open > 0 ? '#d97706' : fixed > 0 ? '#2563eb' : rejected > 0 ? '#dc2626' : '#94a3b8',
               color: '#fff',
               borderRadius: 999,
               minWidth: 16,
@@ -1208,13 +1436,13 @@ function AnnotaKitTool(): React.ReactElement {
               fontWeight: 700,
             }}
           >
-            {open > 0 ? open : fixed > 0 ? fixed : total}
+            {open > 0 ? open : fixed > 0 ? fixed : rejected > 0 ? rejected : total}
           </span>
         )}
       </button>
       <span key="annotakit-sep" style={{ width: 1, height: 16, background: theme.appBorderColor, margin: '0 4px' }} />
       {btn(
-        ui?.visible === false ? 'Show Annotakit pins (⌥L)' : 'Hide Annotakit pins (⌥L)',
+        ui?.visible === false ? `Show Annotakit pins${kLayer}` : `Hide Annotakit pins${kLayer}`,
         ui?.visible === false ? <EyeCloseIcon width={14} height={14} /> : <EyeIcon width={14} height={14} />,
         ui?.visible !== false,
         () => emit('layer'),
@@ -1225,7 +1453,14 @@ function AnnotaKitTool(): React.ReactElement {
 
 /* --------------------------------- registration -------------------------------- */
 
-addons.register(ADDON_ID, () => {
+addons.register(ADDON_ID, (api: Parameters<typeof toggleThreadsPanel>[0] & { getChannel?: () => unknown }) => {
+  // v0.6.11 (S7-B): preview ⌥P lands here (TOGGLE_THREADS_PANEL — the first
+  // reverse-direction COMMAND; the manager owns panel semantics). Via
+  // addons.ready() so the channel is the REAL one (a bare getChannel() before
+  // ready returns SB's silent mockChannel — the event would vanish).
+  void addons.ready().then((ch: { on: (ev: string, fn: () => void) => void }) => {
+    ch.on(TOGGLE_THREADS_PANEL, () => toggleThreadsPanel(api));
+  });
   addons.add(PANEL_ID, {
     type: types.PANEL,
     title: 'Annotakit',

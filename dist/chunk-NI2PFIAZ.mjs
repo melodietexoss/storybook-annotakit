@@ -6,7 +6,7 @@ import {
   mirrorStateOf,
   renderThreadBlock,
   staticScope
-} from "./chunk-X5NLCX4D.mjs";
+} from "./chunk-MHG5WIGU.mjs";
 
 // src/shared/legacyMirror.ts
 function fmtDate(iso) {
@@ -414,7 +414,7 @@ function mirrorIssueBody(t, cfg) {
   out.push("---");
   out.push("");
   out.push(
-    "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED \u2014 do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node."
+    "Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED \u2014 do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). A `rejected \u2014 the fix was not accepted` notice means re-work is expected (the thread stays in the re-work queue until you re-address it and they confirm). Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node."
   );
   out.push("");
   out.push(GH_SENTINEL);
@@ -1081,7 +1081,7 @@ async function getGhLinkedStaticStore() {
     enqueue("sync", t.id);
     return t;
   });
-  linked.patch = (next) => base.patch(next).then((t) => {
+  linked.patch = (next, opts) => base.patch(next, opts).then((t) => {
     enqueue("sync", t.id);
     return t;
   });

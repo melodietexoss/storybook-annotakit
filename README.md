@@ -12,7 +12,7 @@
 │  ┌────────────────────┐      ┌───────────────────────────────────┐         │
 │  │ NATIVE TOOLBAR:    │      │  global decorator on every story:  │         │
 │  │ 📌pin ▢region 💬   │◄────►│  ⌥C → click element → composer      │         │
-│  │ + Annotakit panel: │ post │  ⌥R → drag region                   │         │
+│  │ + Annotakit panel: │ post │  ⌥B → drag region                   │         │
 │  │ GitHub mirror +    │ msg  │  pins re-anchor on HMR/DOM change  │         │
 │  │ export · mirror +  │ + WS │  fiber walk → component + jsx site  │         │
 │  │ sync status        │      │  DOM snapshot (plan-b evidence)     │         │
@@ -35,6 +35,11 @@
 
 ## Install
 
+> **Agent working in a sandboxed one-port container?** Read **`AGENTS.md`**
+> (ships in the package at `node_modules/storybook-annotakit/AGENTS.md`) —
+> the verified static-bake-under-`/storybook/` setup for Next.js-owned-port
+> environments, the GitHub-issue collaboration loop, and the pitfalls table.
+
 ```bash
 # from a local checkout / tarball (not on the npm registry yet):
 bun add -D file:/path/to/storybook-annotakit       # works if dist/ is built
@@ -55,14 +60,16 @@ That's the entire setup — **local mode works with zero configuration**: pinnin
 ## Reviewer flow
 
 1. `npm run storybook` → any story
-2. **Annotakit toolbar buttons** (native Storybook toolbar): pin · region · threads (+count) · show/hide pins — or press **`⌥C`** and click an element (**`⌥R`** → drag a region)
+2. **Annotakit toolbar buttons** (native Storybook toolbar): pin · region · freeze · threads (+count) · show/hide pins — or press **`⌥C`** and click an element (**`⌥B`** → drag a region; **`⌥I`** → freeze the current view)
 3. The composer shows the exact element identity — `<button#save.primary.btn:nth(2) [testid=save-btn] "Save">` — the SAME string the agent later reads in the digest
 4. Type → **Pin it** (⌘/Ctrl+Enter). Saved, automatically — there is no DB setup to fail.
-5. Threads live in the **Annotakit** panel (bottom dock): reply, resolve / confirm / reject / reopen, export, sync status, and a 📷 *dom* chip per thread opening the captured DOM evidence. v0.6.3 review flow: agents mark threads `fixed` (addressed, awaiting your verification — blue pins, `to review` filter, `recent` sort); `resolved` is your confirmation
+5. Threads live in the **Annotakit** panel (bottom dock — natively dockable left/right, resizable; the v0.6.11 round DELETED the floating drawer that used to cover the canvas, `⌥P` and the toolbar threads button now open THIS panel): reply, resolve / confirm / reject / clear / reopen, export, sync status, and a 📷 *dom* chip per thread opening the captured DOM evidence. Review flow: agents mark threads `fixed` (addressed, awaiting your verification — blue pins, `to review` filter, `recent` sort); `resolved` is your confirmation; `rejected` (v0.6.11) is your DURABLE verdict that a fix was not accepted — red pins, its own filter, the re-work queue; it survives reloads and recalls (clear it explicitly if you change your mind). v0.6.9: every thread with a DOM snapshot also gets a **view (recall)** action — it re-creates the exact view at pin time and shows that one pin ALONE (read-only; the focused one-at-a-time review when the canvas is full of pins). Narrow viewports (<~600px): SB's mobile layout hides the addon panel behind its native "Open addon panel" control — the threads button selects Annotakit, then reveal it with SB's own toggle.
 6. Pins follow their element through re-renders, HMR, and DOM changes (multi-selector anchoring with text/attr fallbacks — ported unchanged from AnnotaKit's proven engine)
 7. With a GitHub token configured, **every thread mirrors to exactly one GitHub issue, automatically** — create → issue, reply → comment, resolve → close, reopen → reopen, delete → close+note. No publish button, no duplicate issues, ever.
 
-Shortcuts (SB-convention Alt/⌥-prefixed, physical-key matched so macOS Option-compose can't break them): `⌥C` pin · `⌥R` region · `⌥L` show/hide pins · `⌥D` drawer · `Esc` cancel · `?` help. Customize via `parameters.annotakit.hotkeys`. The v0.4 floating launcher is GONE — the canvas DOM stays untouched.
+Shortcuts (SB-convention Alt/⌥-prefixed, physical-key matched so macOS Option-compose can't break them): `⌥C` pin · `⌥B` region · `⌥I` freeze/thaw the current view · `⌥L` show/hide pins · `⌥P` open the threads panel · `Esc` cancel · `?` help. They work with ANY focus (canvas, sidebar, addon panel — v0.6.10 bridges manager-side keys to the canvas over the addon channel), never fire inside text fields, and never collide with SB 9/10's own alt-shortcuts (fullScreen ⌥F, panelPosition ⌥D, remount ⌥R, openInIsolation ⌥⇧I … — the v0.6.10 defaults moved OFF that whole collision set; alt+shift+letter is reserved for SB and never matches ours). Customize via `parameters.annotakit.hotkeys`. The v0.4 floating launcher is GONE — the canvas DOM stays untouched.
+
+**Frozen views (v0.6.9, upgraded v0.6.10)** — for focus-driven UI that vanishes when the cursor moves (context menus, tooltips, hover popovers — anything living in a body-level portal): press **`⌥I`** — no mouse movement, so the surface cannot close before the capture (the toolbar button is best-effort; reaching it leaves the iframe). v0.6.10: fully static (form controls/selects cannot drift — captures stay honest across pins), full-fidelity capture (form values incl. selects, canvas bitmaps, shadow DOM — passwords/hidden inputs NEVER serialize their value), scrollable when the story is taller than the viewport, ~1.5 ms to freeze (measured; perf marks `annotakit:freeze`/`frozen-snapshot`/`recall` queryable via the Performance API), and pinnable everywhere the live view is — greyed-out elements included (`:disabled` controls and `pointer-events:none` "locked" sections pin in BOTH the live and frozen views). Disable per story with `parameters.annotakit = { frozenView: false }` (freeze entries hidden + refused with a hint; recall keeps working for existing frozen pins). The current DOM is captured exactly — story clone + open portals + scroll positions, no focus changes, no live-DOM writes — and mounted as a static view. Pin what you see inside it: those threads carry `transient` and honestly NO component/jsx data (the element is a static clone with no fiber; the composer says so). `Esc` thaws back to the LIVE present (the story may have drifted while frozen — honest). **Recall** (`view` in the panel, works cross-story) re-creates that exact state later: all other pins hide, the thread card opens at the pin with confirm/reject right there. Fidelity notes: shadow DOM/canvas content doesn't survive cloning, `:hover`/`:focus` styling isn't active in the static view, scroll isn't restored on recall (it IS copied on freeze). The stored snapshot (90KB subtree-aware budget) is both the evidence and the recall source; clipped snapshots refuse recall honestly (live-flash fallback); pre-v0.6.9 snapshots recall too (positioned at the live root's rect) and are sanitized before paint — our own overlay is stripped, so a ghost composer never resurrects from an old capture.
 
 ## What a thread knows (the differentiator)
 
@@ -79,7 +86,7 @@ Every pin captures, at click time:
 | DOM anchor | `@medv/finder` cssSelector + W3C-style textQuote + fragment bbox | `.bg-amber-50`, `"pending"` |
 | **exact element identity** (v0.5.0) | id, class list, data-testid, nth-of-tag, form name/label/placeholder/value (password-masked), img alt | `button#save.primary.btn:nth(2) [testid=save-btn label="Save"] "Save"` |
 | **React key** (v0.5.0) | nearest fiber `key` — the exact `.map()` item identity | `key="row-42"` |
-| **DOM snapshot** (v0.5.0, plan-b) | story-root outerHTML at pin time, pinned element marked `data-annota-snap="1"`; TEXT so any model can read it (no multimodal); `?format=html` renders it for humans | `GET /threads/<id>/snapshot` |
+| **DOM snapshot** (v0.5.0, plan-b) | story-root outerHTML at pin time (serialized from a temp clone, pinned element marked `data-annota-snap="1"`, password/hidden `value` attributes NEVER stored — React renders defaultValue as a live attribute and it rode into evidence pages before v0.6.10); TEXT so any model can read it (no multimodal); `?format=html` renders it for humans. v0.6.9: frozen views serialize themselves (container + story clone + open portals, `surface:"frozen"`); v0.6.10: PUT broadcasts so live panels pick the new evidence up | `GET /threads/<id>/snapshot` |
 
 So the digest an agent receives says *"StatusBadge, src/components/nimbus/StatusBadge.tsx:12, props status=pending, selector .bg-amber-50, comment: should pulse when overdue"* — instead of a raw HTML blob.
 
@@ -106,16 +113,16 @@ curl -X POST $BASE/annotakit/api/gh/reload               # rotate the .env PAT w
 ```
 
 - The digest maps every thread to **the file to edit** (`jsx:` line, repo-root-relative) plus story file + component + props + selector. Fix the UI, then hand it to the reviewer:
-- **Mark fixed programmatically (Path B)**: `GET /api/threads` → take the thread OBJECT → set `"status":"fixed"` → `PATCH` the FULL object to `/annotakit/api/threads/<id>` = addressed, AWAITING REVIEWER VERIFICATION. The lighter partial form works too: `PATCH` with just `{"status":"fixed"}` (JSON-merge semantics, same field guarantees). `"resolved"` is the reviewer's confirmation (panel ✓ or closing the GitHub issue) — direct open→resolved stays legal for trivial fixes. Status is a validated enum — `open`/`fixed`/`resolved`, case-insensitive, anything else is a 400; the server stamps `resolvedAt` on any →resolved transition and rejects `resolved→fixed` with a 400 (reopen first — a stale full-doc PATCH must never demote a confirmation); stale snapshots are merged server-side — omitted comments are never dropped (union by id). PATCH hardening (v0.6.5): a malformed `target` is a 400 at the door (deep shape validation, POST and full-doc PATCH alike — it used to 500 every later digest), comment ids NEW to the thread are re-hashed server-side (stored ids stay — they are union keys and carry ghId stamps), and a client-supplied `gh` block is dropped (mirror mappings are engine-owned). `POST` is create-only: an idempotent replay (same id) returns 200 with `replayed:true` in the body (and an `X-Annotakit-Replayed` header) — your amended body does NOT land, amend via PATCH. Comment bodies are capped at 64,000 chars (413 beyond); GET /schema documents both PATCH forms and every endpoint.
+- **Mark fixed programmatically (Path B)**: `GET /api/threads` → take the thread OBJECT → set `"status":"fixed"` → `PATCH` the FULL object to `/annotakit/api/threads/<id>` = addressed, AWAITING REVIEWER VERIFICATION. The lighter partial form works too: `PATCH` with just `{"status":"fixed"}` (JSON-merge semantics, same field guarantees). `"resolved"` is the reviewer's confirmation (panel ✓ or closing the GitHub issue) — direct open→resolved stays legal for trivial fixes. Status is a validated enum — `open`/`fixed`/`rejected`/`resolved`, case-insensitive, anything else is a 400; the server stamps `resolvedAt` on any →resolved transition and guards the confusing transitions with 400s (`resolved→fixed` and `resolved→rejected`: reopen first — a stale full-doc PATCH must never demote a confirmation; `open→rejected`: reject is a verdict on a FIX, there is nothing to reject yet); verdict transitions append a SYSTEM COMMENT to the thread (`fixed→rejected`: “rejected — the fix was not accepted. Re-addressed fixes re-enter review.”; `rejected→open`: “verdict cleared — back to open.”) which mirrors to the GitHub issue as a plain comment — the agent-visible re-work signal; from `rejected` the agent re-enters review with `{"status":"fixed"}`; a PATCH may carry `statusAuthor` (control field, never stored) to name the acting reviewer in the notice; stale snapshots are merged server-side — omitted comments are never dropped (union by id). PATCH hardening (v0.6.5): a malformed `target` is a 400 at the door (deep shape validation, POST and full-doc PATCH alike — it used to 500 every later digest), comment ids NEW to the thread are re-hashed server-side (stored ids stay — they are union keys and carry ghId stamps), and a client-supplied `gh` block is dropped (mirror mappings are engine-owned). `POST` is create-only: an idempotent replay (same id) returns 200 with `replayed:true` in the body (and an `X-Annotakit-Replayed` header) — your amended body does NOT land, amend via PATCH. Comment bodies are capped at 64,000 chars (413 beyond); GET /schema documents both PATCH forms and every endpoint.
 - **Create threads programmatically** (idempotent upsert by `id`): POST `/annotakit/api/threads` with `{id?, storyId, story?, component?, target, comments:[{id,author,body,createdAt}]}` — include a stable top-level `id` (e.g. `"fix-header-overflow"`) so replayed/retried POSTs return 200 with the existing thread instead of minting a duplicate (201; the /schema example includes it). Numbers are server-assigned per story; comment ids are deterministically re-hashed server-side — key threads by `id`. With GH auto-sync on, each POST **creates a real issue within ~1s**.
 - **GitHub lifecycle mirror (Path A, v0.4.0 production-grade)** — one issue per thread, forever:
   - The local DB (`threads.db`, git-tracked) is the **status source of truth**; each thread's `gh.issue` field pins its mirror.
   - **Push on every mutation** (debounced, serialized): thread → issue, reply → comment, resolve → close, reopen → reopen, delete → close + note. Idempotent — `POST /annotakit/api/sync` reconciles both directions and creates **zero** duplicates, no matter how often you call it. A thread deleted while its issue is being created self-closes it (no orphans).
-  - **Pull every 60s** (configurable): closing the issue on GitHub CONFIRMS the review — the thread resolves in Storybook within a minute (from open or fixed), importing its comments as replies (`source: "github"`). Reopening re-opens the thread; commenting on a closed issue still imports. A thread the agent marked `fixed` keeps its issue OPEN — the review gate.
+  - **Pull every 60s** (configurable): closing the issue on GitHub CONFIRMS the review — the thread resolves in Storybook within a minute (from open, fixed, or rejected), importing its comments as replies (`source: "github"`). Reopening re-opens the thread; commenting on a closed issue still imports. A thread the agent marked `fixed` keeps its issue OPEN — the review gate.
   - **Failure behavior**: 401 → self-healing a/b/c steps (rotate the PAT, then `POST /annotakit/api/gh/reload` — no restart; pull 401s back off 5min; a rotation resets the rejected state and clears the backoff), mirror pauses, local mode keeps working. Rate limits → timed backoff (Retry-After respected, clock-skew-clamped). A create that crashed mid-flight but actually landed on GitHub is adopted on the next sync (stamped orphan — no duplicate issue, create-crash recovery). Remote issue deleted → mapping resets, fresh issue on the next sync (no dupes; the client engine self-heals the same way). Fetch timeouts, pagination (Link-header following, 10-page cap with a loud truncation warning), and comment-`since` gating keep the API budget flat as threads grow.
   - Knobs: `ANNOTAKIT_GH_AUTO=0` (local mode) · `ANNOTAKIT_GH_POLL=<sec>` · `ANNOTAKIT_GH_REPO` · `ANNOTAKIT_GH_API` (GHE) · `ANNOTAKIT_GH_INTERVAL=<ms>`.
   - `POST /gh` is kept as a legacy alias of `POST /sync` (the old bulk-digest publishing is gone).
-- Loop: reviewer pins → issue appears (carrying the FULL verbatim notes — v0.6.3, issue 16: mirrors never shorten; v0.6.5: a mirror whose body still byte-equals the frozen v0.5.0–v0.6.2 machine render self-heals to full text on the next sync — a human-edited mirror never matches and is never touched) → agent fixes code at the `jsx:` path → agent comments evidence, marks the thread fixed (panel) / leaves the issue open (GitHub — closing means reviewer-confirmed) → reviewer verifies: ✓ confirm (→ resolved, issue closes) or reject (→ open, issue reopens, reply why) → hands-free both directions; without GitHub, the same loop runs entirely over Path B.
+- Loop: reviewer pins → issue appears (carrying the FULL verbatim notes — v0.6.3, issue 16: mirrors never shorten; v0.6.5: a mirror whose body still byte-equals the frozen v0.5.0–v0.6.2 machine render self-heals to full text on the next sync — a human-edited mirror never matches and is never touched) → agent fixes code at the `jsx:` path → agent comments evidence, marks the thread fixed (panel) / leaves the issue open (GitHub — closing means reviewer-confirmed) → reviewer verifies: ✓ confirm (→ resolved, issue closes) or reject (→ `rejected` — DURABLE, red, its own filter + digest re-work section; the issue STAYS OPEN and a system notice comment lands on it — your re-work queue, v0.6.11) → re-addressed fixes re-enter review (`rejected→fixed`) → hands-free both directions; without GitHub, the same loop runs entirely over Path B.
 
 ## Lean exports (feedback-driven)
 
@@ -152,7 +159,7 @@ cd examples/nimbus && bun install && bun run storybook
 node scripts/api-test.mjs          # contract tests (repo root; needs the dev server up)
 node scripts/ghsync-fake.mjs       # lifecycle + stress engine tests (no server needed)
 node scripts/ghclient-test.mjs     # client-side publisher tests (no server needed)
-node scripts/release-check.mjs     # release gate: chunk drift + version agreement + dist FRESHNESS (stale dist fails) + pack-leak guard (--selftest)
+node scripts/release-check.mjs     # release gate: chunk drift + version agreement + dist FRESHNESS (stale dist fails) + dist exact-set + AGENTS.md truth + pack-leak guard (--selftest)
 ```
 
 ## Repo layout
@@ -179,7 +186,7 @@ Feedback threads are per-PROJECT, not per-branch — you review `feature-x`'s St
 
 - **the store lives in the repo's common git dir** (`.git/annotakit/`) — checkouts and `git clean -fdx` physically cannot touch it, and "is the db gitignored" is structurally impossible; all worktrees of one repo share it
 - **durability is a dedicated ORPHAN branch** (`refs/heads/annotakit`, tree = `README` + `threads.db`): pure git plumbing (hash-object/mktree/commit-tree/update-ref — no index, no work tree), pushed with the same debounced mutation flow. Zero commits on your code branches (no CI noise, no review pollution); a foreign branch with the same name is detected and avoided (falls back to `annotakit-store`)
-- **divergence is a logical merge, not a conflict**: two machines pushing the same branch reconcile by union (threads by id, delete-wins tombstones, monotonic status precedence open < fixed < resolved, comment union) — committed on top of the remote head, never force-pushed
+- **divergence is a logical merge, not a conflict**: two machines pushing the same branch reconcile by union (threads by id, delete-wins tombstones, monotonic status precedence open < fixed < rejected < resolved — EXCEPT a downgrade proven by the store-owned `reopenedAt` event stamped on every downward transition, which beats a stale higher-ranked copy; see the v0.6.12 entry, comment union) — committed on top of the remote head, never force-pushed
 - **fresh clones / agent sandboxes boot-restore** from the remote branch (offline-capable right after clone via the tracking ref); a legacy v0.4 tracked db is migrated row-by-row, the old file left untouched
 - no repo / `autoSync:false` → classic `<configDir>/annotakit/threads.db`, disk-only (your choice, no git flow)
 
@@ -218,9 +225,114 @@ node node_modules/storybook-annotakit/scripts/bake-static-threads.mjs <sb-output
 # or: put ANNOTAKIT_GH_TOKEN + ANNOTAKIT_GH_REPO in the project .env — the bake picks them up
 ```
 
+## One-port containers & Next.js apps (the port-3000 world)
+
+The typical agent sandbox: a Next.js app scaffolded onto port 3000 (the ONLY port the
+public URL forwards to), ~4 GiB RAM. `storybook dev` defaulting to :6006 is unreachable
+there, forwarding a second port never survives, and "will it OOM?" — measured (Next 16.4 /
+SB 10.6): `next dev` 343–480 MB, `next start` ~110 MB, `storybook dev` 294–349 MB, one
+`storybook build` spike ~800 MB then exits. **Both dev servers + one build spike fit in
+4 GiB with 2× headroom — just never run two builds concurrently.**
+
+| you need | setup | what you lose |
+|---|---|---|
+| programmatic thread writes at the public origin during the loop (agent REST) | **B — live proxy** | live WS push through the edge |
+| reviewer-only, shareable, frozen; app stays up (prod) | **A — static under the app** | agent REST (use the GitHub mirror / baked threads) |
+| the review session IS the work; app not needed | **C — SB on :3000** | the app itself |
+
+Vitest browser mode is not a review surface (no manager UI, no panel, no pins) — it's a
+test runner; don't reach for it here.
+
+### A — static review build under the Next app
+
+```bash
+bun run build:static    # storybook build -o public/storybook + bake
+node node_modules/storybook-annotakit/scripts/bake-static-threads.mjs public/storybook --base /storybook/
+bun run dev             # or: next start (~110 MB) — the review surface is just files
+```
+
+```ts
+// next.config.ts — the only config: the pretty URL (public/ has no directory-index)
+async rewrites() {
+  return [{ source: "/storybook", destination: "/storybook/index.html" }];
+}
+```
+
+`--base` injects `<base href>` into the build's index.html (idempotent; re-targetable;
+fails LOUD if Storybook's ref shape ever changes). It's Next-specific medicine: plain
+static servers (http-server, serve-static.py, GH Pages at a root path) don't need it.
+Static mode gives pins/replies/resolves in localStorage + client-side GitHub publishing —
+full reviewer flow, zero server processes.
+
+### B — live proxy: SB dev behind the Next origin
+
+```bash
+python3 node_modules/storybook-annotakit/scripts/detach-run.py sb sb.log \
+        bunx storybook dev -p 6006 --ci
+REVIEW_PROXY=1 bun run dev     # agent REST now at <public-origin>/annotakit/api/*
+```
+
+```ts
+// next.config.ts
+const SB = "http://127.0.0.1:6006";
+const live = process.env.REVIEW_PROXY === "1";
+
+async rewrites() {
+  if (!live) return [{ source: "/storybook", destination: "/storybook/index.html" }]; // setup A
+  return {
+    beforeFiles: [                                          // beats public/ — a stale bake can't shadow the proxy
+      { source: "/storybook", destination: `${SB}/` },
+      { source: "/storybook/:path*", destination: `${SB}/:path*` },
+    ],
+    fallback: [{ source: "/:path*", destination: `${SB}/:path*` }], // vite's root module space + the API
+  };
+}
+```
+
+Serving through a proxy whose edge rewrites the Host header? Allowlist BOTH layers or you
+get 403 "Invalid host": `core: { allowedHosts: ['.<your-proxy-domain>'] }` AND
+`viteFinal: config.server.allowedHosts += ['.<your-proxy-domain>']`.
+
+⚠ **Security**: the fallback publishes the whole SB dev surface AND the full review API
+at the public origin — including `POST /gh/reload` and `DELETE /threads/<id>` — and an
+`ANNOTAKIT_API_KEY` does NOT protect you here: the gate sees the Next proxy's loopback
+address, not the real client. Treat the public URL as an unauthenticated door bounded by
+the sandbox's lifetime; prefer A or C for anything long-lived or sensitive.
+
+### C — SB dev directly on :3000 (app paused)
+
+```bash
+kill <next-dev-pid>       # the app pauses; stories are the review surface
+python3 node_modules/storybook-annotakit/scripts/detach-run.py sb sb.log \
+        bunx storybook dev -p 3000 --ci
+```
+
+Native everything, ~350 MB, websockets work best in this shape. To bring the app back:
+kill SB, relaunch `bun run dev` (Next 16 refuses a second dev server of the same project
+while one lives — it names the pid to kill).
+
+### Symptoms → fixes
+
+| symptom | fix |
+|---|---|
+| 403 "Invalid host" through the edge | allowedHosts missing in one of the two layers |
+| every asset 404s under /storybook (static) | re-bake with `--base /storybook/` |
+| stale review content despite `REVIEW_PROXY=1` | stale `public/storybook` shadowing — use the beforeFiles form or delete the dir |
+| 500s on /storybook | SB auto-incremented off 6006 — `ss -tlnp`, relaunch |
+| Next lock error on dev | kill the pid the error names |
+| panel doesn't live-update through the edge | WS degraded at the edge (expected in B) — reopen the panel or use C |
+
+Full experiment record + rationale: `design/2026-10-09-one-port-nextjs-setup.md` (in this repo's `design/` dir).
+
 ## Status
 
-v0.6.9 — reopen-aware store merge (DD-42, found live by the e2e-process-kit's D14 drift row on a git-synced store): the v0.6.3 monotonic status precedence (`open < fixed < resolved`) structurally reverted every deliberate reject/reopen within one sync cycle — merge(local=open, remote=resolved) resolved-wins, the reviewer's click was eaten, then the reverted state was pushed so the remote never learned the reopen; the disagreement loop did not survive sync. **The fix is event-based, not clock-based**: the PATCH door stamps `reopenedAt` on every downward transition (resolved→open, fixed→open — reject/reopen/re-helper), superseded by the next →resolved (which clears it); `mergeThread` honors a downgrade only when the LOWER side carries the event and the higher side does not. A stale lower-rank copy cannot synthesize the event (the transition is guarded), so test 6c's stale-clobber protection holds unchanged; a fresher row with a bumped `updatedAt` and no event still loses. Static-store client keeps stamp parity (incl. the spread-mask trap: a confirmation must post-delete `reopenedAt` or `...prev` resurrects it). First-pass flow (pin→fix→confirm) unchanged — rank covers it. Battery: typecheck clean, api 114/114, ghclient 195/195, static-store 58/58, store-robust 11/11, release-check CLEAN.
+v0.6.12 — version re-alignment with the public repo + the reopen-aware merge folded (DD-42). **Upgrading from public 0.6.9?** Public 0.6.9 was the reopen-aware store-merge hotfix (found live by a downstream kit's drift row): the v0.6.3 monotonic status precedence structurally reverted every deliberate reject/reopen within one sync cycle. It is folded here AND extended to the `rejected` rung. The dev-line rounds 0.6.9–0.6.11 (frozen views + recall, greyed-out pins + the hotkey migration, durable `rejected` + drawer→panel + AGENTS.md) ship in THIS release for the first time — public 0.6.10/0.6.11 never existed (the v0.6.9–v0.6.11 entries below describe those dev rounds). **The fold:** `reopenedAt`, a store-owned event stamped on every DOWNWARD status transition (any rank decrease on open < fixed < rejected < resolved — incl. `rejected→fixed` resubmits and `rejected→open` verdict-clears), lets the store merge honor a deliberate downgrade against a stale higher-ranked copy. Three proofs, all required: the event (a stale replica cannot synthesize it — the transitions are guarded and both PATCH doors normalize it away), recency (the event alone livelocked confirm-after-re-fix), and FRESHNESS (the event must postdate the higher side's last touch — a stale event riding a fresh reply cannot eat a newer confirm; review A1, folded before release). Cleared by the next →resolved; the engines stamp the same event on GitHub-side reopens (else the next sync rank-reverts them). The v0.6.3 reopen-loss and BOTH v0.6.11 rejected-merge losses are dissolved; documented residuals: the legacy window (rows whose last downward act predates the upgrade carry no event), the upward-act class (a fresh `fixed→rejected` still loses to an older resolved — reopen-first discipline), and two-machine same-window races. `STATUS_RANK` is exported from merge.ts as the single ladder (the PATCH doors import it — never hand-copied). Battery: typecheck clean, s6-unit 16, api 126, engine 110, ghclient 195, static 91 (6d/6e/6f ported + the 6g rejected ladder), store 11, release-check CLEAN.
+
+v0.6.11 — the durable-verdict round: rejections stick, and the floating drawer is gone (3-track design critique — 11 P1-class findings folded pre-implementation). **Durable `rejected` (the user-reported bug):** reject used to map `fixed→open`, silently erasing the reviewer’s verdict — on reload/recall every rejected fix read as fresh open feedback. `rejected` is now a real thread status: red pins/regions, its own panel filter + count line, digest re-work section (server + static renderer), four-way export counts, `?status=rejected` filter. Machine: `fixed→rejected` (reject), `rejected→{fixed (agent re-addresses — re-enters review), resolved (confirm after all), open (explicit clear)}`; guards: `open→rejected` and `resolved→rejected` are 400s. The verdict transitions append a SYSTEM COMMENT at both mutation doors (server PATCH + static store) that rides the existing reply-mirror machinery — the GitHub issue STAYS open (work continues) and the notice comment is the agent-visible re-work signal (engine-verified: no state flip, notice lands, idempotent across retries). Merge rank: `open < fixed < rejected < resolved` (a concurrent reject beats a concurrent re-fix; a legitimate resubmit loses to a stale rejected on DIVERGED merges — documented accepted loss, same class as v0.6.3’s reject-to-open). `statusAuthor` control field names the acting reviewer (never stored). **Drawer → panel (the floating panel that blocked the canvas):** DrawerCard is DELETED (~270 lines with its CSS); the toolbar threads button and `⌥P` now open the SB bottom panel with Annotakit selected — natively dockable (bottom/left/right) and resizable, which IS the “drag and reallocate” ask. One shared `toggleThreadsPanel` helper serves all three entry points (toolbar click, manager-focus `⌥P` via the bridge — the any-focus contract survives, preview `⌥P` via the new `TOGGLE_THREADS_PANEL` channel event consumed manager-side through `addons.ready()`); the hotkey config key stays `drawer` (existing configs keep working). Active-state derives from panel heights + selectedPanel (SB’s `layout.showPanel` never flips — verified against SB 10.6’s runtime); the badge gains the rejected count (red) and stays enabled in down mode (the panel explains the state); the orphan count moves to the panel count line (the drawer dot was its only list-surface home). Battery: typecheck clean, s6-unit 16, api 123 (+10 rejected cases), engine 105 (+4 mirror cases), ghclient 195, static 72 (+17 door/merge/digest cases), store 11, release-check CLEAN.
+
+v0.6.10 — the greyed-out round: everything pinnable, everywhere, without collisions (4-track sub-agent audit — 21 findings folded; every fix E2E-verified with REAL input, not synthetic dispatch). **Greyed-out elements pin (the user-reported bug):** Chrome suppresses mousedown/mouseup/click on natively-`:disabled` controls (verified live — pointerdown/up still fire), so the click-capture never ran: hover highlighted the element, the click did nothing. Fix = a dual-path capture (the click listener stays the primary actor for everything else, byte-identical; a pointerup path acts ONLY for `:disabled` targets with down/up pairing, slop and pointerId guards + a lastAct double-fire guard) + region drags start on pointerdown (mousedown suppression used to kill drags that began on a disabled element). `pointer-events:none` "locked" sections (hit-test-invisible — `elementsFromPoint` skips the whole subtree) pin via a refinement walk (deepest pe:none descendant of the hit target, overlay chrome excluded, gate cached per DOM generation) — live AND inside frozen views. **Hotkeys off SB's collision set:** SB 9/10's defaults are alt-based (fullScreen ⌥F, panelPosition ⌥D, remount ⌥R — verified in the shipped bundle) and double-fired with ours when the canvas was focused (SB forwards preview keys over the channel); ours moved to ⌥B region / ⌥P drawer / ⌥I freeze (⌥C/⌥L keep), alt+shift+letter never matches ours (SB's openInIsolation ⌥⇧I / copyStoryLink ⌥⇧L family), and a manager-side bridge (isTrusted + typing-target guarded, inert under `hotkeys:false`) makes our keys work with ANY focus. All manager strings render from the ACTIVE hotkey map (per-story customizations included; no letters shown while hotkeys are off). **Frozen views, hardened:** the keyboard veil uses the S2-walk discipline (the first blanket-inert broke our own composer — the overlay lives INSIDE the story root; caught by the audit, masked by synthetic-event E2E, re-verified with real click+type), the mounted view is truly static (selects/checkboxes/inputs cannot drift — pointerdown/mousedown/click preventDefault + focusin blur at the container), capture fidelity gains form state (values/checked/selected, property + serialized attribute; passwords/hidden NEVER serialize — React's defaultValue attribute stripped everywhere incl. the plain-pin path and old stored snapshots on recall), canvas bitmaps (drawImage + an honest `data-annota-canvas` marker), shadow DOM (mounted views; serialization documents the limit), multi-select keeps every selection, and tall stories scroll (overflow:auto). **Feature flag:** `parameters.annotakit = { frozenView: false }` disables the freeze entries (hidden + refused with a hint; recall keeps working). **Perf, measured:** freeze ≈1.5 ms, per-pin snapshot ≈1.5 ms, recall ≈1 ms on a 315-node story (perf marks `annotakit:freeze`/`frozen-snapshot`/`recall` queryable via the Performance API; no per-freeze serialization cache needed at that cost). **Server:** PUT snapshot broadcasts `THREADS_CHANGED {reason:'snapshot'}` (the newest evidence's view button used to need a manual refresh). New shared hotkey kernel (one parser/matcher for preview + manager + tests). New suites: s6-unit 16 (hotkey kernel + hit-tester with an injectable fake DOM — the harness bug the audit caught (missing parentElement → vacuous depth assertions) is itself pinned by a regression case). Battery: typecheck clean, s6-unit 16, api 113, engine 101, ghclient 195, static 55, store 11, release-check CLEAN + selftest PASS.
+
+v0.6.9 — focus-driven UI pinned + review-at-scale (design-critiqued — 18 findings folded before implementation; every claim E2E-verified on the demo). **Frozen view (S3):** `⌥F`/toolbar freeze clones the current DOM — deep story clone at its exact rect + a body-level portal sweep (radix/floating-ui context menus, tooltips, toasts; SB chrome and zero-area surfaces excluded) + a parallel-walk scroll copy — and mounts it as a static view at body level (below the overlay, outside `[data-annota-overlay]`, clear of the overlay's CSS). The capture never writes the live DOM (no focus changes, no attribute writes) so hover/focus state survives exactly as-is; the clone is cleaned (our overlay stripped, ALL `inert` lifted — the frozen view is a fully pinnable display) and sits on an opaque background ladder (root → body → html → #fff — never "skip"). Pins inside it carry `transient: true` with honestly absent component/jsx meta (clone elements carry no fiber; `inspectComponent` bails on the frozen mount — the ancestor walk would report the overlay's own component); their snapshot IS the frozen view (`surface:"frozen"`, 90KB subtree-aware budget ladder — portal styles never dropped, portals fall off the tail before any clip); after thaw they resolve against the live DOM or show the honest orphan fallback (portal pins are recall-first-class, live-orphan by design — the menu is gone from the live DOM). **Recall (S5):** the panel's `view` action on snapshot-carrying threads re-mounts the stored snapshot as a READ-ONLY view — that one pin shown SOLO (all others hidden; E2E: 8 pins → 1), the thread card at the pin (confirm/reject/reply right there), cross-story via the focusThread retry-until-ack pattern (`THREAD_RECALLED` ack, honest live-flash fallback for missing/clipped snapshots). Pre-v0.6.9 snapshots recall too (legacy shape, positioned at the live root's rect) and are sanitized BEFORE paint — the overlay subtree is stripped (the P0: every legacy snapshot contains the live composer, which would resurrect as a ghost and steal the S2 refocus), scripts/`on*`/`javascript:` neutralized. **S2 RCA + fix ("the comment box shows but won't type"):** story-authored focus traps (the radix/headlessui modal pattern) steal focus from the composer textarea and close modals on outside clicks — reproduced live with a trap-instrumented story ("trap: stole focus back from TEXTAREA.annota-textarea"); fix = inert-while-composing: while an annota surface (composer/popup) is open, every element is inerted EXCEPT the overlay's ancestry path (the overlay lives INSIDE the story root — a flat body-children walk caught our own composer via the story root; the walk descends along the overlay path only) + a post-open rAF refocus (text inputs first — a popup's buttons precede its reply input in document order). **S4 (user directive):** the down-mode canvas badge is gone — the state lives where it's actionable (panel notice, composer warning, toolbar tooltips); the canvas stays overlay-free. **Plumb-through:** `transient` at all three create sites (sqlite/json/staticStore — explicit row builders drop unknown fields); PUT snapshot carries `surface`; static-mode frozen pins get no snapshot (existing honest gate — no recall chip). Battery: typecheck clean, api 113/113, engine (ghsync-fake) 101/101, ghclient 195/195, static-store 55/55, store-robust 11/11, release-check CLEAN + selftest PASS.
 
 v0.6.8 — P0 hotfix: legacy thread fingerprints without `attrs` crashed every fresh visitor’s story at render (`anchor.ts` read `fp.attrs.length` unguarded — found live by the public-edge E2E on the Status Badge demo story; guards added at both consumption sites and the type made honest: `attrs?`).
 

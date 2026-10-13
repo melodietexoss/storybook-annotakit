@@ -53,12 +53,15 @@ export async function createThread(input: ThreadInput): Promise<Thread> {
   )) as Thread;
 }
 
-export async function patchThread(thread: Thread): Promise<Thread> {
+/** v0.6.11 (S7-A): `statusAuthor` is a CONTROL field (never stored) — the
+ *  acting reviewer's name for the system notice comment the server appends
+ *  on verdict transitions (fixed→rejected / rejected→open). */
+export async function patchThread(thread: Thread, statusAuthor?: string): Promise<Thread> {
   return (await json(
     await fetch(`${API_BASE}/threads/${encodeURIComponent(thread.id)}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(thread),
+      body: JSON.stringify(statusAuthor ? { ...thread, statusAuthor } : thread),
     }),
   )) as Thread;
 }
@@ -83,4 +86,10 @@ export async function postSnapshot(threadId: string, snapshot: DomSnapshot): Pro
       body: JSON.stringify(snapshot),
     }),
   );
+}
+
+/** v0.6.9 (S5): fetch a thread's stored snapshot (JSON form) for recall.
+ *  Throws on 404/missing — callers run the honest live-flash fallback. */
+export async function getSnapshot(threadId: string): Promise<DomSnapshot> {
+  return (await json(await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/snapshot`, { cache: 'no-store' }))) as DomSnapshot;
 }

@@ -1,20 +1,33 @@
 import {
   API_BASE,
   FOCUS_THREAD,
+  RECALL_THREAD,
   THREADS_CHANGED,
   THREAD_FOCUSED,
+  THREAD_RECALLED,
+  TOGGLE_THREADS_PANEL,
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-6F4R4EGJ.mjs";
+} from "./chunk-N6VBNK7S.mjs";
 import {
   getGhLinkedStaticStore,
   ghClientStatus
-} from "./chunk-QN5WRF3H.mjs";
+} from "./chunk-NI2PFIAZ.mjs";
 import {
   MAX_BODY_CHARS,
   renderStaticDigest
-} from "./chunk-X5NLCX4D.mjs";
+} from "./chunk-MHG5WIGU.mjs";
+import {
+  DEFAULT_HOTKEYS,
+  hotkeyLabel,
+  hotkeyMatches,
+  isTypingTarget,
+  parseHotkey
+} from "./chunk-F7IFSFQY.mjs";
+import {
+  toggleThreadsPanel
+} from "./chunk-R6AKSCIA.mjs";
 
 // src/manager/index.tsx
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -25,6 +38,9 @@ var ADDON_ID = "annotakit";
 var PANEL_ID = `${ADDON_ID}/panel`;
 var TOOL_ID = `${ADDON_ID}/tool`;
 var AUTHOR_KEY = "annotakit:author";
+var toggleThreadsPanel2 = (api) => {
+  toggleThreadsPanel(api, PANEL_ID);
+};
 async function jfetch(url, init) {
   const res = await fetch(url, init);
   const text = await res.text();
@@ -80,6 +96,7 @@ function ReviewPanel() {
   const storybookApi = useStorybookApi();
   const state = useStorybookState();
   const storyId = state.storyId;
+  const { hk: hkMap, hotkeysOn: hotkeysOnMap, ui: uiState } = useAnnotaHotkeys();
   const [scope, setScope] = useState("story");
   const [filter, setFilter] = useState("all");
   const [sortMode, setSortMode] = useState("story");
@@ -107,11 +124,13 @@ function ReviewPanel() {
     }
   }, []);
   const [modeResolved, setModeResolved] = useState(false);
+  const [probeResult, setProbeResult] = useState(null);
   useEffect(() => {
     let alive = true;
     void probeMode().then((m) => {
       if (!alive) return;
       if (m === "static") setStaticMode(true);
+      setProbeResult(m);
       setModeResolved(true);
     });
     return () => {
@@ -234,6 +253,31 @@ function ReviewPanel() {
     }
     setActiveThread(t.id);
   };
+  const recallThread = (t) => {
+    if (t.storyId !== storyId) {
+      storybookApi.selectStory(t.storyId);
+      const ch = addons.getChannel();
+      let attempts = 0;
+      const ack = () => {
+        attempts = 99;
+        ch.removeListener(THREAD_RECALLED, ack);
+      };
+      ch.on(THREAD_RECALLED, ack);
+      const emitOnce = () => {
+        if (attempts >= 5) {
+          ch.removeListener(THREAD_RECALLED, ack);
+          return;
+        }
+        attempts += 1;
+        ch.emit(RECALL_THREAD, t.id);
+        window.setTimeout(emitOnce, 400);
+      };
+      window.setTimeout(emitOnce, 400);
+    } else {
+      addons.getChannel().emit(RECALL_THREAD, t.id);
+    }
+    setActiveThread(t.id);
+  };
   const reply = async (t, body) => {
     if (!body.trim()) return false;
     setBusy(true);
@@ -261,21 +305,19 @@ function ReviewPanel() {
   const setStatus = async (t, status) => {
     setBusy(true);
     try {
-      const next = {
-        ...t,
-        status,
-        resolvedAt: status === "resolved" ? t.resolvedAt ?? (/* @__PURE__ */ new Date()).toISOString() : void 0
-      };
       if (staticMode) {
         const store = await getGhLinkedStaticStore();
-        await store.patch(next);
+        await store.patch(
+          { ...t, status, resolvedAt: status === "resolved" ? t.resolvedAt ?? (/* @__PURE__ */ new Date()).toISOString() : void 0 },
+          { statusAuthor: author }
+        );
         await refresh();
         return;
       }
       await jfetch(`${API_BASE}/threads/${encodeURIComponent(t.id)}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(next)
+        body: JSON.stringify({ status, statusAuthor: author })
       });
       await refresh();
     } catch (e) {
@@ -442,11 +484,15 @@ function ReviewPanel() {
     [threads, sortMode]
   );
   const shown = useMemo(
-    () => ordered.filter((t) => filter === "all" ? true : filter === "open" ? t.status === "open" : t.status === "fixed"),
+    () => ordered.filter(
+      (t) => filter === "all" ? true : filter === "open" ? t.status === "open" : filter === "review" ? t.status === "fixed" : t.status === "rejected"
+    ),
     [ordered, filter]
   );
   const openCount = ordered.filter((t) => t.status === "open").length;
   const fixedCount = ordered.filter((t) => t.status === "fixed").length;
+  const rejectedCount = ordered.filter((t) => t.status === "rejected").length;
+  const uiOrphan = scope === "story" ? uiState?.orphan ?? 0 : 0;
   const chip = (bg, color) => ({
     background: bg,
     color,
@@ -466,7 +512,7 @@ function ReviewPanel() {
     background: active ? bg : "transparent",
     color: active ? "#fff" : theme.textColor
   });
-  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: theme.fontBase, fontSize: 13, padding: "8px 10px", height: "100%", overflow: "auto", color: theme.textColor } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "story"), onClick: () => setScope("story") }, "This story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "all"), onClick: () => setScope("all") }, "All stories")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "all"), onClick: () => setFilter("all"), title: "Show everything" }, "all"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "open"), onClick: () => setFilter("open"), title: "Show only open (agent work queue)" }, "open"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "review"), onClick: () => setFilter("review"), title: "Threads the agent marked fixed \u2014 awaiting your verification (the check-latest-batch view)" }, "to review")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "story"), onClick: () => setSortMode("story"), title: "Stable order: story title, then thread number \u2014 resolving never reorders the list" }, "by story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "recent"), onClick: () => setSortMode("recent"), title: "Most recently touched first (replies, status flips) \u2014 the what-was-addressed-since-my-last-visit view" }, "recent")), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: theme.textMutedColor } }, threads.length ? `${openCount} open${fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : ""} / ${threads.length} threads` : "no threads"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: theme.fontBase, fontSize: 13, padding: "8px 10px", height: "100%", overflow: "auto", color: theme.textColor } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "story"), onClick: () => setScope("story") }, "This story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "all"), onClick: () => setScope("all") }, "All stories")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "all"), onClick: () => setFilter("all"), title: "Show everything" }, "all"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "open"), onClick: () => setFilter("open"), title: "Show only open (agent work queue)" }, "open"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "review"), onClick: () => setFilter("review"), title: "Threads the agent marked fixed \u2014 awaiting your verification (the check-latest-batch view)" }, "to review"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "rejected"), onClick: () => setFilter("rejected"), title: "Fixes you rejected \u2014 awaiting the agent's re-work (the verdict is durable)" }, "rejected")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "story"), onClick: () => setSortMode("story"), title: "Stable order: story title, then thread number \u2014 resolving never reorders the list" }, "by story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "recent"), onClick: () => setSortMode("recent"), title: "Most recently touched first (replies, status flips) \u2014 the what-was-addressed-since-my-last-visit view" }, "recent")), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: theme.textMutedColor } }, threads.length ? `${openCount} open${fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : ""}${rejectedCount > 0 ? ` \xB7 ${rejectedCount} rejected` : ""}${uiOrphan > 0 ? ` \xB7 ${uiOrphan} orphan` : ""} / ${threads.length} threads` : "no threads"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
     "input",
     {
       style: { padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor, width: 110 },
@@ -579,7 +625,7 @@ function ReviewPanel() {
       title: "Remove localStorage overrides \u2014 the baked annotakit-gh.json applies again"
     },
     "Reset"
-  )), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, "Saved overrides live in THIS browser for THIS deployment (localStorage). Every thread mirrors to exactly ONE issue; queued feedback flushes on the next page load even after crashes. Multiple workstreams on one repo: give each a distinct label set here.")), error && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: "pre-wrap" } }, error), notice && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${positiveColor}22`, color: positiveColor } }, notice), shown.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { padding: "12px 4px", fontSize: 12, color: theme.textMutedColor } }, threads.length === 0 ? scope === "story" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Press ", /* @__PURE__ */ React.createElement("b", null, "\u2325C"), " (Alt+C) in the canvas and click an element \u2014 or ", /* @__PURE__ */ React.createElement("b", null, "\u2325R"), " to drag a region. Everything saves automatically to the dev-server store.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, "\u2325C"), " (Alt+C) in the canvas and click an element.") : filter === "open" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing open \u2014 everything is fixed (awaiting review) or resolved. Switch the filter to \u201Cto review\u201D or \u201Call\u201D.") : filter === "review" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing awaiting review \u2014 no agent fixes pending.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "All threads resolved \u{1F389}.")), shown.map((t) => {
+  )), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, "Saved overrides live in THIS browser for THIS deployment (localStorage). Every thread mirrors to exactly ONE issue; queued feedback flushes on the next page load even after crashes. Multiple workstreams on one repo: give each a distinct label set here.")), error && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: "pre-wrap" } }, error), probeResult === "down" && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "6px 8px", fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: "pre-wrap" } }, "No AnnotaKit store reachable \u2014 pinning is paused. Fixes: run the review surface under ", /* @__PURE__ */ React.createElement("b", null, "storybook dev"), " (the API lives on the dev server), or bake the static build (", /* @__PURE__ */ React.createElement("code", null, "node node_modules/storybook-annotakit/scripts/bake-static-threads.mjs <sb-output-dir>"), "). The canvas stays overlay-free either way."), notice && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${positiveColor}22`, color: positiveColor } }, notice), shown.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { padding: "12px 4px", fontSize: 12, color: theme.textMutedColor } }, threads.length === 0 ? scope === "story" ? hotkeysOnMap ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Press ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.pin)), " in the canvas and click an element \u2014 or ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.region)), " to drag a region. Everything saves automatically to the dev-server store.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Click an element with the toolbar Pin button \u2014 or drag a region with the toolbar Box button. Everything saves automatically to the dev-server store.") : hotkeysOnMap ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.pin)), " in the canvas and click an element.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Use the toolbar Pin button, then click an element in the canvas.") : filter === "open" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing open \u2014 everything is fixed (awaiting review), rejected (awaiting re-work) or resolved. Switch the filter to \u201Cto review\u201D, \u201Crejected\u201D or \u201Call\u201D.") : filter === "review" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing awaiting review \u2014 no agent fixes pending.") : filter === "rejected" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing rejected \u2014 no fixes awaiting re-work.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "All threads resolved \u{1F389}.")), shown.map((t) => {
     const active = t.id === activeThread;
     return /* @__PURE__ */ React.createElement(
       "div",
@@ -600,15 +646,15 @@ function ReviewPanel() {
         "span",
         {
           style: chip(
-            t.status === "open" ? "#f59e0b22" : t.status === "fixed" ? "#2563eb22" : "#16a34a22",
-            t.status === "open" ? "#b45309" : t.status === "fixed" ? "#1d4ed8" : "#15803d"
+            t.status === "open" ? "#f59e0b22" : t.status === "fixed" ? "#2563eb22" : t.status === "rejected" ? "#dc262622" : "#16a34a22",
+            t.status === "open" ? "#b45309" : t.status === "fixed" ? "#1d4ed8" : t.status === "rejected" ? "#b91c1c" : "#15803d"
           ),
-          title: t.status === "fixed" ? "addressed by the agent \u2014 awaiting your verification" : t.status
+          title: t.status === "fixed" ? "addressed by the agent \u2014 awaiting your verification" : t.status === "rejected" ? "you rejected the fix \u2014 re-work expected (durable verdict)" : t.status
         },
         "#",
         t.number,
         " ",
-        t.status === "open" ? "open" : t.status === "fixed" ? "fixed" : "resolved"
+        t.status === "open" ? "open" : t.status === "fixed" ? "fixed" : t.status === "rejected" ? "rejected" : "resolved"
       ), t.gh?.url && /^(https?:)?\/\//i.test(t.gh.url) && /* @__PURE__ */ React.createElement(
         "a",
         {
@@ -622,7 +668,14 @@ function ReviewPanel() {
         /* @__PURE__ */ React.createElement(LinkIcon, { width: 10, height: 10 }),
         " ",
         t.gh.issue
-      ), t.component?.name && /* @__PURE__ */ React.createElement("span", { style: chip(`${theme.colorSecondary}18`, theme.colorSecondary) }, t.component.name), snapshotIds.has(t.id) && /* @__PURE__ */ React.createElement(
+      ), t.component?.name && /* @__PURE__ */ React.createElement("span", { style: chip(`${theme.colorSecondary}18`, theme.colorSecondary) }, t.component.name), t.transient && /* @__PURE__ */ React.createElement(
+        "span",
+        {
+          style: chip("#0c4a6e18", "#0369a1"),
+          title: "Pinned inside a frozen view \u2014 recall (view) shows the exact state"
+        },
+        "\u2744"
+      ), snapshotIds.has(t.id) && /* @__PURE__ */ React.createElement(
         "a",
         {
           href: `${API_BASE}/threads/${encodeURIComponent(t.id)}/snapshot?format=html`,
@@ -634,6 +687,18 @@ function ReviewPanel() {
         },
         /* @__PURE__ */ React.createElement(CameraIcon, { width: 10, height: 10 }),
         " dom"
+      ), snapshotIds.has(t.id) && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          title: "Recall \u2014 re-create the exact view at pin time and show this pin alone (read-only; Esc returns to the live view)",
+          style: { ...chip("#0c4a6e18", "#0369a1"), border: "none", font: "inherit", textDecoration: "none", display: "inline-flex", gap: 3, alignItems: "center", cursor: "pointer" },
+          onClick: (e) => {
+            e.stopPropagation();
+            recallThread(t);
+          }
+        },
+        /* @__PURE__ */ React.createElement(EyeIcon, { width: 10, height: 10 }),
+        " view"
       ), scope === "all" && t.story.name && /* @__PURE__ */ React.createElement("span", { style: chip("#64748b18", theme.textMutedColor) }, t.story.name), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, t.createdAt.slice(0, 10))),
       /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, marginTop: 3, color: theme.textColor, textDecoration: t.status === "resolved" ? "line-through" : "none" } }, t.comments[0]?.body?.split("\n")[0]?.slice(0, 140) ?? "(no text)"),
       t.component?.source && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: theme.textMutedColor, fontFamily: theme.fontMonospace, marginTop: 2 } }, t.component.source.file, t.component.source.line ? `:${t.component.source.line}` : ""),
@@ -705,10 +770,29 @@ function ThreadActions(props) {
     {
       style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: "1px solid #fecaca", background: "transparent", color: "#b91c1c", display: "inline-flex", gap: 4, alignItems: "center" },
       disabled: props.busy,
-      onClick: () => props.onSetStatus(props.thread, "open"),
-      title: "Reject \u2014 back to open (reply with why)"
+      onClick: () => props.onSetStatus(props.thread, "rejected"),
+      title: "Reject \u2014 the fix is not accepted (reply with why); stays rejected until re-addressed"
     },
     "reject"
+  )), props.thread.status === "rejected" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: "1px solid #86efac", background: "transparent", color: "#15803d", display: "inline-flex", gap: 4, alignItems: "center" },
+      disabled: props.busy,
+      onClick: () => props.onSetStatus(props.thread, "resolved"),
+      title: "Confirm after all \u2014 you re-verified and accept the fix"
+    },
+    /* @__PURE__ */ React.createElement(CheckIcon, { width: 11, height: 11 }),
+    "confirm"
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      style: { padding: "3px 9px", fontSize: 11, fontWeight: 600, cursor: props.busy ? "default" : "pointer", borderRadius: 6, border: "1px solid #fecaca", background: "transparent", color: "#b91c1c", display: "inline-flex", gap: 4, alignItems: "center" },
+      disabled: props.busy,
+      onClick: () => props.onSetStatus(props.thread, "open"),
+      title: "Clear the rejection \u2014 back to plain open (the verdict is erased)"
+    },
+    "\u21A9 clear"
   )), props.thread.status === "resolved" && /* @__PURE__ */ React.createElement(
     "button",
     {
@@ -745,8 +829,7 @@ function MiniButton(props) {
     props.children
   );
 }
-function AnnotaKitTool() {
-  const theme = useTheme();
+function useAnnotaHotkeys() {
   const [ui, setUi] = useState(null);
   useEffect(() => {
     const ch = addons.getChannel();
@@ -758,9 +841,48 @@ function AnnotaKitTool() {
       ch.removeListener(UI_STATE, onState);
     };
   }, []);
+  return {
+    hk: ui?.hotkeys ?? DEFAULT_HOTKEYS,
+    hotkeysOn: ui?.hotkeys !== null,
+    // null while hotkeys === false (the bridge goes inert)
+    frozenViewEnabled: ui?.frozenViewEnabled !== false,
+    ui
+  };
+}
+function AnnotaKitTool() {
+  const theme = useTheme();
+  const { hk, hotkeysOn, frozenViewEnabled, ui } = useAnnotaHotkeys();
+  const storybookApi = useStorybookApi();
+  const sbState = useStorybookState();
   const emit = useCallback((command) => {
     addons.getChannel().emit(UI_COMMAND, { command });
   }, []);
+  const hkSpecs = useMemo(
+    () => ({
+      pin: parseHotkey(hk.pin, DEFAULT_HOTKEYS.pin),
+      region: parseHotkey(hk.region, DEFAULT_HOTKEYS.region),
+      layer: parseHotkey(hk.layer, DEFAULT_HOTKEYS.layer),
+      drawer: parseHotkey(hk.drawer, DEFAULT_HOTKEYS.drawer),
+      freeze: parseHotkey(hk.freeze, DEFAULT_HOTKEYS.freeze)
+    }),
+    [hk]
+  );
+  useEffect(() => {
+    if (!hotkeysOn) return void 0;
+    const onKey = (e) => {
+      if (!e.isTrusted) return;
+      if (isTypingTarget(e.target)) return;
+      if (hotkeyMatches(e, hkSpecs.pin)) emit("pin");
+      else if (hotkeyMatches(e, hkSpecs.region)) emit("region");
+      else if (hotkeyMatches(e, hkSpecs.layer)) emit("layer");
+      else if (!e.repeat && hotkeyMatches(e, hkSpecs.drawer)) toggleThreadsPanel2(storybookApi);
+      else if (frozenViewEnabled && hotkeyMatches(e, hkSpecs.freeze)) emit("freeze");
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [hkSpecs, hotkeysOn, frozenViewEnabled, emit, storybookApi]);
   const apiDown = ui?.apiOk === false;
   const armed = (on) => ({
     color: on ? theme.barSelectedColor : theme.barTextColor,
@@ -789,15 +911,26 @@ function AnnotaKitTool() {
   );
   const open = ui?.open ?? 0;
   const fixed = ui?.fixed ?? 0;
+  const rejected = ui?.rejected ?? 0;
   const total = ui?.total ?? 0;
-  const drawerOn = ui?.drawerOpen === true;
-  return /* @__PURE__ */ React.createElement("div", { key: "annotakit-tool", style: { display: "inline-flex", alignItems: "center", gap: 2 } }, btn("Pin a comment to an element (\u2325C)", /* @__PURE__ */ React.createElement(PinIcon, { width: 14, height: 14 }), ui?.mode === "pin", () => emit("pin")), btn("Mark a region (\u2325R)", /* @__PURE__ */ React.createElement(BoxIcon, { width: 14, height: 14 }), ui?.mode === "region", () => emit("region")), /* @__PURE__ */ React.createElement(
+  const layout = sbState.layout;
+  const panelShown = sbState.selectedPanel === PANEL_ID && ((layout?.bottomPanelHeight ?? 0) > 0 || (layout?.rightPanelWidth ?? 0) > 0) && sbState.viewMode === "story";
+  const kPin = hotkeysOn ? ` (${hotkeyLabel(hk.pin)})` : "";
+  const kRegion = hotkeysOn ? ` (${hotkeyLabel(hk.region)})` : "";
+  const kLayer = hotkeysOn ? ` (${hotkeyLabel(hk.layer)})` : "";
+  const kDrawer = hotkeysOn ? ` (${hotkeyLabel(hk.drawer)})` : "";
+  const kFreeze = hotkeysOn ? hotkeyLabel(hk.freeze) : "";
+  return /* @__PURE__ */ React.createElement("div", { key: "annotakit-tool", style: { display: "inline-flex", alignItems: "center", gap: 2 } }, btn(`Pin a comment to an element${kPin}`, /* @__PURE__ */ React.createElement(PinIcon, { width: 14, height: 14 }), ui?.mode === "pin", () => emit("pin")), btn(`Mark a region${kRegion}`, /* @__PURE__ */ React.createElement(BoxIcon, { width: 14, height: 14 }), ui?.mode === "region", () => emit("region")), frozenViewEnabled && btn(
+    ui?.frozen === true ? "Thaw the frozen view (Esc) \u2014 pin what you see while it lasts" : kFreeze ? `Freeze the current view (${kFreeze} \u2014 best-effort from the toolbar; the hotkey is the reliable path: no mouse movement, so hover-driven UI cannot close)` : "Freeze the current view (best-effort from the toolbar)",
+    /* @__PURE__ */ React.createElement("span", { style: { fontSize: 14, lineHeight: "14px" }, "aria-hidden": true }, "\u2744"),
+    ui?.frozen === true,
+    () => emit("freeze")
+  ), /* @__PURE__ */ React.createElement(
     "button",
     {
-      key: "annotakit-drawer",
-      title: apiDown ? "Annotakit: dev server API down \u2014 run `storybook dev`" : "Threads drawer (\u2325D)",
-      "aria-label": "Annotakit threads drawer",
-      disabled: apiDown,
+      key: "annotakit-threads",
+      title: apiDown ? "Open the Annotakit threads panel (dev server API down \u2014 the panel explains the state)" : `Open the Annotakit threads panel${kDrawer} \u2014 the bottom dock; SB docks it left/right too`,
+      "aria-label": "Annotakit threads panel",
       style: {
         background: "transparent",
         border: "none",
@@ -805,20 +938,23 @@ function AnnotaKitTool() {
         display: "inline-flex",
         alignItems: "center",
         gap: 4,
-        cursor: apiDown ? "default" : "pointer",
-        ...armed(drawerOn)
+        cursor: "pointer",
+        ...armed(panelShown)
       },
-      onClick: () => emit("drawer")
+      onClick: () => toggleThreadsPanel2(storybookApi)
     },
     /* @__PURE__ */ React.createElement(CommentsIcon, { width: 14, height: 14 }),
     total > 0 && /* @__PURE__ */ React.createElement(
       "span",
       {
-        title: open > 0 ? `${open} open \xB7 ${fixed} fixed (awaiting review) \xB7 ${total} total` : fixed > 0 ? `${fixed} fixed \u2014 awaiting your review (${total} total)` : `${total} threads, all resolved`,
+        title: open > 0 || fixed > 0 || rejected > 0 ? `${open} open \xB7 ${fixed} fixed (awaiting review) \xB7 ${rejected} rejected (re-work) \xB7 ${total} total` : `${total} threads, all resolved`,
         style: {
           // v0.6.3: amber = agent work queued, blue = fixes awaiting the
-          // reviewer's verification (0 open + N fixed is NOT "nothing to do")
-          background: open > 0 ? "#d97706" : fixed > 0 ? "#2563eb" : "#94a3b8",
+          // reviewer's verification (0 open + N fixed is NOT "nothing to
+          // do"). v0.6.11 (S7-A): red = rejected re-work. Priority keeps
+          // the existing open-first semantics (the agent work queue);
+          // rejected shows once open+fixed are clear.
+          background: open > 0 ? "#d97706" : fixed > 0 ? "#2563eb" : rejected > 0 ? "#dc2626" : "#94a3b8",
           color: "#fff",
           borderRadius: 999,
           minWidth: 16,
@@ -830,16 +966,19 @@ function AnnotaKitTool() {
           fontWeight: 700
         }
       },
-      open > 0 ? open : fixed > 0 ? fixed : total
+      open > 0 ? open : fixed > 0 ? fixed : rejected > 0 ? rejected : total
     )
   ), /* @__PURE__ */ React.createElement("span", { key: "annotakit-sep", style: { width: 1, height: 16, background: theme.appBorderColor, margin: "0 4px" } }), btn(
-    ui?.visible === false ? "Show Annotakit pins (\u2325L)" : "Hide Annotakit pins (\u2325L)",
+    ui?.visible === false ? `Show Annotakit pins${kLayer}` : `Hide Annotakit pins${kLayer}`,
     ui?.visible === false ? /* @__PURE__ */ React.createElement(EyeCloseIcon, { width: 14, height: 14 }) : /* @__PURE__ */ React.createElement(EyeIcon, { width: 14, height: 14 }),
     ui?.visible !== false,
     () => emit("layer")
   ));
 }
-addons.register(ADDON_ID, () => {
+addons.register(ADDON_ID, (api) => {
+  void addons.ready().then((ch) => {
+    ch.on(TOGGLE_THREADS_PANEL, () => toggleThreadsPanel2(api));
+  });
   addons.add(PANEL_ID, {
     type: types.PANEL,
     title: "Annotakit",

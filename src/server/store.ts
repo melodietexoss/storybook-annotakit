@@ -217,6 +217,10 @@ function sqliteStore(db: SqliteDb, storePath: string): Store {
       component: input.component ?? null,
       target: input.target,
       comments: input.comments,
+      // v0.6.9 (S3): transient (frozen-capture) flag plumb-through — explicit
+      // row builders drop unknown ThreadInput fields, so every create site
+      // carries it (sqlite here, json store, staticStore).
+      transient: input.transient === true ? true : undefined,
     };
     db.prepare('INSERT INTO threads (id, number, story_id, status, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?)').run(
       id,
@@ -527,6 +531,8 @@ function jsonStore(storePath: string): Store {
           component: input.component ?? null,
           target: input.target,
           comments: input.comments,
+          // v0.6.9 (S3): transient plumb-through (json store create).
+          transient: input.transient === true ? true : undefined,
         };
         doc.threads.push(thread);
         return thread;

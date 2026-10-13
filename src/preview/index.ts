@@ -10,6 +10,7 @@
  *       disabled: true,                       // opt this story out
  *       hotkeys: { pin: 'k', region: 'x' },   // customize shortcuts
  *       hotkeys: false,                       // disable shortcuts (UI only)
+ *       frozenView: false,                    // v0.6.10: no freeze entry points
  *     },
  *   }
  */
@@ -23,7 +24,7 @@ export const decorators = [
   (StoryFn: () => React.ReactElement, context: any) => {
     if (context?.viewMode === 'docs') return React.createElement(StoryFn);
     const params = context?.parameters?.annotakit as
-      | { disabled?: boolean; hotkeys?: Partial<Hotkeys> | false }
+      | { disabled?: boolean; hotkeys?: Partial<Hotkeys> | false; frozenView?: boolean }
       | undefined;
     if (params?.disabled) return React.createElement(StoryFn);
 
@@ -37,6 +38,7 @@ export const decorators = [
         title: context?.title,
         name: context?.name,
         hotkeys: params?.hotkeys,
+        frozenView: params?.frozenView !== false,
       }),
     );
   },

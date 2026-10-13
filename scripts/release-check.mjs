@@ -22,11 +22,15 @@
  *      from an earlier build that bypassed npm run build's rmSync) ships
  *      dead code silently — v0.6.4's tag carried 9, one with stale
  *      pre-fix logic that could re-enter a future clean:false run.
+ *   6. v0.6.11 (S7-C/F6): AGENTS.md truth — the consumer-agent guide must
+ *      ship (files whitelist), carry the canonical /storybook setup
+ *      commands (--base flag + the next.config rewrite), and the
+ *      fine-grained-PAT guidance (the token-in-bake risk is load-bearing).
  *
  * Self-test: `node scripts/release-check.mjs --selftest` plants a ghost
- * chunk, a fake package.json version drift, a stale dist banner, AND a
- * tracked orphan — expects ALL FOUR to be caught, restoring state in
- * finally.
+ * chunk, a fake package.json version drift, a stale dist banner, a tracked
+ * orphan, AND a gutted AGENTS.md — expects ALL FIVE to be caught, restoring
+ * state in finally.
  *
  * Exit codes: 0 = clean, 1 = release-dirty, 2 = selftest failure.
  */
@@ -177,6 +181,33 @@ function distSetProblems() {
   }
 }
 
+/* 6 — v0.6.11 (S7-C/F6): the consumer guide ships and tells the verified
+ * truth. AGENTS.md is the first file an agent in a sandboxed environment
+ * reads (referenced from README Install + One-port sections); a missing or
+ * gutted file ships a broken first-run experience. Checks: presence, the
+ * whitelist entry, the canonical /storybook setup commands, and the
+ * fine-grained-PAT guidance (the token-in-bake risk is load-bearing).
+ * v0.6.12 (S7-AUDIT-D6): extracted into a function so the selftest can
+ * plant a gutted AGENTS.md and prove THIS gate bites. */
+function agentsGuideProblems() {
+  const out = [];
+  const agentsPath = path.join(root, 'AGENTS.md');
+  if (!fs.existsSync(agentsPath)) {
+    out.push('AGENTS.md missing — the consumer-agent guide must ship with the package');
+    return out;
+  }
+  const agents = fs.readFileSync(agentsPath, 'utf8');
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const missing = [];
+  if (!pkg.files?.includes('AGENTS.md')) missing.push('not in package.json files whitelist');
+  if (!agents.includes('--base /storybook/')) missing.push('missing the --base /storybook/ bake flag');
+  if (!agents.includes('"/storybook", destination: "/storybook/index.html"')) missing.push('missing the next.config.ts rewrite');
+  if (!/fine-grained PAT/i.test(agents)) missing.push('missing the fine-grained-PAT guidance (token-in-bake risk)');
+  if (missing.length) out.push(`AGENTS.md incomplete: ${missing.join('; ')}`);
+  else notes.push('AGENTS.md: ships, whitelisted, and carries the verified setup + PAT guidance');
+  return out;
+}
+
 /* --------------------------------- selftest --------------------------------- */
 if (process.argv.includes('--selftest')) {
   const ghost = path.join(root, 'dist', 'chunk-DEADBEEF.mjs');
@@ -227,17 +258,30 @@ if (process.argv.includes('--selftest')) {
       fs.rmSync(orphan, { force: true });
       if (orphanStaged) run('git', ['rm', '--cached', '--quiet', '--', 'dist/chunk-SELFTEST-ORPHAN.mjs']);
     }
+    // (e) gutted AGENTS.md → the real gate-6 must catch it (S7-AUDIT-D6:
+    // gate 6 previously had NO selftest coverage — "selftest PASS" in the
+    // v0.6.11 commit meant only the pre-existing four plants)
+    const agentsPath = path.join(root, 'AGENTS.md');
+    const origAgents = fs.readFileSync(agentsPath, 'utf8');
+    try {
+      fs.writeFileSync(agentsPath, origAgents.replaceAll('--base /storybook/', '--base /WRONG/').replace(/fine-grained PAT/gi, 'any PAT'));
+      const ap = agentsGuideProblems();
+      if (ap.length !== 1 || !/incomplete/.test(ap[0]) || !/--base/.test(ap[0]) || !/fine-grained[- ]PAT/i.test(ap[0])) { console.error(`selftest FAIL: AGENTS gate did not bite (reported ${JSON.stringify(ap)})`); failed++; }
+    } finally {
+      fs.writeFileSync(agentsPath, origAgents);
+    }
   } finally {
     fs.rmSync(ghost, { force: true });
     fs.writeFileSync(pkgPath, origPkg);
     if (origDist !== null) fs.writeFileSync(distPath, origDist);
   }
-  console.log(failed === 0 ? 'release-check selftest: PASS (ghost chunk + version drift + stale dist + tracked orphan all caught)' : 'release-check selftest: FAIL');
+  console.log(failed === 0 ? 'release-check selftest: PASS (ghost chunk + version drift + stale dist + tracked orphan + gutted AGENTS.md all caught)' : 'release-check selftest: FAIL');
   process.exit(failed === 0 ? 0 : 2);
 }
 
 /* --------------------------------- verdict ---------------------------------- */
 problems.push(...versionProblems(), ...distFreshnessProblems(), ...distSetProblems());
+problems.push(...agentsGuideProblems());
 for (const n of notes) console.log(`  ok  ${n}`);
 if (problems.length) {
   for (const p of problems) console.error(`  FAIL  ${p}`);

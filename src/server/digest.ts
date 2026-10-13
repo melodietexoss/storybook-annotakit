@@ -71,7 +71,9 @@ function threadBlock(t: Thread, snapshotUrl?: string, full?: boolean): string[] 
   // H-B-15 (P3): an unknown/legacy status used to render as RESOLVED and
   // then VANISH from every bucket (not open/fixed/resolved) — threads
   // silently disappeared from digests. Unknown → OPEN everywhere.
-  const status = t.status === 'fixed' ? 'FIXED' : t.status === 'resolved' ? 'RESOLVED' : 'OPEN';
+  // v0.6.11 (S7-A): rejected renders REJECTED (still unknown-safe).
+  const status =
+    t.status === 'fixed' ? 'FIXED' : t.status === 'resolved' ? 'RESOLVED' : t.status === 'rejected' ? 'REJECTED' : 'OPEN';
   const out: string[] = [];
   // v0.6.7 link-safety: NEVER emit `#N` in a GitHub-rendered surface — GitHub
   // auto-links `#2` to UNRELATED issue/PR #2 of the mirror repo. `Thread 2`
@@ -142,7 +144,9 @@ function threadBlock(t: Thread, snapshotUrl?: string, full?: boolean): string[] 
   if (t.status === 'resolved' && t.resolvedAt) {
     out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
   } else if (t.status === 'fixed') {
-    out.push('  - fixed: addressed, awaiting reviewer verification (confirm → resolved, reject → open)');
+    out.push('  - fixed: addressed, awaiting reviewer verification (confirm → resolved, reject → rejected)');
+  } else if (t.status === 'rejected') {
+    out.push('  - rejected: the fix was NOT accepted — re-work expected (re-address → fixed re-enters review)');
   }
   out.push('');
   return out;
@@ -153,10 +157,12 @@ export function renderDigest(
   opts?: { origin?: string; mirror?: boolean; snapshotIds?: Set<string>; fullText?: boolean },
 ): string {
   const out: string[] = [];
-  // three-way counts (v0.6.3). Number(...)||0 guards old bundles whose
-  // counts lack `fixed` (undefined → NaN through reduce — ?? does NOT catch NaN)
+  // four-way counts (v0.6.3 → v0.6.11 S7-A adds rejected). Number(...)||0
+  // guards old bundles whose counts lack a key (undefined → NaN through
+  // reduce — ?? does NOT catch NaN)
   const open = stories.reduce((n, s) => n + (Number(s.counts.open) || 0), 0);
   const fixed = stories.reduce((n, s) => n + (Number(s.counts.fixed) || 0), 0);
+  const rejected = stories.reduce((n, s) => n + (Number(s.counts.rejected) || 0), 0);
   const resolved = stories.reduce((n, s) => n + (Number(s.counts.resolved) || 0), 0);
   const title =
     stories.length === 1
@@ -165,7 +171,7 @@ export function renderDigest(
 
   out.push(`# ${title}`);
   out.push('');
-  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${resolved} resolved · ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`);
+  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${rejected} rejected (re-work) / ${resolved} resolved · ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`);
   if (opts?.origin) out.push(`storybook: ${opts.origin}`);
   out.push('');
 
@@ -186,8 +192,12 @@ export function renderDigest(
       out.push('');
       continue;
     }
-    const openThreads = s.threads.filter((t) => t.status !== 'fixed' && t.status !== 'resolved');
+    // v0.6.11 (S7-A): the negative predicate keeps the H-B-15 unknown→open
+    // bucket AND excludes rejected from double-listing (rejected threads
+    // appear ONLY in the re-work section below).
+    const openThreads = s.threads.filter((t) => t.status !== 'fixed' && t.status !== 'rejected' && t.status !== 'resolved');
     const reviewThreads = s.threads.filter((t) => t.status === 'fixed');
+    const reworkThreads = s.threads.filter((t) => t.status === 'rejected');
     const done = s.threads.filter((t) => t.status === 'resolved');
     // local mode: point agents at the plan-b evidence when it exists
     const snapUrl = (t: Thread): string | undefined =>
@@ -199,6 +209,14 @@ export function renderDigest(
       out.push(`**${reviewThreads.length} awaiting review (agent marked fixed):**`);
       out.push('');
       for (const t of reviewThreads) out.push(...threadBlock(t, snapUrl(t), opts?.fullText));
+    }
+    // v0.6.11 (S7-A): the re-work queue — REJECTED fixes, listed with the
+    // reviewer's verdict (the system notice comment + any why-reply ride the
+    // thread block's reply lines). Between "awaiting review" and resolved.
+    if (reworkThreads.length) {
+      out.push(`**${reworkThreads.length} rejected — re-work (the reviewer did not accept the fix):**`);
+      out.push('');
+      for (const t of reworkThreads) out.push(...threadBlock(t, snapUrl(t), opts?.fullText));
     }
     if (done.length) {
       out.push(`<details><summary>${done.length} resolved</summary>`);
@@ -212,10 +230,10 @@ export function renderDigest(
   out.push('---');
   out.push('');
   const footer = opts?.mirror
-    ? 'Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED — do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). ' +
+    ? 'Agent loop: fix the code at the `jsx:`/`component file:` paths, comment with fix evidence, then mark the thread FIXED — do NOT close this issue: on this mirror, closing = the reviewer CONFIRMED your fix (they close it, or confirm in the panel). A REJECTED thread means the fix was not accepted: re-work it and comment evidence again, then mark it FIXED again for re-verification. ' +
       'Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.'
     : 'Agent loop: fix the code at the `jsx:`/`component file:` paths, then PATCH ' +
-      `${opts?.origin ?? ''}/annotakit/api/threads/<id> with {"status":"fixed"} (addressed, awaiting the reviewer\'s verification — {"status":"resolved"} is the reviewer\'s confirmation, not yours). ` +
+      `${opts?.origin ?? ''}/annotakit/api/threads/<id> with {"status":"fixed"} (addressed, awaiting the reviewer\'s verification — {"status":"resolved"} is the reviewer\'s confirmation, not yours; a REJECTED thread needs re-work: fix again, then PATCH {"status":"fixed"} to re-enter review). ` +
       'Note: `jsx: file:line` points at the component definition (may be a few lines off); the `element:`/`selector:` lines pinpoint the exact pinned node.';
   out.push(footer);
   out.push('');

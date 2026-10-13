@@ -12,14 +12,11 @@
  * Field-level semantics (A3):
  *   - threads: union by id; tombstones (deleted_threads) WIN over any row
  *   - per thread: comments union by comment id (body of higher row wins on
- *     same id), status = monotonic precedence open < fixed < resolved
- *     (v0.6.3 — extends "resolved-wins": a stale 'open' can't clobber 'fixed',
- *     a stale 'fixed' can't clobber 'resolved') EXCEPT (v0.6.9, DD-42) a
- *     DOWNGRADE is honored when the lower side carries the reopen event
- *     (reopenedAt) and the higher side does not — the deliberate
- *     reject/reopen survives sync; documented losses narrowed to: a
- *     two-machine reopen race within one sync window (both-with → rank wins,
- *     self-correcting), gh mapping = either side's
+ *     same id), status = monotonic precedence open < fixed < rejected <
+ *     resolved EXCEPT a downgrade proven by the store-owned reopen event
+ *     (reopenedAt — see STATUS_RANK below for the three proofs and the
+ *     documented residuals; the v0.6.3 "lost reopen" class is dissolved),
+ *     gh mapping = either side's
  *     (mapping loss = duplicate issues), every other scalar from the row with
  *     higher updatedAt
  *   - tombstone sets: union (a delete observed anywhere is final)
@@ -75,8 +72,42 @@ function unionComments(a: Thread, b: Thread): Comment[] {
   return out;
 }
 
-/** Monotonic status precedence (v0.6.3): open < fixed < resolved. */
-const STATUS_RANK: Record<Thread['status'], number> = { open: 0, fixed: 1, resolved: 2 };
+/** Monotonic status precedence (v0.6.3): open < fixed < resolved.
+ *  v0.6.11 (S7-A): open < fixed < rejected < resolved — a concurrent
+ *  reviewer-reject (from base fixed) beats a concurrent agent re-fix
+ *  (same base, EVENT-FREE rows — see below), and a confirm still outranks
+ *  everything. The `Record` type is deliberate: a missing key is a COMPILE
+ *  error, not a silent undefined comparison (undefined >= 2 → false →
+ *  remote wins — wrong merge). Exported (v0.6.12): the PATCH doors import
+ *  the SAME ladder for the rank-decrease stamp rule — never hand-copy it.
+ *  v0.6.12 (DD-42 fold, extends public v0.6.9): a DOWNGRADE is honored
+ *  when the lower side carries the reopen EVENT (reopenedAt — a store-owned
+ *  stamp on every rank decrease) AND is the newer row AND the event is
+ *  FRESH (postdates the higher side's last touch). Three proofs, all
+ *  required: the event is qualitative (a deliberate downgrade occurred — a
+ *  stale replica cannot synthesize it, 6c holds), recency orders the rows,
+ *  freshness stops a stale event riding a fresh NON-STATUS touch (a reply)
+ *  from eating a newer confirm. Documented residuals:
+ *   - the LEGACY WINDOW: rows whose last downward act predates the upgrade
+ *     carry no event — their reopens/resubmits/clears still lose to rank
+ *     until the next act re-stamps (the old v0.6.3/v0.6.11 behavior);
+ *   - the UPWARD-ACT class: fixed→rejected stamps nothing (upward), so a
+ *     fresh reject vs an OLDER resolved copy still loses by rank (intended
+ *     — reopen-first discipline; resolved→rejected is a 400);
+ *   - two-machine transition races within one sync window (equal/interleaved
+ *     timestamps): exact updatedAt ties resolve by RANK — the freshness
+ *     proof can never pass on a tie (every door stamps reopenedAt before
+ *     updatedAt, so E <= lo.updatedAt == hi.updatedAt), which is the more
+ *     conservative outcome; self-correcting on the next act. A NEWER
+ *     event-carrying re-fix may also beat a concurrent reject (newest-act
+ *     rule — S7's reject-beats-re-fix holds for event-free rows).
+ *  Equal-rank merges may graft an event onto a same-status row — benign
+ *  (resolved is never the lo side; the doors clean it at the next write).
+ *  Loss SITE note: single-machine dev flows never merge, but EVERY static
+ *  load merges seed ∪ persisted (staticStore) — a re-baked seed refreshed
+ *  from a dev-mode store can carry the stale side (the bake writes payloads
+ *  verbatim, so event-carrying seeds are legal and load-bearing). */
+export const STATUS_RANK: Record<Thread['status'], number> = { open: 0, fixed: 1, rejected: 2, resolved: 3 };
 
 /** Merge ONE thread id from both sides (rows may be absent on either side). */
 function mergeThread(local: Thread | undefined, remote: Thread | undefined): Thread | null {
@@ -85,28 +116,47 @@ function mergeThread(local: Thread | undefined, remote: Thread | undefined): Thr
   const newer = later(local, remote);
   const older = newer === local ? remote : local;
   const merged = cloneThread(newer);
-  // v0.6.9 (DD-42, adversarially folded): status merges by monotonic rank
-  // (amendment 8) EXCEPT a downgrade is honored when the LOWER side carries
-  // the reopen EVENT (reopenedAt — a server-stamped, guarded downward
-  // transition) AND is the NEWER row (later()). Two proofs, both required:
-  // the event is qualitative (a deliberate reopen/reject occurred — a stale
-  // replica without one cannot clobber, 6c holds), recency is the ordering
-  // (it happened after the other side's state was written). Recency alone
-  // was rejected (clock-skew clobber); the event alone LIVELOCKS the
-  // confirm-after-re-fix (the event persists on the fixed row by design, so
-  // a fresh confirm — newer, event cleared — would be reverted by the older
-  // fixed+event copy forever) and eats the round-2 reject (both sides carry
-  // events). Residual: a two-machine transition race from a common base
-  // (equal updatedAt) resolves by rank — self-correcting on the next act.
-  // A resolved row may graft an event via equal-rank merge (P2, benign —
-  // it only makes resolved stickier; resolved is never the lo side).
+  // status: monotonic precedence (design amendment 8 — recency-resolved
+  // status was considered and rejected: loses agent fixes more often than
+  // it saves) EXCEPT (v0.6.12, DD-42 fold extending public v0.6.9) a
+  // DOWNGRADE is honored when the lower side proves the deliberate act:
+  //   (1) EVENT — lo carries reopenedAt (store-owned, stamped on every rank
+  //       decrease; a stale replica cannot synthesize it → 6c's stale-clobber
+  //       protection holds);
+  //   (2) RECENCY — lo is the newer row (later()). The event alone LIVELOCKS
+  //       confirm-after-re-fix (the event persists on the fixed row by
+  //       design, so a fresh confirm — newer, event cleared — would be
+  //       reverted by the older fixed+event copy forever) and eats the
+  //       round-2 reject (both sides carry events);
+  //   (3) FRESHNESS — the event postdates the hi side's last touch
+  //       (Date.parse(lo.reopenedAt) > Date.parse(hi.updatedAt)). Without
+  //       it, a STALE event riding a fresh NON-STATUS touch (a reply bumping
+  //       updatedAt) eats a newer confirm — the act itself is old. Doors
+  //       stamp reopenedAt and updatedAt in the same patch, so E ≤
+  //       lo.updatedAt always; garbage event strings → NaN → inert (rank
+  //       wins). A garbage hi.updatedAt → the event is trusted.
+  // Residuals (documented above STATUS_RANK): the legacy window, the
+  // upward-act class, two-machine same-window races.
   const rankL = STATUS_RANK[local.status];
   const rankR = STATUS_RANK[remote.status];
   const hi = rankL >= rankR ? local : remote;
   const lo = rankL >= rankR ? remote : local;
-  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo;
+  const hiT = Date.parse(hi.updatedAt ?? '');
+  const eventFresh = !Number.isFinite(hiT) || Date.parse(lo.reopenedAt ?? '') > hiT;
+  const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo && eventFresh;
   merged.status = downgradeProven ? lo.status : hi.status;
-  merged.reopenedAt = (downgradeProven ? lo : hi).reopenedAt; // the winning side's own event — never cross-contaminated
+  // S7-AUDIT-B1: on an EQUAL-RANK merge the winning (newer) event-less row
+  // used to silently DROP the older side's event — an unconfirmed downgrade
+  // in the union history vanished, and the next merge against a stale
+  // higher-ranked copy rank-reverted it (the exact DD-42 loss, through a
+  // side door; reproduced live). Carry it: the event survives on the
+  // same-status row (resolved never legitimately carries one — the doors
+  // clean it; unequal-rank supersession is untouched, pinned by 6e/6g4).
+  merged.reopenedAt = downgradeProven
+    ? lo.reopenedAt
+    : rankL === rankR && merged.status !== 'resolved'
+      ? (hi.reopenedAt ?? lo.reopenedAt)
+      : hi.reopenedAt;
   if (merged.status === 'resolved') {
     if (!merged.resolvedAt) merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
   } else {

@@ -56,7 +56,7 @@ import { decideMirrorHeal, legacyMirrorTitle, legacyServerBodyCandidates } from 
 import type { Comment, GhSyncStatus, GhSyncSummary, Thread } from '../shared/types';
 import { ISSUE_BODY_LIMIT, mirrorStateOf } from '../shared/types';
 
-export type EngineReason = 'updated' | 'commented' | 'resolved' | 'reopened' | 'fixed';
+export type EngineReason = 'updated' | 'commented' | 'resolved' | 'reopened' | 'fixed' | 'rejected';
 
 export interface GhSync {
   /** Queue a push-reconcile for one thread (deduped, ordered). */
@@ -226,7 +226,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     const origin = opts.origin();
     const storyUrl = t.story?.url ?? `${origin}/?path=/story/${t.storyId}`;
     const body = renderDigest(
-      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === 'open' ? 1 : 0, fixed: t.status === 'fixed' ? 1 : 0, resolved: t.status === 'resolved' ? 1 : 0 }, threads: [t] }],
+      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === 'open' ? 1 : 0, fixed: t.status === 'fixed' ? 1 : 0, rejected: t.status === 'rejected' ? 1 : 0, resolved: t.status === 'resolved' ? 1 : 0 }, threads: [t] }],
       { origin, mirror: true, fullText: true },
     );
     // pathological threads (several 64k comments) can exceed GitHub's 65,536-char
@@ -624,13 +624,17 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
             // reopen fires from resolved ONLY — fixed+open is natural (see above)
             cur.status = 'open';
             delete cur.resolvedAt;
-            // v0.6.9 (DD-42, review F4): the mirror door must stamp the same
-            // event the PATCH door does, or a GitHub-side reopen merges
-            // event-less and is eaten by the next sync (rank reverts it).
+            // v0.6.12 (DD-42 fold, public-v0.6.9 review F4): the mirror door
+            // must stamp the same event the PATCH door does, or a GitHub-side
+            // reopen merges event-less and is eaten by the next sync (rank
+            // reverts it). LOAD-BEARING: store.mutateThread is a raw
+            // full-payload sink — this is the ONLY stamp on this path.
             cur.reopenedAt = nowIso();
             systemComment(cur, `gh-reopen-${mir.issue}`, 'github', 'reopened on GitHub');
           }
-          if (cur.status === 'resolved') delete cur.reopenedAt; // confirm supersedes the event (both doors)
+          // confirm supersedes the event (both doors — incl. a confirm from
+          // rejected carrying a resubmit event)
+          if (cur.status === 'resolved') delete cur.reopenedAt;
           const knownNow = new Set(cur.comments.map((c) => c.ghId).filter((x): x is string => Boolean(x)));
           for (const c of fresh) {
             if (knownNow.has(String(c.id))) continue;

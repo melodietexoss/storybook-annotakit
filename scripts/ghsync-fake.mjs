@@ -214,6 +214,13 @@ const closeRemote = (n) => {
   i.closed_by = { login: 'agent-smith' };
   touchIssue(n);
 };
+const reopenRemote = (n) => {
+  const i = gh.issues.find((x) => x.number === n);
+  i.state = 'open';
+  delete i.closed_at;
+  delete i.closed_by;
+  touchIssue(n);
+};
 const commentRemote = (n, body, login) => {
   const id = gh.nextCommentId++;
   (gh.comments[n] = gh.comments[n] ?? []).push({ id, body, user: { login }, created_at: new Date().toISOString(), html_url: `${issueUrl(n)}#issuecomment-${id}` });
@@ -322,6 +329,22 @@ async function main() {
   await waitFor(() => gh.issues[0].state === 'open', 5000, 'issue reopened after confirm-reject cycle');
   check('issue reopened (state restored)', gh.issues[0].state === 'open');
 
+  console.log('== 4c. v0.6.11 (S7-A) rejected: issue stays OPEN + the system notice lands as an issue comment ==');
+  const fixedForReject = { ...(await j('GET', `/annotakit/api/threads/${t1.id}`)).body, status: 'fixed' };
+  await j('PATCH', `/annotakit/api/threads/${t1.id}`, fixedForReject);
+  const rejectedBody = { ...(await j('GET', `/annotakit/api/threads/${t1.id}`)).body, status: 'rejected' };
+  const patchRejected = await j('PATCH', `/annotakit/api/threads/${t1.id}`, rejectedBody);
+  check('PATCH {status:rejected} → 200 (durable verdict)', patchRejected.status === 200 && patchRejected.body?.status === 'rejected', `status=${patchRejected.status}`);
+  check('verdict notice appended to the thread', (patchRejected.body?.comments ?? []).some((c) => String(c.body).includes('rejected — the fix was not accepted')));
+  await j('POST', '/annotakit/api/sync'); // settle pushes — the notice mirrors as a plain comment
+  check('issue stays OPEN while rejected (re-work continues)', gh.issues[0].state === 'open', gh.issues[0].state);
+  await waitFor(() => (gh.comments[1] ?? []).some((c) => c.body.includes('rejected — the fix was not accepted')), 5000, 'rejection notice mirrored');
+  check('rejection notice lands on the issue (agent-visible re-work signal)', (gh.comments[1] ?? []).some((c) => c.body.includes('rejected — the fix was not accepted')));
+  // restore the OPEN state section 5 expects (rejected→open = verdict cleared)
+  const clearBody = { ...(await j('GET', `/annotakit/api/threads/${t1.id}`)).body, status: 'open' };
+  await j('PATCH', `/annotakit/api/threads/${t1.id}`, clearBody);
+  await j('POST', '/annotakit/api/sync');
+
   console.log('== 5. remote close (agent on GitHub) → local thread resolves ==');
   closeRemote(1);
   const sync1 = await j('POST', '/annotakit/api/sync');
@@ -330,6 +353,21 @@ async function main() {
   check('local status now resolved', t1c.status === 'resolved');
   check('remote close trace comment added', t1c.comments.some((c) => c.source === 'github' && c.body === 'closed on GitHub' && c.author === 'agent-smith'), JSON.stringify(t1c.comments.map((c) => c.author)));
   check('resolvedAt stamped', Boolean(t1c.resolvedAt));
+
+  console.log('== 5b. v0.6.12 (DD-42 fold) remote reopen → the row carries the merge event ==');
+  reopenRemote(1);
+  const sync5b = await j('POST', '/annotakit/api/sync');
+  check('pull imported the remote reopen', sync5b.body.pulled >= 1, JSON.stringify(sync5b.body));
+  const t1r = (await j('GET', '/annotakit/api/threads')).body.threads[0];
+  check('local status back to open', t1r.status === 'open', `status=${t1r.status}`);
+  check('gh-side reopen stamps reopenedAt — the merge event (else the next sync rank-reverts it)', typeof t1r.reopenedAt === 'string', `reopenedAt=${t1r.reopenedAt}`);
+  check('reopen trace comment added', t1r.comments.some((c) => c.source === 'github' && c.body === 'reopened on GitHub'));
+  // restore the resolved state section 6 expects — and prove the confirm
+  // clears the event (both doors)
+  closeRemote(1);
+  await j('POST', '/annotakit/api/sync');
+  const t1rr = (await j('GET', '/annotakit/api/threads')).body.threads[0];
+  check('state restored to resolved; the confirm clears the event', t1rr.status === 'resolved' && !t1rr.reopenedAt, `status=${t1rr.status} reopenedAt=${t1rr.reopenedAt}`);
 
   console.log('== 6. remote agent comment → imported reply ==');
   commentRemote(1, 'fixed in commit abc123 — bumped the flex gap', 'agent-smith');

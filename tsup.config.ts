@@ -25,6 +25,14 @@ export default [
       // v0.5.3: client-side GitHub publisher — same standalone-export pattern
       // (tests drive it with an injected transport + localStorage shims).
       ghClient: 'src/shared/ghClient.ts',
+      // v0.6.10 (S6): the hotkey kernel + pin-mode hit-tester — standalone
+      // exports so node tests exercise them directly (injectable
+      // elementsFromPoint/rect getters — jsdom-free).
+      hotkeys: 'src/shared/hotkeys.ts',
+      hittest: 'src/preview/hittest.ts',
+      // v0.6.12 (S7-AUDIT-C7): the panel-toggle helper — same pattern (the
+      // manager bundle is not node-importable; the truth table is unit-pinned).
+      panelToggle: 'src/shared/panelToggle.ts',
     },
     format: ['esm'],
     platform: 'browser',

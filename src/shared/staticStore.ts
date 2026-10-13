@@ -31,7 +31,7 @@
  * import time) so node tests can inject shims.
  */
 
-import { logicalMerge } from '../server/merge';
+import { logicalMerge, STATUS_RANK } from '../server/merge';
 import { DIGEST_CLIP_CHARS } from './types';
 import type { ExportedStory, StoryRef, Thread, ThreadInput } from './types';
 import { elementSummary } from './describe';
@@ -150,7 +150,7 @@ export interface StaticStore {
   /** stable order: story, then per-story number (same as the server). */
   list(storyId?: string): Thread[];
   create(input: ThreadInput): Promise<Thread>;
-  patch(thread: Thread): Promise<Thread>;
+  patch(thread: Thread, opts?: { statusAuthor?: string }): Promise<Thread>;
   addComment(threadId: string, body: string, author: string): Promise<Thread>;
   deleteThread(threadId: string): Promise<void>;
   /** Re-read the persisted doc from localStorage into memory (source of
@@ -264,6 +264,9 @@ export function getStaticStore(): Promise<StaticStore> {
           component: input.component ?? null,
           target: input.target,
           comments: input.comments,
+          // v0.6.9 (S3): transient (frozen-capture) plumb-through — this
+          // builder drops unknown fields, so the flag needs an explicit line.
+          transient: input.transient === true ? true : undefined,
         };
         // H-H-08 (server parity): an idempotent replay must return the STORED
         // row, not the freshly-built object — callers diffing the response
@@ -275,33 +278,54 @@ export function getStaticStore(): Promise<StaticStore> {
         for (const cb of listeners) cb();
         return Promise.resolve(thread);
       },
-      patch(next: Thread): Promise<Thread> {
+      patch(next: Thread, opts?: { statusAuthor?: string }): Promise<Thread> {
         const idx = threads.findIndex((t) => t.id === next.id);
         if (idx === -1) throw new Error(`annotakit(static): no thread ${next.id}`);
         // v0.6.3 status normalization (design amendment 7 — parity with the
         // server PATCH door): case-normalize, validate the enum, stamp/clear
-        // resolvedAt on transitions, never demote a confirmation to fixed
+        // resolvedAt on transitions, never demote a confirmation to fixed.
+        // v0.6.11 (S7-A): + 'rejected' (verdict transitions append a system
+        // comment below; →rejected only FROM fixed — server routes parity)
         const prev = threads[idx];
         const patched = { ...next } as Thread;
-        // v0.6.9 (DD-42, review F3): reopenedAt is store-owned — normalize
-        // BEFORE any status logic so a full-doc patch can neither FORGE the
-        // merge-proof event nor DROP it (the spread below would carry either
-        // through). The transition logic inside re-stamps/clears per act.
+        // v0.6.12 (S7-AUDIT-B5): a stray statusAuthor on the THREAD object
+        // (a UI bug spreading {...thread, statusAuthor}) must never persist
+        // — the control field is opts-only here, exactly like the server
+        // door's defensive strip.
+        delete (patched as { statusAuthor?: string }).statusAuthor;
+        // v0.6.12 (DD-42 fold, public-v0.6.9 parity): reopenedAt is store-owned
+        // — normalize BEFORE any status logic so a full-doc patch can neither
+        // FORGE the merge-proof event nor DROP it (the spread below would
+        // carry either through). The transition logic inside re-stamps/clears
+        // per act. ghClient's advisory pullStartedAt stamp is deliberately
+        // wiped here and re-stamped by the rank rule — only event PRESENCE
+        // matters to the merge.
         patched.reopenedAt = prev.reopenedAt;
         if (patched.status !== undefined) {
           const norm = String(patched.status).toLowerCase() as Thread['status'];
-          if (norm !== 'open' && norm !== 'fixed' && norm !== 'resolved') {
-            throw new Error(`annotakit(static): status must be "open", "fixed" or "resolved" (got ${JSON.stringify(patched.status)})`);
+          if (norm !== 'open' && norm !== 'fixed' && norm !== 'rejected' && norm !== 'resolved') {
+            throw new Error(`annotakit(static): status must be "open", "fixed", "rejected" or "resolved" (got ${JSON.stringify(patched.status)})`);
           }
           if (prev.status === 'resolved' && norm === 'fixed') {
             throw new Error('annotakit(static): thread is resolved (reviewer-confirmed) — reopen to "open" first');
           }
+          if (prev.status === 'resolved' && norm === 'rejected') {
+            throw new Error('annotakit(static): thread is resolved (reviewer-confirmed) — reopen to "open" first if you want to reject a new fix');
+          }
+          if (norm === 'rejected' && prev.status !== 'fixed' && prev.status !== 'rejected') {
+            throw new Error(`annotakit(static): reject applies to a fix — thread is ${prev.status} (reject is only valid from "fixed")`);
+          }
           patched.status = norm;
           if (prev.status !== 'resolved' && norm === 'resolved' && !patched.resolvedAt) patched.resolvedAt = nowIso();
           if (prev.status === 'resolved' && norm !== 'resolved') delete patched.resolvedAt;
-          // v0.6.9 (DD-42) parity with the server PATCH door: stamp the
-          // reopen event on downward transitions, supersede it on confirm.
-          if (prev.status !== 'open' && norm === 'open') patched.reopenedAt = nowIso();
+          // v0.6.12 (DD-42 fold) parity with the server PATCH door: stamp the
+          // reopen EVENT on every rank DECREASE (resolved→open, fixed→open,
+          // rejected→open the verdict-clear, rejected→fixed the resubmit —
+          // the guards above leave no other downward path), supersede it on
+          // confirm. Same ladder as the server (imported, never copied).
+          if (STATUS_RANK[prev.status] > STATUS_RANK[norm]) {
+            patched.reopenedAt = nowIso();
+          }
           if (norm === 'resolved') delete patched.reopenedAt;
         }
         const merged: Thread = { ...prev, ...patched, updatedAt: nowIso() };
@@ -328,6 +352,25 @@ export function getStaticStore(): Promise<StaticStore> {
           if (!newIds.has(pc.id)) unioned.push(pc);
         }
         merged.comments = unioned;
+        // v0.6.11 (S7-A): verdict transitions append a SYSTEM COMMENT (server
+        // routes parity) — the durable record that rides the EXISTING
+        // reply-mirror machinery (comments without ghId mirror out; ghClient
+        // stamps them idempotently). prev-based: re-patching the same status
+        // never double-appends. Attribution from the UI's statusAuthor;
+        // never stored as a thread field.
+        if (merged.status === 'rejected' && prev.status === 'fixed') {
+          const who = opts?.statusAuthor?.trim() || 'reviewer';
+          merged.comments = [
+            ...merged.comments,
+            { id: newCommentId(), author: who, body: 'rejected — the fix was not accepted. Re-addressed fixes re-enter review.', createdAt: nowIso() },
+          ];
+        } else if (merged.status === 'open' && prev.status === 'rejected') {
+          const who = opts?.statusAuthor?.trim() || 'reviewer';
+          merged.comments = [
+            ...merged.comments,
+            { id: newCommentId(), author: who, body: 'verdict cleared — back to open.', createdAt: nowIso() },
+          ];
+        }
         // mirror mapping: engine writes (ghClient stamps) flow through patch;
         // a UI patch built from a stale copy must never WIPE the mapping
         // (mapping loss = duplicate issue on the next create).
@@ -338,9 +381,10 @@ export function getStaticStore(): Promise<StaticStore> {
         if (prev.status === 'resolved' && merged.status !== 'resolved') {
           delete merged.resolvedAt;
         }
-        // v0.6.9 (DD-42) same spread-mask class: a confirmation must
+        // v0.6.12 (DD-42 fold) same spread-mask class: a confirmation must
         // supersede the reopen event — prev's reopenedAt would survive the
-        // delete-on-patched above
+        // in-door delete above through `...prev` (and a merge-grafted
+        // resolved+event row is cleaned by any later no-status patch too)
         if (merged.status === 'resolved') {
           delete merged.reopenedAt;
         }
@@ -435,8 +479,9 @@ function threadBlock(t: Thread, storageNote?: string, full?: boolean): string[] 
   const first = t.comments[0];
   const headline = first ? (full ? firstLine(first.body) || '(no text)' : clip(first.body)) : '(no text)';
   // unknown/legacy status → OPEN (never vanish from the digest; parity with
-  // the server digest's v0.6.5 default)
-  const status = t.status === 'fixed' ? 'FIXED' : t.status === 'resolved' ? 'RESOLVED' : 'OPEN';
+  // the server digest's v0.6.5 default). v0.6.11 (S7-A): rejected renders
+  // REJECTED (still unknown-safe).
+  const status = t.status === 'fixed' ? 'FIXED' : t.status === 'resolved' ? 'RESOLVED' : t.status === 'rejected' ? 'REJECTED' : 'OPEN';
   const out: string[] = [];
   // v0.6.7 link-safety: `#N` auto-links to unrelated GitHub issues — emit
   // `Thread N` instead (staticStore feeds BOTH the md export and the client
@@ -479,6 +524,7 @@ function threadBlock(t: Thread, storageNote?: string, full?: boolean): string[] 
   }
   if (t.status === 'resolved' && t.resolvedAt) out.push(`  - resolved ${fmtDate(t.resolvedAt)}`);
   else if (t.status === 'fixed') out.push('  - fixed: addressed, awaiting reviewer verification');
+  else if (t.status === 'rejected') out.push('  - rejected: the fix was NOT accepted — re-work expected (re-address → fixed re-enters review)');
   out.push('');
   return out;
 }
@@ -497,13 +543,14 @@ function groupStories(threads: Thread[]): ExportedStory[] {
     const story = t.story ?? ({ storyId: t.storyId } as StoryRef);
     let entry = map.get(t.storyId);
     if (!entry) {
-      entry = { story, counts: { open: 0, fixed: 0, resolved: 0 }, threads: [] };
+      entry = { story, counts: { open: 0, fixed: 0, rejected: 0, resolved: 0 }, threads: [] };
       map.set(t.storyId, entry);
     }
     entry.threads.push(t);
     if (t.status === 'open') entry.counts.open += 1;
     else if (t.status === 'fixed') entry.counts.fixed += 1;
-    else entry.counts.resolved += 1;
+    else if (t.status === 'rejected') entry.counts.rejected += 1;
+    else entry.counts.resolved += 1; // resolved + the legacy-garbage catch-all
   }
   return [...map.values()];
 }
@@ -514,6 +561,7 @@ export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: str
   const stories = groupStories(threads);
   const open = stories.reduce((n, s) => n + (Number(s.counts.open) || 0), 0);
   const fixed = stories.reduce((n, s) => n + (Number(s.counts.fixed) || 0), 0);
+  const rejected = stories.reduce((n, s) => n + (Number(s.counts.rejected) || 0), 0);
   const resolved = stories.reduce((n, s) => n + (Number(s.counts.resolved) || 0), 0);
   const title = stories.length === 1
     ? `UI review — ${stories[0].story.title ?? stories[0].story.storyId}`
@@ -521,7 +569,7 @@ export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: str
   const out: string[] = [];
   out.push(`# ${title}`);
   out.push('');
-  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${resolved} resolved · ${nowIso().slice(0, 16).replace('T', ' ')} · static build (local storage)`);
+  out.push(`${open} open / ${fixed} fixed (awaiting review) / ${rejected} rejected (re-work) / ${resolved} resolved · ${nowIso().slice(0, 16).replace('T', ' ')} · static build (local storage)`);
   out.push('');
   for (const s of stories) {
     const st = s.story;
@@ -540,8 +588,16 @@ export function renderStaticDigest(threads: Thread[], opts?: { storageNote?: str
     // reviewer's long note must NEVER arrive shortened (same contract as the
     // GitHub mirror since v0.6.3). full=true renders VERBATIM bodies; the
     // lean clip stays the default for token-economical digests.
-    for (const t of s.threads.filter((x) => x.status !== 'fixed' && x.status !== 'resolved')) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
+    for (const t of s.threads.filter((x) => x.status !== 'fixed' && x.status !== 'rejected' && x.status !== 'resolved')) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
     for (const t of s.threads.filter((x) => x.status === 'fixed')) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
+    // S7-AUDIT-B9: the re-work banner — server digest.ts parity, so a
+    // rejected block never reads as a plain list item between sections
+    const rejectedThreads = s.threads.filter((x) => x.status === 'rejected');
+    if (rejectedThreads.length > 0) {
+      out.push(`**${rejectedThreads.length} rejected — re-work (the fix was not accepted; re-address → fixed re-enters review):**`);
+      out.push('');
+    }
+    for (const t of rejectedThreads) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
     for (const t of s.threads.filter((x) => x.status === 'resolved')) out.push(...threadBlock(t, opts?.storageNote, opts?.full));
   }
   return out.join('\n');

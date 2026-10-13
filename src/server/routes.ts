@@ -15,6 +15,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
 import { getStore, migrateLegacyStore, nowIso, readConfig, type Store } from './store';
 import { renderDigest } from './digest';
+import { STATUS_RANK } from './merge';
 import { createGhSync, type GhSync } from './ghsync';
 import { createAutoSync, type AutoSync } from './sync';
 import {
@@ -35,7 +36,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.9';
+const VERSION = '0.6.12';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -552,7 +553,7 @@ function groupByStory(threads: Thread[], origin: string): ExportedStory[] {
     if (!entry) {
       entry = {
         story: { ...t.story, url: t.story.url ?? `${origin}/?path=/story/${t.storyId}` },
-        counts: { open: 0, fixed: 0, resolved: 0 },
+        counts: { open: 0, fixed: 0, rejected: 0, resolved: 0 },
         threads: [],
       };
       map.set(t.storyId, entry);
@@ -560,7 +561,8 @@ function groupByStory(threads: Thread[], origin: string): ExportedStory[] {
     entry.threads.push(t);
     if (t.status === 'open') entry.counts.open++;
     else if (t.status === 'fixed') entry.counts.fixed++;
-    else entry.counts.resolved++;
+    else if (t.status === 'rejected') entry.counts.rejected++;
+    else entry.counts.resolved++; // resolved + the legacy-garbage catch-all (H-B-15 class)
   }
   const out = [...map.values()];
   for (const s of out) s.threads.sort((a, b) => a.number - b.number);
@@ -597,13 +599,13 @@ async function handleApi(
         ['GET', `${API_BASE}/health`, 'agentSurfaces, store, gh + git state — detect your path here first'],
         ['GET', `${API_BASE}/schema`, 'this document'],
         ['GET', `${API_BASE}/threads`, 'ALL threads — envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array)'],
-        ['GET', `${API_BASE}/threads?storyId=<id>&status=<open|fixed|resolved>`, 'filtered (an EMPTY storyId param is treated as absent, not a filter)'],
+        ['GET', `${API_BASE}/threads?storyId=<id>&status=<open|fixed|rejected|resolved>`, 'filtered (an EMPTY storyId param is treated as absent, not a filter)'],
         ['POST', `${API_BASE}/threads`, 'create → 201; idempotent replay (same id) → 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only — amend via PATCH'],
         ['GET', `${API_BASE}/threads/<id>`, 'one thread doc'],
         ['PATCH', `${API_BASE}/threads/<id>`, 'partial {status} (JSON-merge) or full doc — see PATCH below'],
         ['POST', `${API_BASE}/threads/<id>/comments`, 'reply → 201 with the FULL updated thread doc (not the new comment); key comments by thread id, never by your own comment id (ids are re-hashed)'],
         ['DELETE', `${API_BASE}/threads/<id>`, 'delete (path form; legacy DELETE /threads?id=<id> equivalent)'],
-        ['GET|PUT', `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence — GET → JSON, GET ?format=html → human view; PUT replaces (idempotent, 96KB cap)'],
+        ['GET|PUT', `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence — GET → JSON, GET ?format=html → human view; PUT replaces (idempotent, 96KB cap) and broadcasts THREADS_CHANGED {reason:"snapshot"} so live panels re-fetch'],
         ['GET', `${API_BASE}/export?format=md|json`, 'digest — json keeps FULL bodies (envelope {generatedAt, stories:[...]}, story-grouped, NOT the {threads:[...]} shape of GET /threads). md default is the LEAN digest (200-char clips for token economy); add ?mode=full for VERBATIM bodies (the panel export uses this — a hand-off artifact must never shorten a note)'],
         ['GET|POST', `${API_BASE}/sync`, 'mirror status / force reconcile — POST also forces one git store cycle first (v0.6.1)'],
         ['POST', `${API_BASE}/gh/reload`, 're-read .env and apply token changes WITHOUT a restart (v0.6.6) — response lists applied/requiresRestart; the PAT is never echoed'],
@@ -616,7 +618,7 @@ async function handleApi(
       PATCH: {
         url: `${API_BASE}/threads/<id>`,
         partialBody: { status: 'resolved' },
-        note: 'partial (JSON-merge) or full-document both accepted; status must be "open", "fixed" or "resolved" (case-insensitive, normalized — anything else is a 400). "fixed" = addressed by the agent, awaiting reviewer verification (the agent Path B terminal state; the GitHub issue stays OPEN). "resolved" = reviewer-confirmed — server stamps resolvedAt on ANY →resolved transition and clears it on demotion out of resolved; PATCHing "fixed" onto a resolved thread is a 400 (reopen first — a stale full-doc PATCH must never demote a confirmation). comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt)',
+        note: 'partial (JSON-merge) or full-document both accepted; status must be "open", "fixed", "rejected" or "resolved" (case-insensitive, normalized — anything else is a 400). "fixed" = addressed by the agent, awaiting reviewer verification (the agent Path B terminal state; the GitHub issue stays OPEN). "rejected" = the reviewer did NOT accept the fix (re-work expected; DURABLE — the verdict survives reloads; the GitHub issue stays OPEN and the server appends a system notice comment, the agent-visible re-work signal). "resolved" = reviewer-confirmed — server stamps resolvedAt on ANY →resolved transition and clears it on demotion out of resolved; PATCHing "fixed" or "rejected" onto a resolved thread is a 400 (reopen first — a stale full-doc PATCH must never demote a confirmation); PATCHing "rejected" onto an OPEN thread is a 400 (reject is a verdict on a fix). From rejected: "fixed" (agent re-addresses — re-enters review), "resolved" (reviewer confirms after all), "open" (reviewer clears the verdict). comments always union-merge by id; comment bodies NEW or CHANGED by this PATCH are capped at 64000 chars (stored ones exempt). reopenedAt is server-owned (stamped on every downward transition, cleared on the next resolved — never send it)',
       },
       COMMENT: {
         url: `${API_BASE}/threads/<id>/comments`,
@@ -804,9 +806,9 @@ async function handleApi(
       // here, and must not make a status-less PATCH un-fixable).
       if ('status' in body && full.status !== undefined) {
         const norm = String(full.status).toLowerCase();
-        if (norm !== 'open' && norm !== 'fixed' && norm !== 'resolved') {
+        if (norm !== 'open' && norm !== 'fixed' && norm !== 'rejected' && norm !== 'resolved') {
           throw Object.assign(
-            new Error(`status must be "open", "fixed" or "resolved" (got ${JSON.stringify(full.status)}) — {"status":"fixed"} = addressed, awaiting review; {"status":"resolved"} = reviewer-confirmed (server stamps resolvedAt); {"status":"open"} reopens`),
+            new Error(`status must be "open", "fixed", "rejected" or "resolved" (got ${JSON.stringify(full.status)}) — {"status":"fixed"} = addressed, awaiting review; {"status":"rejected"} = reviewer rejected the fix (re-work); {"status":"resolved"} = reviewer-confirmed (server stamps resolvedAt); {"status":"open"} reopens`),
             { status: 400 },
           );
         }
@@ -820,6 +822,20 @@ async function handleApi(
           { status: 400 },
         );
       }
+      // v0.6.11 (S7-A): →rejected only FROM fixed (self-transition fine) —
+      // "reject" is a verdict on a FIX ATTEMPT. open→rejected has nothing to
+      // reject yet; resolved→rejected demotes a confirmation (reopen first),
+      // same class as the resolved→fixed guard above.
+      if (full.status === 'rejected' && prev.status !== 'fixed' && prev.status !== 'rejected') {
+        throw Object.assign(
+          new Error(
+            `reject applies to a fix — thread is ${prev.status} (reject is only valid from "fixed"${
+              prev.status === 'resolved' ? '; reopen to "open" first' : '; nothing to reject yet'
+            })`,
+          ),
+          { status: 400 },
+        );
+      }
       // server-side resolve bookkeeping: agents forget resolvedAt — the server
       // stamps it on ANY →resolved transition and clears it on any demotion
       // out of resolved, so digests stay consistent
@@ -829,17 +845,20 @@ async function handleApi(
       if (prev.status === 'resolved' && full.status !== 'resolved') {
         delete full.resolvedAt;
       }
-      // v0.6.9 (DD-42, review F3): reopenedAt is SERVER-OWNED, exactly like
-      // the gh block below — a full-doc PATCH returns the body verbatim, so
-      // without this normalization a crafted same-status PATCH could FORGE
-      // the event (the merge's proof — protection collapses) or DROP it
-      // (un-protect a re-fix). The transition logic below re-stamps/clears.
+      // v0.6.12 (DD-42 fold, public-v0.6.9 parity): reopenedAt is SERVER-OWNED,
+      // exactly like the gh block below — a full-doc PATCH returns the body
+      // verbatim, so without this normalization a crafted same-status PATCH
+      // could FORGE the event (the merge's proof — protection collapses) or
+      // DROP it (un-protect a re-fix). The transition logic below re-stamps/clears.
       full.reopenedAt = prev.reopenedAt;
-      // v0.6.9 (DD-42): stamp reopenedAt on every DOWNWARD transition — the
-      // event-proof the store merge honors (a deliberate reopen/reject must
-      // survive a union-merge against a stale higher-ranked copy; see
-      // merge.ts). Superseded by the next confirmation.
-      if (prev.status !== 'open' && full.status === 'open') {
+      // stamp the reopen EVENT on every DOWNWARD transition (any rank decrease
+      // — resolved→open, fixed→open, rejected→open the verdict-clear,
+      // rejected→fixed the resubmit; the 400-guards above leave no other
+      // downward path): the store merge's proof that a deliberate downgrade
+      // must survive a union-merge against a stale higher-ranked copy (see
+      // merge.ts). Same-ladder source: STATUS_RANK is imported, never copied.
+      // Superseded by the next →resolved (which clears it).
+      if (STATUS_RANK[prev.status] > STATUS_RANK[full.status]) {
         full.reopenedAt = nowIso();
       }
       if (full.status === 'resolved') {
@@ -880,6 +899,37 @@ async function handleApi(
           throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars — new/changed comments only; stored bodies are exempt)`), { status: 413 });
         }
       }
+      // v0.6.11 (S7-A): verdict transitions append a SYSTEM COMMENT — the
+      // durable record that rides the EXISTING reply-mirror machinery (both
+      // engines push comments without ghId; per-comment ghId stamping makes
+      // the mirror idempotent across crash windows — no bespoke trigger
+      // needed, unlike a gh.lastStatus scheme). The check is prev-based:
+      // re-PATCHing the same status never double-appends, and a client retry
+      // after a lost response lands on prev=rejected → no-op.
+      // `statusAuthor` is a CONTROL field (the acting reviewer's name) —
+      // extracted here and stripped from the doc; never stored.
+      const verdictAuthor =
+        typeof body.statusAuthor === 'string' && body.statusAuthor.trim()
+          ? body.statusAuthor.trim()
+          : 'reviewer';
+      delete (full as { statusAuthor?: string }).statusAuthor;
+      if (prev.status === 'fixed' && full.status === 'rejected') {
+        const at = nowIso();
+        full.comments.push({
+          id: 'c_' + createHash('sha256').update(`${verdictAuthor}|annotakit-rejected|${full.id}|${at}`).digest('base64url').slice(0, 12),
+          author: verdictAuthor,
+          body: `rejected — the fix was not accepted. Re-addressed fixes re-enter review.`,
+          createdAt: at,
+        });
+      } else if (prev.status === 'rejected' && full.status === 'open') {
+        const at = nowIso();
+        full.comments.push({
+          id: 'c_' + createHash('sha256').update(`${verdictAuthor}|annotakit-verdict-cleared|${full.id}|${at}`).digest('base64url').slice(0, 12),
+          author: verdictAuthor,
+          body: `verdict cleared — back to open.`,
+          createdAt: at,
+        });
+      }
       const updated = await store.updateThread(full);
       if (!updated) return notFound(res, THREAD_404_HINT), true; // deleted concurrently — never resurrect
       afterMutation(rt, {
@@ -890,9 +940,11 @@ async function handleApi(
             ? 'resolved'
             : prev.status === 'open' && updated.status === 'fixed'
               ? 'fixed'
-              : prev.status === 'resolved' && updated.status === 'open'
-                ? 'reopened'
-                : 'updated',
+              : prev.status === 'fixed' && updated.status === 'rejected'
+                ? 'rejected'
+                : prev.status === 'resolved' && updated.status === 'open'
+                  ? 'reopened'
+                  : 'updated',
       });
       await sendMutationJson(rt, res, 200, updated);
       return true;
@@ -951,10 +1003,19 @@ async function handleApi(
         capturedAt: typeof body.capturedAt === 'string' ? body.capturedAt : nowIso(),
         width: Math.round(Number(body.width) || 800),
         height: Math.round(Number(body.height) || 600),
+        // v0.6.9 (S3): the frozen-container shape marker — additive; the
+        // legacy story-root shape simply lacks it (old snapshots).
+        surface: body.surface === 'frozen' ? 'frozen' : undefined,
       };
       await store.putSnapshot(id, snap);
-      // NOT afterMutation: snapshots are read-only evidence — no issue-body
-      // change, no re-broadcast (the thread itself already did that)
+      // v0.6.10 (S6, E2E-caught): the panel's recall/view affordance derives
+      // from snapshot PRESENCE (the GET /threads envelope's snapshots[]), and
+      // the thread's own THREADS_CHANGED fires BEFORE this PUT lands — the
+      // newest snapshot's view button never appeared until some LATER
+      // refresh. Snapshots stay read-only evidence (no issue-body change, no
+      // gh churn) but the broadcast IS needed so manager panels re-fetch and
+      // learn the id.
+      broadcast({ storyId: thread.storyId, threadId: id, reason: 'snapshot' });
       sendJson(res, 200, { ok: true, threadId: id, bytes: html.length, clipped: snap.clipped });
       return true;
     }
