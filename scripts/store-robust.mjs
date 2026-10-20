@@ -61,9 +61,10 @@ function sh(cwd, args) {
   return { ok: r.status === 0, out: String(r.stdout ?? '').trim(), err: String(r.stderr ?? '').trim() };
 }
 
-/** A dev-server subprocess serving ONE configDir. */
-async function startServer(configDir) {
-  const proc = spawn(process.execPath, [SERVER_SCRIPT, configDir], { stdio: ['ignore', 'pipe', 'pipe'] });
+/** A dev-server subprocess serving ONE configDir. mode 'noenv' drops the
+ *  ANNOTAKIT_GH_REPO pin (the configrepo case observes the config door). */
+async function startServer(configDir, mode) {
+  const proc = spawn(process.execPath, mode ? [SERVER_SCRIPT, configDir, mode] : [SERVER_SCRIPT, configDir], { stdio: ['ignore', 'pipe', 'pipe'] });
   let port = 0;
   let booted = false;
   const logs = [];
@@ -153,20 +154,33 @@ const threadInput = (n, body) => ({
 });
 
 /** Thread count inside the remote's current annotakit snapshot (sqlite blob).
- *  Reads via the repo's refs/annotakit/remote cache (kept fresh by the caller). */
+ *  Reads via the repo's refs/annotakit/remote cache (kept fresh by the caller).
+ *  v0.6.15 (Y1): streams the blob to a FILE via the child's stdout FD — the
+ *  old spawnSync buffered stdout in JS and died at Node's 1MB maxBuffer,
+ *  which is exactly the cap class the bigstore case exists to punish. */
 const remoteThreadCount = (repo) => {
   const sha = sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/annotakit/remote']).out;
   if (!sha) return null;
-  const got = spawnSync('git', ['-C', repo.work, 'cat-file', 'blob', `${sha}:threads.db`], { timeout: 8000 });
-  if (got.status !== 0) return null;
   const tmp = path.join(repo.base, 'remote-blob.db');
-  fs.writeFileSync(tmp, got.stdout);
+  const fd = fs.openSync(tmp, 'w');
+  const got = spawnSync('git', ['-C', repo.work, 'cat-file', 'blob', `${sha}:threads.db`], { timeout: 8000, stdio: ['ignore', fd, 'pipe'] });
+  fs.closeSync(fd);
+  if (got.status !== 0) return null;
   const q = spawnSync(process.execPath, ['-e', `
     const { DatabaseSync } = require('node:sqlite');
     try { const db = new DatabaseSync(${JSON.stringify(tmp)}, { readOnly: true }); console.log(db.prepare('SELECT COUNT(*) c FROM threads').get().c); db.close(); } catch { console.log('ERR'); }
   `], { encoding: 'utf8' });
   const n = Number(String(q.stdout ?? '').trim());
   return Number.isFinite(n) ? n : null;
+};
+
+/** Byte size of the remote's threads.db blob (null when absent). */
+const remoteBlobSize = (repo) => {
+  const sha = sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/annotakit/remote']).out;
+  if (!sha) return null;
+  const r = sh(repo.work, ['cat-file', '-s', `${sha}:threads.db`]);
+  const n = Number(r.out);
+  return r.ok && Number.isFinite(n) ? n : null;
 };
 
 const CASES = {
@@ -230,6 +244,156 @@ const CASES = {
     ctx.check('restored thread bodies intact', threads.filter((t) => t.comments[0]?.body?.includes('restore seed')).length === 2);
     ctx.check('restore logged by the server', /restored 2 threads/.test(srv2.logs.join('')), (srv2.logs.join('') || '').slice(-200));
     await srv2.kill();
+  },
+
+  /** v0.6.15 (Y1, wave-3 P1): a store grown past the old in-memory read cap
+   *  (~4MB of buffered git-show chunks) used to read as UNREADABLE — the boot
+   *  restore adopted 0 threads, and worse, syncOnce's silently-skipped union
+   *  let the push REPLACE the remote's content with local-only rows. The fix
+   *  streams the blob to a file (no cap) and REFUSES to push an uncomputed
+   *  union. This case proves all three behaviors on a >4MB store. */
+  bigstore: async (ctx) => {
+    const { repo } = ctx;
+    const srv = await ctx.serve(repo);
+    // 90 threads × ~56KB evidence bodies ≈ 5MB — decisively past the old cap
+    // (and past Node's 1MB spawnSync maxBuffer, the harness-side twin).
+    const N = 90;
+    for (let i = 0; i < N; i++) await ctx.create(srv, `big${i}`, `evidence-${i} ` + 'X'.repeat(56_000));
+    const pushed = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit:refs/annotakit/remote']);
+      return remoteThreadCount(repo) === N;
+    }, 60_000);
+    ctx.check('big store pushed to the remote (90 threads)', pushed);
+    const size = remoteBlobSize(repo);
+    ctx.check('remote blob is >4MB (really past the old read cap)', typeof size === 'number' && size > 4 * 1024 * 1024, `size=${size}`);
+    await srv.kill();
+
+    // fresh clone: the boot restore must STREAM-READ the >4MB blob and adopt
+    // every thread — the old code declared it 'unreadable' and adopted 0
+    const clone = makeClone(repo, 'bigclone');
+    const srv2 = await ctx.serve(clone);
+    const restored = await waitFor(async () => (await ctx.health(srv2)).threads === N, 60_000);
+    ctx.check('fresh clone restores ALL 90 big-store threads (stream read, no cap)', restored);
+    const h2 = await ctx.health(srv2);
+    ctx.check('big clone git health clean after restore', h2.git?.healthy !== false && h2.git?.consecutivePushFailures === 0, JSON.stringify(h2.git ?? {}).slice(0, 160));
+
+    // a mutation on the clone must UNION with the big remote — never a
+    // wholesale replace (the refusal guard fires instead of a bad push)
+    await ctx.create(srv2, 'newkid', 'created on the big clone');
+    const converged = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit:refs/annotakit/remote']);
+      return remoteThreadCount(repo) === N + 1;
+    }, 60_000);
+    ctx.check('clone push UNIONS over the big remote (remote-only threads survive)', converged);
+    await srv2.kill();
+  },
+
+  /** v0.6.15 (Y1): the refusal guard's NEGATIVE proof — a remote whose
+   *  threads.db blob exists but cannot parse (4 consecutive corrupt commits,
+   *  deeper than the A13 4-hop parent walk) must NEVER be pushed over: the
+   *  boot keeps local data safe, syncOnce REFUSES (union uncomputed), the
+   *  remote head stays untouched, and gitHealth names the refusal. The old
+   *  code pushed local-only rows here — a wholesale silent replace. */
+  corruptremote: async (ctx) => {
+    const { repo } = ctx;
+    // seed a healthy store first
+    const srv = await ctx.serve(repo);
+    await ctx.create(srv, 'T1', 'seed before corruption');
+    await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit']).ok, 20_000);
+    await srv.kill();
+
+    // plant 4 corrupt threads.db commits on top (plumbing only; README kept
+    // OURS so the adoption gate passes and the flow reaches readRemoteDoc)
+    let head = sh(repo.work, ['rev-parse', 'refs/annotakit/remote']).out;
+    const lsTree = sh(repo.work, ['ls-tree', head]).out;
+    const readmeSha = (lsTree.split('\n').find((l) => l.endsWith('\tREADME')) || '').split(/\s+/)[2];
+    const garbage = Buffer.from('this is not a sqlite database — corrupt blob planted by store-robust corruptremote\n');
+    const gb = spawnSync('git', ['-C', repo.work, 'hash-object', '-t', 'blob', '-w', '--stdin'], { input: garbage, encoding: 'utf8' });
+    if (gb.status !== 0) throw new Error('hash-object failed');
+    const garbageSha = String(gb.stdout).trim();
+    for (let i = 0; i < 4; i++) {
+      const mt = spawnSync('git', ['-C', repo.work, 'mktree'], {
+        input: `100644 blob ${readmeSha}\tREADME\n100644 blob ${garbageSha}\tthreads.db\n`,
+        encoding: 'utf8',
+      });
+      const ct = spawnSync('git', ['-C', repo.work, 'commit-tree', String(mt.stdout).trim(), '-p', head, '-m', `corrupt ${i}`], { encoding: 'utf8' });
+      if (ct.status !== 0) throw new Error('commit-tree failed');
+      head = String(ct.stdout).trim();
+    }
+    sh(repo.work, ['push', '-q', repo.remote, `${head}:refs/heads/annotakit`]);
+    ctx.check('corrupt remote head planted (4 deep)', sh(repo.remote, ['rev-parse', 'refs/heads/annotakit']).out === head);
+
+    // boot a fresh clone on the corrupt remote: local data stays safe, 0 adopted
+    const clone = makeClone(repo, 'corruptclone');
+    const srv2 = await ctx.serve(clone);
+    // boot restore is async — poll until describe leaves 'init'
+    const namedIt = await waitFor(async () => {
+      const h = await ctx.health(srv2);
+      return h.threads === 0 && !/^init$/.test(String(h.gitSync?.describe ?? h.git?.describe ?? 'init'));
+    }, 20_000);
+    const h0 = await ctx.health(srv2);
+    ctx.check('boot on corrupt remote: store alive, 0 threads adopted', namedIt && h0.threads === 0, `threads=${h0.threads}`);
+    ctx.check(
+      'boot names the unreadable remote (not a silent pass)',
+      /unreadable|no store blob/.test(String(h0.gitSync?.describe ?? h0.git?.describe ?? '')) || /unreadable/.test(srv2.logs.join('')),
+      String(h0.gitSync?.describe ?? h0.git?.describe ?? '').slice(0, 160),
+    );
+
+    // a mutation must be REFUSED, not pushed — the remote head cannot move
+    await ctx.create(srv2, 'T-new', 'created on the corrupt clone');
+    await new Promise((r) => setTimeout(r, 9_000)); // a full debounce cycle
+    const h1 = await ctx.health(srv2);
+    ctx.check('local thread survives the refusal', (await ctx.list(srv2)).length === 1);
+    ctx.check('remote head NOT advanced (uncomputed union never pushed)', sh(repo.remote, ['rev-parse', 'refs/heads/annotakit']).out === head);
+    ctx.check(
+      'gitHealth names the refusal',
+      /unreadable|refus/.test(String(h1.git?.lastPushError ?? '')),
+      String(h1.git?.lastPushError ?? '').slice(0, 160),
+    );
+    await srv2.kill();
+  },
+
+  /** v0.6.15 (Y3, wave-3): the config-file ghRepo door is GATED like the
+   *  env/bake/client doors — it used to flow VERBATIM (the only ungated
+   *  door), arming dead mirrors on URL pastes, and a garbage value would
+   *  now own the decision (mirror OFF + a loud boot warning) instead of
+   *  silently falling through to env/detection (wrong-repo retarget). */
+  configrepo: async (ctx) => {
+    const { repo } = ctx;
+
+    // (1) a github.com URL config value NORMALIZES to owner/name
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: 'https://github.com/octocat/widgets.git' }));
+    const srv1 = await ctx.serve(repo, 'noenv');
+    const h1 = await ctx.health(srv1);
+    ctx.check('config ghRepo URL form normalizes to owner/name', h1.gh?.repo === 'octocat/widgets', JSON.stringify(h1.gh?.repo));
+    await srv1.kill();
+
+    // (2) the github: shorthand normalizes (the dead-mirror incident shape)
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: 'github:octocat/widgets' }));
+    const srv2 = await ctx.serve(repo, 'noenv');
+    const h2 = await ctx.health(srv2);
+    ctx.check('config ghRepo github: shorthand normalizes', h2.gh?.repo === 'octocat/widgets', JSON.stringify(h2.gh?.repo));
+    await srv2.kill();
+
+    // (3) garbage: the mirror stays OFF (the OLD code armed 'not a repo!!'
+    //     verbatim) + a loud boot warning; no fallthrough to the env pin
+    //     (removed via noenv) or the detected origin
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: 'not a repo!!' }));
+    const srv3 = await ctx.serve(repo, 'noenv');
+    const h3 = await ctx.health(srv3);
+    ctx.check('garbage config ghRepo leaves the mirror OFF (no verbatim arming)', h3.gh?.repo == null, JSON.stringify(h3.gh?.repo));
+    ctx.check('garbage config ghRepo surfaces a boot warning', Array.isArray(h3.warnings) && h3.warnings.some((w) => String(w).includes('ghRepo') && String(w).includes('not a repo!!')), JSON.stringify(h3.warnings ?? []).slice(0, 200));
+    // (the reason precedence puts the harness's GH_AUTO=0 first — 'disabled'
+    // — the load-bearing part is github:false: NO mirror was armed)
+    ctx.check('agentSurfaces says github:false (no mirror armed)', h3.agentSurfaces?.github === false, JSON.stringify(h3.agentSurfaces?.githubReason));
+    await srv3.kill();
+
+    // (4) a valid owner/name still passes through unchanged (regression)
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: 'octocat/widgets' }));
+    const srv4 = await ctx.serve(repo, 'noenv');
+    const h4 = await ctx.health(srv4);
+    ctx.check('valid config ghRepo passes through unchanged', h4.gh?.repo === 'octocat/widgets', JSON.stringify(h4.gh?.repo));
+    await srv4.kill();
   },
 
   divergence: async (ctx) => {
@@ -588,7 +752,7 @@ async function runCase(caseId) {
   const ctx = {
     repo,
     check,
-    serve: (r) => startServer(r.configDir),
+    serve: (r, mode) => startServer(r.configDir, mode),
     health: async (srv) => (await j(srv, 'GET', '/annotakit/api/health')).body,
     create: async (srv, n, body) => (await j(srv, 'POST', '/annotakit/api/threads', threadInput(n, body))).body,
     list: async (srv) => (await j(srv, 'GET', '/annotakit/api/threads?storyId=test-story--storeb')).body.threads ?? [],

@@ -12,6 +12,9 @@
  *      quote the platform internals it scrubs) or .agents/SKILL.md
  *      (untransformed dev form). The v0.6.0 `files` field shipped BOTH —
  *      the whitelist now prevents it; this check keeps it prevented.
+ *      DD-5d (33-g P2-4): the deny list also covers .env,
+ *      annotakit-gh.json and examples/ — the repo's highest-value secrets;
+ *      a `files` regression shipping those passed every gate CLEAN.
  *   4. v0.6.5 (H-F-04): dist FRESHNESS — the built server.cjs embeds the
  *      routes VERSION constant; "bump the version, forget the rebuild"
  *      used to pass every gate and ship a /health reporting the OLD
@@ -22,6 +25,12 @@
  *      from an earlier build that bypassed npm run build's rmSync) ships
  *      dead code silently — v0.6.4's tag carried 9, one with stale
  *      pre-fix logic that could re-enter a future clean:false run.
+ *      DD-4 (33-g P1-1): the set compare compared NAMES only — the three
+ *      product entry bundles have FIXED names (manager.mjs, preview.mjs,
+ *      server.cjs), so a src change landing only in them passed every gate
+ *      CLEAN with a stale dist. Builds are deterministic from the repo
+ *      root (33-g probe: 14/14 byte-equal), so every shared name is now
+ *      also byte-compared against the tracked dist/.
  *   6. v0.6.11 (S7-C/F6): AGENTS.md truth — the consumer-agent guide must
  *      ship (files whitelist), carry the canonical /storybook setup
  *      commands (--base flag + the next.config rewrite), and the
@@ -29,8 +38,9 @@
  *
  * Self-test: `node scripts/release-check.mjs --selftest` plants a ghost
  * chunk, a fake package.json version drift, a stale dist banner, a tracked
- * orphan, AND a gutted AGENTS.md — expects ALL FIVE to be caught, restoring
- * state in finally.
+ * orphan, a gutted AGENTS.md, a STALE-BY-CONTENT manager.mjs (DD-4), AND a
+ * files-whitelist pack leak (DD-5d) — expects ALL SEVEN to be caught,
+ * restoring state in finally.
  *
  * Exit codes: 0 = clean, 1 = release-dirty, 2 = selftest failure.
  */
@@ -138,7 +148,23 @@ function distSetProblems() {
           'rebuild via `npm run build` (its rmSync wipes orphans) and re-stage the whole dist',
       ];
     }
-    notes.push(`dist exact-set: ${tracked.size} files == fresh build output`);
+    // DD-4 (33-g P1-1): name-set equality is NOT freshness. Only content-
+    // hashed chunk-* files self-report content drift (a changed chunk gets
+    // a new hash → set drift above); the fixed-name entry bundles
+    // (manager.mjs / preview.mjs / server.cjs) stayed invisible — a src fix
+    // committed without `npm run build` shipped the OLD code with every
+    // gate green. tsup is deterministic from the repo root, so byte-compare
+    // every shared name against the tracked dist/.
+    const stale = [];
+    for (const f of fresh) {
+      const distFile = path.join(root, 'dist', f);
+      if (!fs.existsSync(distFile)) { stale.push(`dist/${f}`); continue; } // tracked in index, gone from worktree
+      if (!fs.readFileSync(path.join(tmp, f)).equals(fs.readFileSync(distFile))) stale.push(`dist/${f}`);
+    }
+    if (stale.length) {
+      return stale.map((f) => `${f} is STALE vs src (content differs from fresh build) — run npm run build`);
+    }
+    notes.push(`dist exact-set: ${tracked.size} files == fresh build (names + bytes)`);
     return [];
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -148,37 +174,49 @@ function distSetProblems() {
 /* 3 — npm-pack leak guard (v0.6.7 audit fix: npm 11 prints the plain listing
  * to STDERR, so the old `out.includes(...)` over stdout was ALWAYS false —
  * proven inert with a planted leak. --json emits the file list as JSON on
- * stdout; parse it and match on paths.) */
-{
+ * stdout; parse it and match on paths.)
+ * DD-5d (33-g P2-4): the deny list was blind to the repo's highest-value
+ * secrets — a `files` regression shipping .env (the live demo PAT),
+ * annotakit-gh.json (bake output) or examples/ (the live demo tree) passed
+ * CLEAN. Extracted into a function so the selftest can plant a whitelist
+ * regression and prove THIS gate bites. */
+function packLeakProblems() {
   const out = run('npm', ['pack', '--dry-run', '--json']);
   if (out === null) {
     notes.push('npm pack unavailable (skipped leak guard — run it where npm exists)');
-  } else {
-    let paths = '';
-    try {
-      // stdout is ONE json array (verified npm 11); belt-and-suspenders: on
-      // parse failure, try slicing the first complete value (appended notices)
-      let parsed;
-      try {
-        parsed = JSON.parse(out);
-      } catch {
-        parsed = JSON.parse(out.slice(0, out.indexOf('}]') + 2));
-      }
-      const files = Array.isArray(parsed) ? parsed[0]?.files : parsed?.files;
-      paths = (files ?? []).map((f) => f.path).join('\n');
-    } catch {
-      paths = out; // fall back to raw matching (older npm: the listing was plain text on stdout)
-    }
-    if (!paths) {
-      problems.push('npm pack --json produced no file list — the leak guard cannot verify (investigate before tagging)');
-    } else {
-      const leaked = [];
-      if (paths.includes('stage-release.mjs')) leaked.push('scripts/stage-release.mjs (PRIVATE — its anchors quote scrubbed internals)');
-      if (/\.agents\/SKILL\.md/.test(paths)) leaked.push('.agents/SKILL.md (dev form — the public transform lives in stage-release)');
-      if (leaked.length) problems.push(`npm pack would ship: ${leaked.join('; ')}`);
-      else notes.push(`npm pack: no private files in the tarball (${paths.split('\n').length} files checked)`);
-    }
+    return [];
   }
+  let paths = '';
+  try {
+    // stdout is ONE json array (verified npm 11); belt-and-suspenders: on
+    // parse failure, try slicing the first complete value (appended notices)
+    let parsed;
+    try {
+      parsed = JSON.parse(out);
+    } catch {
+      parsed = JSON.parse(out.slice(0, out.indexOf('}]') + 2));
+    }
+    const files = Array.isArray(parsed) ? parsed[0]?.files : parsed?.files;
+    paths = (files ?? []).map((f) => f.path).join('\n');
+  } catch {
+    paths = out; // fall back to raw matching (older npm: the listing was plain text on stdout)
+  }
+  if (!paths) {
+    return ['npm pack --json produced no file list — the leak guard cannot verify (investigate before tagging)'];
+  }
+  const lines = paths.split('\n').map((l) => l.trim()).filter(Boolean);
+  const leaked = [];
+  if (lines.some((p) => /stage-release\.mjs$/.test(p))) leaked.push('scripts/stage-release.mjs (PRIVATE — its anchors quote scrubbed internals)');
+  if (lines.some((p) => p.includes('.agents/SKILL.md'))) leaked.push('.agents/SKILL.md (dev form — the public transform lives in stage-release)');
+  // DD-5d (33-g P2-4): the highest-value secrets — a files-whitelist
+  // regression shipping ANY of these must FAIL, not pass CLEAN. .env.example
+  // (the secret-free template) is deliberately NOT denied.
+  if (lines.some((p) => p === '.env' || p.endsWith('/.env'))) leaked.push('.env (live PAT — never leaves the dev repo)');
+  if (lines.some((p) => /(^|\/)annotakit-gh\.json$/.test(p))) leaked.push('annotakit-gh.json (bake output — public consumers bake their own)');
+  if (lines.some((p) => p === 'examples' || p.startsWith('examples/'))) leaked.push('examples/ (the live demo tree — .env + dogfood data)');
+  if (leaked.length) return [`npm pack would ship: ${leaked.join('; ')}`];
+  notes.push(`npm pack: no private files in the tarball (${lines.length} files checked)`);
+  return [];
 }
 
 /* 6 — v0.6.11 (S7-C/F6): the consumer guide ships and tells the verified
@@ -270,17 +308,47 @@ if (process.argv.includes('--selftest')) {
     } finally {
       fs.writeFileSync(agentsPath, origAgents);
     }
+    // (f) STALE-BY-CONTENT dist (DD-4, 33-g P1-1): append a marker byte to a
+    // FIXED-NAME entry bundle — the name-set is unchanged, so only the new
+    // byte-compare can catch it (the exact release hole: a src fix
+    // committed without `npm run build`). Restore (c)'s still-live stale
+    // banner first so the content compare isolates THIS plant.
+    const mgrPath = path.join(root, 'dist', 'manager.mjs');
+    const origMgr = fs.existsSync(mgrPath) ? fs.readFileSync(mgrPath) : null;
+    try {
+      if (origMgr !== null) {
+        if (origDist !== null) fs.writeFileSync(distPath, origDist);
+        fs.writeFileSync(mgrPath, Buffer.concat([origMgr, Buffer.from('\n// selftest: stale-content marker (DD-4 plant)\n')]));
+        const sp = distSetProblems();
+        if (sp.length !== 1 || !/dist\/manager\.mjs is STALE vs src/.test(sp[0])) { console.error(`selftest FAIL: DD-4 content gate did not bite (reported ${JSON.stringify(sp)})`); failed++; }
+      } else {
+        notes.push('selftest: dist/manager.mjs missing — stale-content plant skipped');
+      }
+    } finally {
+      if (origMgr !== null) fs.writeFileSync(mgrPath, origMgr);
+    }
+    // (g) files-whitelist pack leak (DD-5d, 33-g P2-4 + P3-7): plant the
+    // worst `files` regression — examples/ drags the live demo .env and
+    // dogfood data into the tarball; the deny list must FAIL it
+    try {
+      fs.writeFileSync(pkgPath, origPkg.replace(/"files": \[/, '"files": [\n    "examples",'));
+      const pp = packLeakProblems();
+      if (pp.length !== 1 || !/examples\//.test(pp[0]) || !/\.env/.test(pp[0])) { console.error(`selftest FAIL: pack-leak deny list did not bite (reported ${JSON.stringify(pp)})`); failed++; }
+    } finally {
+      fs.writeFileSync(pkgPath, origPkg);
+    }
   } finally {
     fs.rmSync(ghost, { force: true });
     fs.writeFileSync(pkgPath, origPkg);
     if (origDist !== null) fs.writeFileSync(distPath, origDist);
   }
-  console.log(failed === 0 ? 'release-check selftest: PASS (ghost chunk + version drift + stale dist + tracked orphan + gutted AGENTS.md all caught)' : 'release-check selftest: FAIL');
+  console.log(failed === 0 ? 'release-check selftest: PASS (ghost chunk + version drift + stale dist + tracked orphan + gutted AGENTS.md + stale content + pack leak all caught)' : 'release-check selftest: FAIL');
   process.exit(failed === 0 ? 0 : 2);
 }
 
 /* --------------------------------- verdict ---------------------------------- */
 problems.push(...versionProblems(), ...distFreshnessProblems(), ...distSetProblems());
+problems.push(...packLeakProblems());
 problems.push(...agentsGuideProblems());
 for (const n of notes) console.log(`  ok  ${n}`);
 if (problems.length) {

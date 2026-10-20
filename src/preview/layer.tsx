@@ -22,8 +22,9 @@ import { inspectComponent, correctSource } from './fiber';
 import { buildStoryRef } from './story-meta';
 import { addComment, createThread, getSnapshot, getThreads, patchThread, postSnapshot } from './api';
 import { captureFrozenSnapshot, captureFrozenView, captureSnapshot, mountRecalledView, type FrozenMount } from './snapshot';
-import { hitTest, GreyedGate } from './hittest';
-import { DEFAULT_HOTKEYS, parseHotkey, hotkeyMatches, altMatches, isTypingTarget, type Hotkeys, type HotkeySpec } from '../shared/hotkeys';
+import { hitTest, GreyedGate, isPinnableTarget } from './hittest';
+import { DEFAULT_HOTKEYS, parseHotkey, hotkeyMatches, altMatches, hotkeyLabel, isTypingTarget, type Hotkeys, type HotkeySpec } from '../shared/hotkeys';
+import { applyRecallScroll, shouldApplyRecall } from '../shared/recall';
 
 // v0.6.10 (S6-D3c): the hotkey kernel (parse/match/guard/defaults) moved to
 // src/shared/hotkeys.ts — ONE implementation for the preview layer AND the
@@ -75,6 +76,9 @@ function sbChannel(): ChannelLike {
 /* ---------------------------------- utils ------------------------------------ */
 
 const AUTHOR_KEY = 'annotakit:author';
+/** v0.6.14 (user directive 2026-10-19): the ThreadCard's comment order —
+ *  'newest' (default) | 'oldest' — persisted per browser like the author. */
+const COMMENT_ORDER_KEY = 'annotakit:commentOrder';
 
 function getAuthor(): string {
   try {
@@ -157,6 +161,15 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
     };
   }, [composer]);
   const [activeThread, setActiveThread] = useState<string | null>(null);
+  /** v0.6.13 (audit 44-c P2-1): mirrors for the POST-await surface re-check —
+   *  recallThread's pre-await composer/activeThread guards are defeated by
+   *  their own await window (a surface opened mid-fetch used to be
+   *  force-replaced by the landing winner's setActiveThread). The modeRef
+   *  pattern; read at re-check time, not captured in the callback closure. */
+  const composerRef = useRef(composer);
+  composerRef.current = composer;
+  const activeThreadRef = useRef(activeThread);
+  activeThreadRef.current = activeThread;
 
   /** v0.6.9 (S3/S5): a FROZEN view is mounted. kind 'freeze' = a live capture
    *  (pinnable — focus-driven UI survives exactly as captured); kind 'recall'
@@ -168,6 +181,17 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
   const frozenRef = useRef(frozen);
   frozenRef.current = frozen;
   const frozenMountRef = useRef<FrozenMount | null>(null);
+  /** v0.6.13 (S9/DD-3a): the recall in-flight guard's sequence token —
+   *  last-started-wins. Each recallThread invocation captures ++seq at
+   *  start; after the await only the current-token holder may touch state
+   *  (see shared/recall.ts for the full contract, unit-pinned there). */
+  const recallSeqRef = useRef(0);
+  /** v0.6.13 (S9/DD-17a): the recalled view's scroll was restored from the
+   *  snapshot's `scroll` field — the flash effect then skips its
+   *  scrollIntoView centering (the as-captured position IS the pin's
+   *  context; centering would override the restore with a slightly
+   *  different view). The flash highlight still fires. */
+  const recallScrollRef = useRef(false);
 
   /** v0.6.9 (S2 RCA — reproduced live): story-authored focus traps (the
    *  radix/headlessui modal pattern) steal focus from the composer textarea
@@ -187,13 +211,28 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
       // body-children walk would inert our own composer. Walk DOWN the tree
       // instead, freezing every child EXCEPT the subtrees that contain (or
       // are) an overlay — inert cascades, so one level per path suffices.
+      // v0.6.13 (S9/DD-3e, 34-b): the walk now ALSO skips the FROZEN container
+      // — the veil walk's pattern (applyFrozenVeil). A card opened over a
+      // recalled mount (recallThread opens the card at the end of its mount)
+      // used to inert the container itself: the recalled view went dead
+      // under its own card, and elementsFromPoint skipping inert subtrees
+      // meant any still-armed capture would pin the LIVE element behind the
+      // opaque view. frozenMountRef is read at WALK time (not captured in
+      // this effect's closure — the veil walk's discipline). NOTE: the
+      // length===0 gate above means a mount SWAP while a card stays open does
+      // not re-run this walk — irrelevant once taught (it would only ever
+      // have SKIPPED the container); do not "fix" the gate to chase that.
       const overlays = Array.from(document.querySelectorAll('[data-annota-overlay]'));
-      const onPath = (el: Element): boolean => overlays.some((o) => o === el || el.contains(o));
+      const fm = frozenMountRef.current;
+      const onPath = (el: Element): boolean =>
+        overlays.some((o) => o === el || el.contains(o)) || (fm != null && (el === fm.container || el.contains(fm.container)));
       const inerted: Element[] = [];
       const walk = (parent: Element): void => {
         for (const child of Array.from(parent.children)) {
           if (onPath(child)) {
-            if (child !== overlays[0]) walk(child); // descend along the overlay path only
+            // descend along the path only — into wrappers, never INTO the
+            // overlay or the frozen container themselves
+            if (!overlays.includes(child) && child !== fm?.container) walk(child);
             continue;
           }
           if (!child.hasAttribute('inert')) {
@@ -618,7 +657,10 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
   }, [visible, emitLayerState]);
 
   /* ---- UI_STATE → manager toolbar (active-state reflection + counts) ---- */
-  const openCountMemo = threads.filter((t) => t.status === 'open').length;
+  // v0.6.15 (55-c P3-4): unknown/legacy counts OPEN everywhere (the H-B-15
+  // UI twin — the digest buckets already do; a legacy thread must not
+  // vanish from every toolbar count).
+  const openCountMemo = threads.filter((t) => t.status !== 'fixed' && t.status !== 'rejected' && t.status !== 'resolved').length;
   const fixedCountMemo = threads.filter((t) => t.status === 'fixed').length;
   const rejectedCountMemo = threads.filter((t) => t.status === 'rejected').length;
   // v0.6.11 (S7-B): the orphan count — the drawer's dot was the only
@@ -676,10 +718,35 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
     [anchors],
   );
 
+  /* ---- capture modes (v0.6.13/S9: declared above recallThread — its deps
+   *  array evaluates at render time, so a later-declared exitMode would be a
+   *  TDZ read. v0.6.14: moved above enterFreeze TOO — its disarm-on-entry
+   * (the recall 3d parity) references exitMode in its deps, same class.) ---- */
+  const enterMode = useCallback((m: 'pin' | 'region' | 'idle') => {
+    setMode(m);
+    setComposer(null);
+    setActiveThread(null);
+    if (m === 'pin') document.body.classList.add('annota-cursor');
+    else document.body.classList.remove('annota-cursor');
+  }, []);
+
+  const exitMode = useCallback(() => {
+    setMode('idle');
+    setHoverBox(null);
+    setDragRect(null);
+    dragStart.current = null;
+    document.body.classList.remove('annota-cursor');
+  }, []);
+
   /* ---- v0.6.9 (S3/S5): frozen view state machine ---- */
   const exitFrozenView = useCallback((): void => {
     frozenMountRef.current?.teardown();
     frozenMountRef.current = null;
+    // v0.6.15 (55-d P3-2): a thaw is a MODE CHANGE — the entry hint ("❄
+    // frozen — … Esc to thaw") used to keep reading over the LIVE canvas
+    // for its full 2.6s window after Esc (live-proven at +703ms). Clear it.
+    setHint(null);
+    if (hintTimer.current) window.clearTimeout(hintTimer.current);
     // v0.6.10 (S6-D4d): lift the keyboard veil (S2-walk discipline — see
     // applyFrozenVeil) + release the gate's strong refs to the torn-down
     // container (audit A-P3: the frozen container is a body child the
@@ -693,13 +760,29 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
   }, [resolveAll, liftFrozenVeil]);
 
   const enterFreeze = useCallback((): void => {
+    // v0.6.14 (audit 53-c P3, the recall 3d parity): disarm an armed
+    // pin/region BEFORE the freeze — an armed mode carried INTO a frozen
+    // view is the same armed-carry hole recallThread closes (mislabelled
+    // live pins against the DOM hidden behind the opaque view; also zero
+    // freeze announcement while armed — the cursor class ate the state).
+    if (modeRef.current !== 'idle') exitMode();
     frozenMountRef.current = captureFrozenView(storyRoot());
     // v0.6.10 (S6-D4d): the keyboard veil — S2-walk discipline (the blunt
     // storyRoot inert broke our own composer: the overlay lives INSIDE it).
     applyFrozenVeil();
     setFrozen({ kind: 'freeze' });
+    // v0.6.14 (user directive "no sticky elements on the DOM surface" —
+    // same class as the removed "dev only" badge): the PERSISTENT frozen
+    // pill is GONE. Entry announces through the transient 2.6s hint (the
+    // accepted friction-hint pattern), then the canvas stays clean for the
+    // whole freeze. Esc thaws — documented in the help card + here.
+    // v0.6.14 (54-a residual): hotkeys:false stories get the toolbar-Pin
+    // wording — advertising the ⌥C chord there is advertising a dead key.
+    showHint(hotkeys === false
+      ? '❄ frozen — the toolbar Pin button pins what you see · Esc to thaw'
+      : `❄ frozen — ${hotkeyLabel(hk.pin, DEFAULT_HOTKEYS.pin)} to pin what you see · Esc to thaw`);
     resolveAll();
-  }, [resolveAll, applyFrozenVeil]);
+  }, [resolveAll, applyFrozenVeil, showHint, hk.pin, exitMode, hotkeys]);
 
   /** ⌥I / toolbar. Toggle: freeze → thaw; recall → REPLACE with a fresh
    *  freeze (one state machine, one container — D8). Refused while a composer
@@ -745,7 +828,18 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
    *  the composer-open guard (the panel's view button lives in the MANAGER
    *  document — the canvas composer stays open, and a mount created while a
    *  surface is open escapes the S2 inert walk) + the live-root inert veil
-   *  (S6-D4d, same as freeze). */
+   *  (S6-D4d, same as freeze).
+   *  v0.6.13 (S9/DD-3, 34-b as amended): (3a) the in-flight sequence guard —
+   *  overlapping invocations used to overwrite each other's mount without
+   *  teardown, leaking a frozen container that permanently blocks the canvas
+   *  (survives story switch); (3b) teardown-before-assign inside the guarded
+   *  block; (3d) disarm on BOTH sides of the await (the top call alone is
+   *  defeated by its own await window — setFrozen(null) below nulls
+   *  frozenRef during getSnapshot, so every arm guard passes mid-fetch).
+   *  v0.6.13 (audit 44-c P2-1): the S6-D4c surface guards are re-checked
+   *  POST-await too (ref mirrors) — a card/composer opened mid-fetch no
+   *  longer gets force-replaced by the landing winner (see the re-check
+   *  inside the token-guarded block). */
   const recallThread = useCallback(
     async (threadId: string): Promise<void> => {
       if (composer) {
@@ -758,6 +852,20 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
         showHint('Close the open thread card first (Esc)');
         return;
       }
+      // v0.6.13 (S9/DD-3d): disarm FIRST — an armed pin/region carried into a
+      // recall minted mislabeled live pins against the DOM hidden behind the
+      // opaque view (the read-only "recalled past" contract). Covers
+      // armed-BEFORE-invoke immediately; the await window below is re-covered
+      // inside the token-guarded block (see 3d there).
+      if (modeRef.current !== 'idle') exitMode();
+      // v0.6.13 (S9/DD-3a): capture THIS invocation's token — last-started-wins
+      // (see shared/recall.ts). Guard-refused calls above never consume one,
+      // so a refused overlap cannot absorb a pending sibling.
+      const seq = ++recallSeqRef.current;
+      // v0.6.13 (S9/DD-17a): clear the previous recall's scroll-restored flag
+      // BEFORE this flight — a fallback/failed recall must not inherit it and
+      // wrongly suppress the flash effect's centering.
+      recallScrollRef.current = false;
       // one state machine: an existing mount (freeze or recall) goes first
       if (frozenMountRef.current) {
         frozenMountRef.current.teardown();
@@ -768,16 +876,91 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
       let mounted = false;
       try {
         const snap = await getSnapshot(threadId);
-        if (!mountedRef.current) return; // story switched mid-fetch — the layer is gone
+        // story-switch guard first (the layer is gone — the manager's bounded
+        // 5×400 ms loop covers the missing ack; do not ack inside the guard)
+        if (!mountedRef.current) return;
+        // in-flight guard: absorbed by a newer invocation → touch NOTHING —
+        // no teardown, no assign, no ack. It never created a mount (nothing
+        // leaks); the winner acks for itself on BOTH of its exit paths.
+        if (!shouldApplyRecall(seq, recallSeqRef.current)) return;
+        // v0.6.13 (audit 44-c P2-1): the pre-await composer/activeThread
+        // guards above are PRE-AWAIT only — a surface opened DURING
+        // getSnapshot (a canvas pin click, the panel's focusThread, a
+        // composer armed through the 3d arm hole) used to land anyway: the
+        // winner mounted the recalled view under the open card and its
+        // trailing setActiveThread FORCE-REPLACED the user's reading context
+        // (S6-D4c's rationale violated one await later). Re-check the
+        // MIRRORED state here and refuse the landing: ack FIRST (this
+        // invocation IS the winner — the refused overlaps that kept it alive
+        // never consumed a token; the layer is still mounted, so the ack
+        // terminates the manager's retry loop), hint, and return BEFORE the
+        // re-disarm/teardown/assign — the open surface keeps ownership, no
+        // view is mounted, nothing leaks.
+        if (composerRef.current || activeThreadRef.current) {
+          try {
+            sbChannel().emit(THREAD_RECALLED, threadId);
+          } catch {
+            /* ignore */
+          }
+          showHint(
+            composerRef.current
+              ? 'Submit or cancel the open comment first (Esc)'
+              : 'Close the open thread card first (Esc)',
+          );
+          return;
+        }
+        // v0.6.13 (S9/DD-3d, MANDATORY re-disarm): the top-of-function
+        // exitMode is defeated by its own await window — during getSnapshot,
+        // frozenRef is null (setFrozen above), so BOTH arm guards (the
+        // channel RECALL refusal and the hotkey guards) pass and ⌥C / ⌥B /
+        // the Pin command can arm mid-fetch. Re-disarm INSIDE the guarded
+        // block: recall is read-only by contract; a mid-drag disarm sacrifices
+        // the drag, which is the honest outcome (the cross-story re-emit makes
+        // mid-flight arrival real, not theoretical).
+        if (modeRef.current !== 'idle') exitMode();
         if (!snap?.html || !snap.html.trim() || snap.clipped) throw new Error('snapshot missing or clipped');
+        // v0.6.13 (S9/DD-3, 34-b amendment 3b): teardown-before-assign — the winner tears down
+        // whatever frozenMountRef holds AT ASSIGN TIME: null (the usual — its
+        // own top block, or an absorbed sibling, already cleared it) or a
+        // FREEZE that entered during this flight via toggleFreeze's own assign
+        // (the guard alone would orphan that mount forever — the leak). The
+        // cast is load-bearing: TS's flow analysis narrowed the ref to null
+        // (the top block above assigns null) and cannot see the cross-function
+        // assignment that happens during the await.
+        const stale = frozenMountRef.current as FrozenMount | null;
+        stale?.teardown();
         frozenMountRef.current = mountRecalledView(snap, storyRoot());
+        // v0.6.13 (S9/DD-17a): restore the captured scroller position. The
+        // frozen surface's own exploration scroll applies VERBATIM (the
+        // stored clone's inline top already encodes the freeze-time window
+        // scroll); the legacy story-root shape is translated by the live
+        // window's CURRENT scroll (the holder sits at the live root's
+        // today-rect — the best historical proxy). Absent/malformed → false
+        // → today's behavior (top + the flash effect's pin centering).
+        // v0.6.13 usability round (e2e row 9): the FROZEN shape mounts the
+        // serialized container as a NESTED [data-annota-frozen] div (the
+        // B-F6 shape — captureFrozenSnapshot serializes the container
+        // itself) and that nested div is position:fixed, i.e. OUT OF FLOW:
+        // the fresh outer container cannot scroll (content height 0), so
+        // applying the restore to `container` was a silent no-op and every
+        // frozen-shape recall opened at TOP (live-reproduced). Target the
+        // element that actually scrolls: the nested serialized container
+        // when present, the outer one otherwise (the legacy holder shape —
+        // and any future mount that stops nesting — keeps today's path).
+        const mount = frozenMountRef.current as FrozenMount;
+        const scroller =
+          (mount.container.querySelector(':scope > [data-annota-frozen]') as HTMLElement | null) ?? mount.container;
+        recallScrollRef.current = applyRecallScroll(snap, scroller, { x: window.scrollX, y: window.scrollY });
         // v0.6.10 (S6-D4d): the keyboard veil (S2-walk discipline)
         applyFrozenVeil();
         mounted = true;
       } catch {
         mounted = false;
       }
-      // ack FIRST (terminates the manager's retry loop), then the fallback
+      // ack FIRST (terminates the manager's retry loop) — winner-only, on BOTH
+      // exit paths (mount and honest fallback): the emit sits BEFORE the
+      // mounted branch by contract. Absorbed invocations returned above and
+      // never reach here.
       try {
         sbChannel().emit(THREAD_RECALLED, threadId);
       } catch {
@@ -789,11 +972,19 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
         return;
       }
       setFrozen({ kind: 'recall', threadId });
+      // v0.6.14 (user directive "no sticky elements on the DOM surface"): the
+      // persistent "recalling #N — read-only" pill is GONE — the SAME
+      // transient 2.6s hint as freeze entry announces the state, then the
+      // recalled view is visually owned by the snapshot + the opened card.
+      // The Esc exit stays documented in the panel's view-button tooltip +
+      // the help card, and the read-only contract is enforced by the pin
+      // door itself (refuses with a hint).
+      showHint(`❄ recalling #${threads.find((t) => t.id === threadId)?.number ?? '?'} — read-only · Esc to return`);
       setVisible(true); // the user asked to SEE this pin — the layer must not stay hidden
       setActiveThread(threadId); // the card opens next to the pin (review actions right there)
       resolveAll();
     },
-    [showHint, focusThread, resolveAll, composer, activeThread, liftFrozenVeil, applyFrozenVeil],
+    [showHint, focusThread, resolveAll, composer, activeThread, liftFrozenVeil, applyFrozenVeil, exitMode, threads],
   );
 
   /** Recall flash: anchors state commits async — flash from an effect once
@@ -805,29 +996,16 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
     const raf = requestAnimationFrame(() => {
       const el = anchors.get(id)?.el;
       if (!el || !el.closest('[data-annota-frozen]')) return;
-      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      // v0.6.13 (S9/DD-17a): with the captured scroll restored, the
+      // as-captured position IS the pin's context — skip the centering
+      // (scrollIntoView would override the restore); the flash highlight
+      // still marks the pin.
+      if (!recallScrollRef.current) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
       el.setAttribute('data-annota-flash', '1');
       window.setTimeout(() => el.removeAttribute('data-annota-flash'), 3400);
     });
     return () => cancelAnimationFrame(raf);
   }, [frozen, anchors]);
-
-  /* ---- capture modes ---- */
-  const enterMode = useCallback((m: 'pin' | 'region' | 'idle') => {
-    setMode(m);
-    setComposer(null);
-    setActiveThread(null);
-    if (m === 'pin') document.body.classList.add('annota-cursor');
-    else document.body.classList.remove('annota-cursor');
-  }, []);
-
-  const exitMode = useCallback(() => {
-    setMode('idle');
-    setHoverBox(null);
-    setDragRect(null);
-    dragStart.current = null;
-    document.body.classList.remove('annota-cursor');
-  }, []);
 
   /* ---- channel: manager commands (toolbar buttons — v0.5.0 the ONLY entry
    *  point besides hotkeys; the in-canvas launcher is GONE).
@@ -920,8 +1098,21 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
      *  whose click events Chrome suppresses). el: the pointerup path passes
      *  its already-resolved hit (audit A-P3-5: no duplicate hitTest). */
     const actOnHit = (x: number, y: number, el?: HTMLElement): void => {
-      const target = el ?? hitTest(x, y, hitScope(), gate);
+      const scope = hitScope();
+      const target = el ?? hitTest(x, y, scope, gate);
       if (!target) return;
+      // v0.6.13 (S9/DD-18b, 33-e P2-2): the hit must land INSIDE the hit scope
+      // — a strict descendant of the story root (live) / the frozen container
+      // (frozen). elementsFromPoint answers <body> at exposed canvas padding
+      // and the container itself on the exposed frozen background; neither is
+      // story content, and both minted honest-looking junk threads (cssPath
+      // throws, textQuote grabs the story's first text, the pin rides our own
+      // chrome). Dead clicks SPEAK here — unlike the null-swallow path above,
+      // which stays silent (the predecessor's still-open overlay-swallow item).
+      if (!isPinnableTarget(target, scope)) {
+        showHint('Click an element inside the story to pin it');
+        return;
+      }
       // v0.6.9 (S3): while a frozen view is up, the capture root follows the
       // element — the story clone for story content, the container for
       // body-portal content (context menus, tooltips).
@@ -1092,9 +1283,19 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
             }
             setComposer(null);
           }
+          // v0.6.13 (S9/DD-18a, 33-e P2-1): the missing steps, mirroring the
+          // hotkeys-enabled chain's order EXACTLY. Without the activeThread
+          // step this branch ran exitFrozenView() with a card open over the
+          // frozen view: the veil lifted (story fully live under an open annota
+          // card — the S2 focus-trap class, story handlers firing under the
+          // reply input) while the S2 walk's records still held only the
+          // (removed) container. helpOpen joins for completeness (unreachable
+          // via hotkeys in this config — the '?' key is disabled with them).
+          else if (activeThread) setActiveThread(null);
           // v0.6.9 (S3): the no-hotkeys branch mirrors the main chain's frozen
           // exit (after the composer guard).
           else if (frozen) exitFrozenView();
+          else if (helpOpen) setHelpOpen(false);
         }
         return;
       }
@@ -1302,6 +1503,29 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
         out.push({ thread: t, fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h }, status: 'orphan' });
       }
     }
+    // v0.6.14 (sweep 53-d P2-3): PIN CASCADE — two pins on the same element
+    // (or clamped to the same edge) stacked EXACTLY, and only the topmost
+    // was clickable: the threads existed but were unreachable from the
+    // canvas. Stack-index pins that share a rounded anchor slot and offset
+    // each subsequent one down-right by 10px — every pin stays clickable.
+    // Regions are exempt (their rects differ; the cascade is for POINT
+    // pins). Deterministic order = the render order below.
+    const slotCount = new Map<string, number>();
+    for (const v of out) {
+      if (v.thread.target.kind === 'region') continue;
+      // v0.6.15 (55-d P3-4): key on the CLAMPED render position — the render
+      // clamps pins into the viewport, so two pins near the right/bottom edge
+      // clamped onto the SAME pixel while their unclamped keys differed (no
+      // cascade): at the corner, two pins rendered at exactly one point and
+      // only the topmost was clickable (the original "8 pins as 2 dots" bug
+      // alive at the corner). Same clamp constants as the pin render below.
+      const cx = Math.min(Math.max(v.fixed.x - 4, 2), Math.max(vw - 26, 2));
+      const cy = Math.min(Math.max(v.fixed.y - 26, 2), Math.max(vh - 26, 2));
+      const key = `${Math.round(cx / 12)}:${Math.round(cy / 12)}`;
+      const n = slotCount.get(key) ?? 0;
+      slotCount.set(key, n + 1);
+      if (n > 0) v.fixed = { ...v.fixed, x: v.fixed.x + n * 10, y: v.fixed.y + n * 10 };
+    }
     void vw;
     void vh;
     return out;
@@ -1314,23 +1538,29 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
     // the last sticky canvas element. The state lives where it's actionable:
     // toolbar buttons disable with an explanatory tooltip, and the panel
     // carries the honest down-mode notice (see manager). Dead clicks still
-    // speak via transient hints.
-    return null;
+    // speak via transient hints — v0.6.15 (55-d P3-3): and they RENDER now
+    // (the old early `return null` sat BEFORE the hint JSX, so the guards'
+    // showHint calls were total silence; the comment had been claiming they
+    // speak since v0.6.9).
+    return hint ? (
+      <div className="annota-root">
+        <div className="annota-capture-hint" role="status">
+          {hint}
+        </div>
+      </div>
+    ) : null;
   }
 
   const activeT = threads.find((t) => t.id === activeThread) ?? null;
 
   return (
     <div data-annota-overlay="1" className="annota-root">
-      {/* v0.6.9 (S3/S5): frozen/recall state pill — informational, never a
-          banner (the canvas stays overlay-free by user directive). */}
-      {frozen && (
-        <div className="annota-frozen-pill" role="status">
-          {frozen.kind === 'freeze'
-            ? '❄ frozen — ⌥C to pin what you see · Esc to thaw'
-            : `❄ recalling #${threads.find((t) => t.id === frozen.threadId)?.number ?? '?'} — read-only · Esc to return`}
-        </div>
-      )}
+      {/* v0.6.14 (user directive "no sticky elements on the DOM surface",
+          extended 2026-10-19 after the recall pill annoyed in live use): NO
+          persistent state surfaces render here anymore — the frozen/recall
+          pill joined the "dev only" badge in the deleted set. State changes
+          announce via the TRANSIENT hint (2.6s, same class as friction
+          hints); the steady-state canvas carries ONLY pins/regions/cards. */}
 
       {/* pins + regions */}
       {visible &&
@@ -1341,7 +1571,19 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
               className={`annota-region${thread.status === 'resolved' ? ' is-resolved' : ''}${thread.status === 'fixed' ? ' is-fixed' : ''}${thread.status === 'rejected' ? ' is-rejected' : ''}${thread.id === activeThread ? ' is-active' : ''}`}
               style={{ left: clamp(fixed.x, 0, Math.max(window.innerWidth - fixed.w, 0)), top: clamp(fixed.y, 0, Math.max(window.innerHeight - fixed.h, 0)), width: fixed.w, height: fixed.h }}
               onClick={() => setActiveThread(thread.id)}
-              title={`#${thread.number}`}
+              onKeyDown={(e) => {
+                // v0.6.15 (55-b P3): the a11y quartet mirrors the PIN — a
+                // keyboard user could open pin threads from the canvas but
+                // never region threads (an asymmetry inside one feature).
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setActiveThread(thread.id);
+                }
+              }}
+              tabIndex={0}
+              role="button"
+              aria-label={`Open region thread #${thread.number} (${thread.status})`}
+              title={`#${thread.number} — Enter/Space opens`}
             >
               <span className="annota-region-tag">#{thread.number}</span>
             </div>
@@ -1379,8 +1621,14 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
           ),
         )}
 
-      {/* transient, non-error friction hints (v0.6.1) — dead clicks SPEAK */}
-      {hint && mode === 'idle' && (
+      {/* transient, non-error friction hints (v0.6.1) — dead clicks SPEAK.
+          v0.6.14 (usability row 6 + sweep 53-d P2-2, browser-confirmed by
+          53-a2): the `mode === 'idle'` gate is DROPPED — armed-mode dead
+          clicks (canvas padding, frozen background, the ⌥C-then-⌥I freeze
+          refusals) set hints that the gate rendered NOWHERE (the hint is
+          pointer-events:none — it cannot occlude the target; the user saw
+          total silence and read pinning as broken). */}
+      {hint && (
         <div className="annota-capture-hint" role="status">
           {hint}
         </div>
@@ -1632,10 +1880,43 @@ function ThreadCard(props: {
   onClose: () => void;
 }): React.ReactElement {
   const [replyBody, setReplyBody] = React.useState('');
+  // v0.6.14 (user directive 2026-10-19, same as the panel's list order):
+  // comments render LATEST-first by default — "usually I open up to click on
+  // the latest": the newest reply (an agent's response) is readable without
+  // scrolling. A header toggle flips to the classic oldest-first stream; the
+  // choice persists in localStorage like the author name.
+  const [newestFirst, setNewestFirst] = React.useState<boolean>(() => {
+    try {
+      return localStorage.getItem(COMMENT_ORDER_KEY) !== 'oldest';
+    } catch {
+      return true;
+    }
+  });
+  const toggleCommentOrder = (): void => {
+    setNewestFirst((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem(COMMENT_ORDER_KEY, next ? 'newest' : 'oldest');
+      } catch {
+        /* ignore — a blocked storage must not break the toggle */
+      }
+      return next;
+    });
+  };
   const t = props.thread;
   const near = props.pin?.fixed;
   const { ref, style } = useClampedPosition(near ? near.x + (near.x > window.innerWidth / 2 ? -120 : 120) : 40, near ? near.y : 60);
   const comp = t.component;
+  // v0.6.14 (audit 53-c P3): in newest-first order a submitted reply lands at
+  // the TOP of the max-height:60vh scrolling card — out of view above the
+  // fold. When the comment count GROWS while the card is mounted (a reply
+  // landed), scroll the card to its top so the new reply is visible.
+  const prevCountRef = React.useRef(t.comments.length);
+  React.useEffect(() => {
+    const grew = t.comments.length > prevCountRef.current;
+    prevCountRef.current = t.comments.length;
+    if (grew && newestFirst && ref.current) ref.current.scrollTop = 0;
+  }, [t.comments.length, newestFirst, ref]);
   return (
     <div ref={ref} className="annota-card" style={style}>
       <div className="annota-card-header">
@@ -1662,6 +1943,15 @@ function ThreadCard(props: {
             ❄ frozen
           </span>
         )}
+        <button
+          className="annota-btn is-small"
+          onClick={toggleCommentOrder}
+          title={newestFirst
+            ? 'Comments: newest first (latest reply on top) — click for oldest first (chat order)'
+            : 'Comments: oldest first (chat order) — click for newest first (latest reply on top)'}
+        >
+          {newestFirst ? '⇅ latest' : '⇅ oldest'}
+        </button>
         <button className="annota-btn is-small" onClick={props.onClose}>
           ✕
         </button>
@@ -1689,7 +1979,7 @@ function ThreadCard(props: {
           </div>
         )}
       </div>
-      {t.comments.map((c) => (
+      {(newestFirst ? [...t.comments].reverse() : t.comments).map((c) => (
         <div key={c.id} className="annota-comment">
           <div className="annota-comment-head">
             <b>
@@ -1761,11 +2051,12 @@ function ThreadCard(props: {
  * manager-side toggleThreadsPanel helper). */
 
 function HelpCard(props: { hotkeys: Hotkeys; frozenView: boolean; onClose: () => void }): React.ReactElement {
-  const k = (spec: string): string => {
-    const s = parseHotkey(spec, spec);
-    const key = s.key === '?' ? '?' : s.key.toUpperCase();
-    return s.alt ? `⌥${key}` : key;
-  };
+  // v0.6.14 (usability row 16, track 53-b): k() used parseHotkey(spec, spec)
+  // — the spec as its OWN fallback. A degenerate spec ('alt+') fell through
+  // to the raw token and rendered a phantom "⌥ALT+". The shared hotkeyLabel
+  // with the action's DEFAULT as the fallback renders the REAL chord (the
+  // same substitution rule the bind applies), never a phantom modifier.
+  const k = (spec: string, fallback: string): string => hotkeyLabel(spec, fallback);
   return (
     <div className="annota-card annota-help">
       <div className="annota-card-header">
@@ -1776,13 +2067,13 @@ function HelpCard(props: { hotkeys: Hotkeys; frozenView: boolean; onClose: () =>
       </div>
       <table>
         <tbody>
-          <tr><td><span className="annota-kbd">{k(props.hotkeys.pin)}</span></td><td>pin an element (click it)</td></tr>
-          <tr><td><span className="annota-kbd">{k(props.hotkeys.region)}</span></td><td>mark a region (drag)</td></tr>
+          <tr><td><span className="annota-kbd">{k(props.hotkeys.pin, DEFAULT_HOTKEYS.pin)}</span></td><td>pin an element (click it)</td></tr>
+          <tr><td><span className="annota-kbd">{k(props.hotkeys.region, DEFAULT_HOTKEYS.region)}</span></td><td>mark a region (drag)</td></tr>
           {props.frozenView !== false && (
-            <tr><td><span className="annota-kbd">{k(props.hotkeys.freeze)}</span></td><td>freeze / thaw the current view — works without moving the mouse (catches hover-driven UI)</td></tr>
+            <tr><td><span className="annota-kbd">{k(props.hotkeys.freeze, DEFAULT_HOTKEYS.freeze)}</span></td><td>freeze / thaw the current view — works without moving the mouse (catches hover-driven UI)</td></tr>
           )}
-          <tr><td><span className="annota-kbd">{k(props.hotkeys.layer)}</span></td><td>show / hide pins</td></tr>
-          <tr><td><span className="annota-kbd">{k(props.hotkeys.drawer)}</span></td><td>open the threads panel (bottom dock — SB docks it left/right too)</td></tr>
+          <tr><td><span className="annota-kbd">{k(props.hotkeys.layer, DEFAULT_HOTKEYS.layer)}</span></td><td>show / hide pins</td></tr>
+          <tr><td><span className="annota-kbd">{k(props.hotkeys.drawer, DEFAULT_HOTKEYS.drawer)}</span></td><td>open the threads panel (bottom dock — SB docks it left/right too)</td></tr>
           <tr><td><span className="annota-kbd">Esc</span></td><td>cancel / close</td></tr>
           <tr><td><span className="annota-kbd">⌘/Ctrl+↵</span></td><td>submit comment</td></tr>
         </tbody>

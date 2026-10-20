@@ -9,25 +9,27 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-N6VBNK7S.mjs";
+} from "./chunk-JG34ADOS.mjs";
 import {
   getGhLinkedStaticStore,
-  ghClientStatus
-} from "./chunk-NI2PFIAZ.mjs";
+  ghClientStatus,
+  ghMappingRepo
+} from "./chunk-23RNGYKC.mjs";
 import {
   MAX_BODY_CHARS,
   renderStaticDigest
-} from "./chunk-MHG5WIGU.mjs";
+} from "./chunk-DEMUCS72.mjs";
 import {
   DEFAULT_HOTKEYS,
   hotkeyLabel,
   hotkeyMatches,
   isTypingTarget,
   parseHotkey
-} from "./chunk-F7IFSFQY.mjs";
+} from "./chunk-RIIVYBJP.mjs";
 import {
+  panelShownNow,
   toggleThreadsPanel
-} from "./chunk-R6AKSCIA.mjs";
+} from "./chunk-SA6YJLWN.mjs";
 
 // src/manager/index.tsx
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -38,6 +40,7 @@ var ADDON_ID = "annotakit";
 var PANEL_ID = `${ADDON_ID}/panel`;
 var TOOL_ID = `${ADDON_ID}/tool`;
 var AUTHOR_KEY = "annotakit:author";
+var SORT_KEY = "annotakit:sort";
 var toggleThreadsPanel2 = (api) => {
   toggleThreadsPanel(api, PANEL_ID);
 };
@@ -87,6 +90,20 @@ function ago(iso) {
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   return `${Math.round(s / 3600)}h ago`;
 }
+function lastActivity(t) {
+  let best = null;
+  let bestT = -Infinity;
+  for (const c of t.comments ?? []) {
+    if (!c || typeof c.body !== "string" || !c.body) continue;
+    const ts = Date.parse(c.createdAt ?? "");
+    if (!Number.isFinite(ts)) continue;
+    if (ts > bestT) {
+      bestT = ts;
+      best = { author: String(c.author ?? "?"), body: c.body, createdAt: c.createdAt };
+    }
+  }
+  return best;
+}
 var positiveOf = (t) => t.colorPositive ?? t.color?.positive ?? "#66BF3C";
 var negativeOf = (t) => t.colorNegative ?? t.color?.negative ?? "#FF4400";
 function ReviewPanel() {
@@ -99,7 +116,22 @@ function ReviewPanel() {
   const { hk: hkMap, hotkeysOn: hotkeysOnMap, ui: uiState } = useAnnotaHotkeys();
   const [scope, setScope] = useState("story");
   const [filter, setFilter] = useState("all");
-  const [sortMode, setSortMode] = useState("story");
+  const [sortMode, setSortMode] = useState(
+    () => {
+      try {
+        return localStorage.getItem(SORT_KEY) === "story" ? "story" : "recent";
+      } catch {
+        return "recent";
+      }
+    }
+  );
+  const changeSort = (m) => {
+    setSortMode(m);
+    try {
+      localStorage.setItem(SORT_KEY, m);
+    } catch {
+    }
+  };
   const [threads, setThreads] = useState([]);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
@@ -233,7 +265,8 @@ function ReviewPanel() {
       storybookApi.selectStory(t.storyId);
       const ch = addons.getChannel();
       let attempts = 0;
-      const ack = () => {
+      const ack = (id) => {
+        if (id !== t.id) return;
         attempts = 99;
         ch.removeListener(THREAD_FOCUSED, ack);
       };
@@ -253,19 +286,24 @@ function ReviewPanel() {
     }
     setActiveThread(t.id);
   };
+  const [recallPending, setRecallPending] = useState(0);
   const recallThread = (t) => {
     if (t.storyId !== storyId) {
       storybookApi.selectStory(t.storyId);
       const ch = addons.getChannel();
       let attempts = 0;
-      const ack = () => {
+      setRecallPending((n) => n + 1);
+      const ack = (id) => {
+        if (id !== t.id) return;
         attempts = 99;
         ch.removeListener(THREAD_RECALLED, ack);
+        setRecallPending((n) => Math.max(0, n - 1));
       };
       ch.on(THREAD_RECALLED, ack);
       const emitOnce = () => {
         if (attempts >= 5) {
           ch.removeListener(THREAD_RECALLED, ack);
+          setRecallPending((n) => Math.max(0, n - 1));
           return;
         }
         attempts += 1;
@@ -410,13 +448,32 @@ function ReviewPanel() {
     setGhSettingsOpen((v) => !v);
     if (!ghSettingsOpen) {
       setGhForm({
-        repo: ghStat?.repo ?? ghForm.repo ?? "",
-        labels: ghStat?.labels?.length ? ghStat.labels : ghForm.labels ?? ["annotakit"],
+        // v0.6.13 (S9/U2, 33-d P3): per-field preservation like the token —
+        // an unsaved edit made before collapsing the section used to be
+        // silently DISCARDED on reopen (only the token survived; the old
+        // ghStat-first seeding only kept an edit when ghStat's own value was
+        // null/empty).
+        repo: ghForm.repo ?? ghStat?.repo ?? "",
+        labels: Array.isArray(ghForm.labels) ? ghForm.labels : ghStat?.labels?.length ? ghStat.labels : ["annotakit"],
         token: ghForm.token ?? "",
-        pollMs: ghStat?.pollMs ?? 6e4,
-        disabled: ghStat?.suppressed
+        pollMs: ghForm.pollMs ?? ghStat?.pollMs ?? 6e4,
+        // the RAW poll string does NOT survive the re-seed (a stale
+        // half-typed value must not masquerade as the effective setting);
+        // a VALID unsaved poll edit survives via pollMs (kept fresh on
+        // change) and re-displays as its parsed seconds.
+        pollRaw: void 0,
+        // the disable-publishing checkbox is an edit like the rest (the
+        // audit named repo/labels/poll; the checkbox is the same drop class
+        // — a toggled-but-unsaved local-only switch must not flip back).
+        disabled: ghForm.disabled ?? ghStat?.suppressed
       });
     }
+  };
+  const pollSeconds = (raw) => {
+    const t = raw.trim();
+    if (!t) return void 0;
+    const n = Number(t);
+    return Number.isFinite(n) && n >= 0 ? Math.round(n * 1e3) : void 0;
   };
   const saveGhSettings = async () => {
     const store = await getGhLinkedStaticStore();
@@ -428,10 +485,22 @@ function ReviewPanel() {
       const patch = {};
       const repo = (ghForm.repo ?? "").trim();
       if (repo && repo !== freshStat.repo) patch.repo = repo;
+      let detaching = 0;
+      if (patch.repo) {
+        const threads2 = store.list?.() ?? [];
+        for (const t of threads2) {
+          if (!t.gh) continue;
+          const r = ghMappingRepo(t.gh);
+          if (r && r !== patch.repo) detaching++;
+        }
+      }
       const tok = (ghForm.token ?? "").trim();
       if (tok) patch.token = tok;
       if (labels.length && labels.join(",") !== (freshStat.labels ?? []).join(",")) patch.labels = labels;
-      if (ghForm.pollMs !== void 0 && ghForm.pollMs !== freshStat.pollMs) patch.pollMs = ghForm.pollMs;
+      const pollRaw = (ghForm.pollRaw ?? "").trim();
+      const pollMs = pollRaw !== "" ? pollSeconds(pollRaw) : ghForm.pollMs ?? freshStat.pollMs;
+      const pollInvalid = pollRaw !== "" && pollMs === void 0;
+      if (pollMs !== void 0 && pollMs !== freshStat.pollMs) patch.pollMs = pollMs;
       patch.disabled = ghForm.disabled ? true : void 0;
       const tokIgnored = Boolean(ghForm.token) && !tok;
       store.gh.saveSettings(patch);
@@ -441,8 +510,12 @@ function ReviewPanel() {
         setError(String(s.lastError));
       } else if (!s.configured && !patch.disabled) {
         setNotice("saved \u2014 but NOT publishing yet: repo must be owner/name and a token must be present (check GitHub settings below)");
+      } else if (pollInvalid) {
+        setNotice("saved \u2014 but the poll interval was NOT: enter seconds (a number \u2265 0; 0 disables polling) \u2014 it keeps the previous value");
       } else if (tokIgnored) {
         setNotice('saved \u2014 token unchanged (whitespace-only input ignored; use "use baked" to drop a saved override)');
+      } else if (detaching > 0) {
+        setNotice(`saved \u2014 publishing \u2192 ${patch.repo} \xB7 \u26A0 ${detaching} mirrored thread${detaching === 1 ? "" : "s"} DETACHED (issue${detaching === 1 ? "" : "s"} live on the old repo; frozen, not synced \u2014 restore the repo or unlink to re-mirror)`);
       } else {
         setNotice(`saved \u2014 publishing${patch.disabled ? " disabled" : ` \u2192 ${patch.repo ?? freshStat.repo ?? "(baked repo)"}`}${labels.length ? ` \xB7 labels: ${labels.join(", ")}` : ""}`);
       }
@@ -473,23 +546,34 @@ function ReviewPanel() {
   };
   const clearGhSettings = async () => {
     const store = await getGhLinkedStaticStore();
-    store.gh?.clearSettings();
+    try {
+      store.gh?.clearSettings();
+    } catch (e) {
+      setError(`overrides NOT cleared \u2014 ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
     setGhForm({});
     setGhStat(await ghClientStatus());
     setNotice("local overrides cleared \u2014 baked config (if any) applies again");
     window.setTimeout(() => setNotice(null), 5e3);
   };
   const ordered = useMemo(
-    () => sortMode === "recent" ? [...threads].sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""))) : stableSort(threads),
+    () => sortMode === "recent" ? [...threads].sort((a, b) => (
+      // v0.6.14: updatedAt falls back to createdAt (a thread never touched
+      // since pinning is "as recent as it was born"); both-missing → ''
+      // which already sorts LAST in this DESC comparator (legacy threads
+      // sink, they never masquerade as freshest).
+      String(b.updatedAt ?? b.createdAt ?? "").localeCompare(String(a.updatedAt ?? a.createdAt ?? ""))
+    )) : stableSort(threads),
     [threads, sortMode]
   );
   const shown = useMemo(
     () => ordered.filter(
-      (t) => filter === "all" ? true : filter === "open" ? t.status === "open" : filter === "review" ? t.status === "fixed" : t.status === "rejected"
+      (t) => filter === "all" ? true : filter === "open" ? t.status !== "fixed" && t.status !== "rejected" && t.status !== "resolved" : filter === "active" ? t.status !== "resolved" : filter === "review" ? t.status === "fixed" : t.status === "rejected"
     ),
     [ordered, filter]
   );
-  const openCount = ordered.filter((t) => t.status === "open").length;
+  const openCount = ordered.filter((t) => t.status !== "fixed" && t.status !== "rejected" && t.status !== "resolved").length;
   const fixedCount = ordered.filter((t) => t.status === "fixed").length;
   const rejectedCount = ordered.filter((t) => t.status === "rejected").length;
   const uiOrphan = scope === "story" ? uiState?.orphan ?? 0 : 0;
@@ -512,7 +596,7 @@ function ReviewPanel() {
     background: active ? bg : "transparent",
     color: active ? "#fff" : theme.textColor
   });
-  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: theme.fontBase, fontSize: 13, padding: "8px 10px", height: "100%", overflow: "auto", color: theme.textColor } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "story"), onClick: () => setScope("story") }, "This story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "all"), onClick: () => setScope("all") }, "All stories")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "all"), onClick: () => setFilter("all"), title: "Show everything" }, "all"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "open"), onClick: () => setFilter("open"), title: "Show only open (agent work queue)" }, "open"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "review"), onClick: () => setFilter("review"), title: "Threads the agent marked fixed \u2014 awaiting your verification (the check-latest-batch view)" }, "to review"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "rejected"), onClick: () => setFilter("rejected"), title: "Fixes you rejected \u2014 awaiting the agent's re-work (the verdict is durable)" }, "rejected")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "story"), onClick: () => setSortMode("story"), title: "Stable order: story title, then thread number \u2014 resolving never reorders the list" }, "by story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "recent"), onClick: () => setSortMode("recent"), title: "Most recently touched first (replies, status flips) \u2014 the what-was-addressed-since-my-last-visit view" }, "recent")), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: theme.textMutedColor } }, threads.length ? `${openCount} open${fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : ""}${rejectedCount > 0 ? ` \xB7 ${rejectedCount} rejected` : ""}${uiOrphan > 0 ? ` \xB7 ${uiOrphan} orphan` : ""} / ${threads.length} threads` : "no threads"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: theme.fontBase, fontSize: 13, padding: "8px 10px", height: "100%", overflow: "auto", color: theme.textColor } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "story"), onClick: () => setScope("story") }, "This story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "all"), onClick: () => setScope("all") }, "All stories")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "all"), onClick: () => setFilter("all"), title: "Show everything" }, "all"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "open"), onClick: () => setFilter("open"), title: "Show only open (agent work queue)" }, "open"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "active"), onClick: () => setFilter("active"), title: "Everything unresolved \u2014 open + to review + rejected (resolved excluded): the full outstanding-work view" }, "active"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "review"), onClick: () => setFilter("review"), title: "Threads the agent marked fixed \u2014 awaiting your verification (the check-latest-batch view)" }, "to review"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "rejected"), onClick: () => setFilter("rejected"), title: "Fixes you rejected \u2014 awaiting the agent's re-work (the verdict is durable)" }, "rejected")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "story"), onClick: () => changeSort("story"), title: "Stable order: story title, then thread number \u2014 resolving never reorders the list" }, "by story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "recent"), onClick: () => changeSort("recent"), title: "Latest first: most recently touched (replies, status flips, new pins) on top \u2014 the default (persisted; the 'by story' switch is remembered too)" }, "latest")), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: theme.textMutedColor } }, threads.length ? `${openCount} open${fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : ""}${rejectedCount > 0 ? ` \xB7 ${rejectedCount} rejected` : ""}${uiOrphan > 0 ? ` \xB7 ${uiOrphan} orphan` : ""} / ${threads.length} threads` : "no threads"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
     "input",
     {
       style: { padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor, width: 110 },
@@ -602,11 +686,8 @@ function ReviewPanel() {
     "input",
     {
       style: { width: 60, padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor },
-      value: String(Math.round((ghForm.pollMs ?? 6e4) / 1e3)),
-      onChange: (e) => {
-        const n = Number.parseInt(e.target.value, 10);
-        setGhForm((f) => ({ ...f, pollMs: Number.isFinite(n) && n >= 0 ? n * 1e3 : 6e4 }));
-      },
+      value: ghForm.pollRaw ?? String(Math.round((ghForm.pollMs ?? 6e4) / 1e3)),
+      onChange: (e) => setGhForm((f) => ({ ...f, pollRaw: e.target.value, pollMs: pollSeconds(e.target.value) ?? f.pollMs })),
       title: "How often to pull remote replies/state \u2014 0 disables polling (manual sync only)"
     }
   )), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 4, alignItems: "center", color: theme.textMutedColor } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: Boolean(ghForm.disabled), onChange: (e) => setGhForm((f) => ({ ...f, disabled: e.target.checked })) }), "disable client publishing (local-only)"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
@@ -625,7 +706,14 @@ function ReviewPanel() {
       title: "Remove localStorage overrides \u2014 the baked annotakit-gh.json applies again"
     },
     "Reset"
-  )), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, "Saved overrides live in THIS browser for THIS deployment (localStorage). Every thread mirrors to exactly ONE issue; queued feedback flushes on the next page load even after crashes. Multiple workstreams on one repo: give each a distinct label set here.")), error && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: "pre-wrap" } }, error), probeResult === "down" && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "6px 8px", fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: "pre-wrap" } }, "No AnnotaKit store reachable \u2014 pinning is paused. Fixes: run the review surface under ", /* @__PURE__ */ React.createElement("b", null, "storybook dev"), " (the API lives on the dev server), or bake the static build (", /* @__PURE__ */ React.createElement("code", null, "node node_modules/storybook-annotakit/scripts/bake-static-threads.mjs <sb-output-dir>"), "). The canvas stays overlay-free either way."), notice && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${positiveColor}22`, color: positiveColor } }, notice), shown.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { padding: "12px 4px", fontSize: 12, color: theme.textMutedColor } }, threads.length === 0 ? scope === "story" ? hotkeysOnMap ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Press ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.pin)), " in the canvas and click an element \u2014 or ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.region)), " to drag a region. Everything saves automatically to the dev-server store.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Click an element with the toolbar Pin button \u2014 or drag a region with the toolbar Box button. Everything saves automatically to the dev-server store.") : hotkeysOnMap ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.pin)), " in the canvas and click an element.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Use the toolbar Pin button, then click an element in the canvas.") : filter === "open" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing open \u2014 everything is fixed (awaiting review), rejected (awaiting re-work) or resolved. Switch the filter to \u201Cto review\u201D, \u201Crejected\u201D or \u201Call\u201D.") : filter === "review" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing awaiting review \u2014 no agent fixes pending.") : filter === "rejected" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing rejected \u2014 no fixes awaiting re-work.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "All threads resolved \u{1F389}.")), shown.map((t) => {
+  )), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, "Saved overrides live in THIS browser for THIS deployment (localStorage). Every thread mirrors to exactly ONE issue; queued feedback flushes on the next page load even after crashes. Multiple workstreams on one repo: give each a distinct label set here.")), error && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: "pre-wrap" } }, error), probeResult === "down" && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "6px 8px", fontSize: 11, borderRadius: 6, background: `${negativeColor}22`, color: negativeColor, whiteSpace: "pre-wrap" } }, "No AnnotaKit store reachable \u2014 pinning is paused. Fixes: run the review surface under ", /* @__PURE__ */ React.createElement("b", null, "storybook dev"), " (the API lives on the dev server), or bake the static build (", /* @__PURE__ */ React.createElement("code", null, "node node_modules/storybook-annotakit/scripts/bake-static-threads.mjs <sb-output-dir>"), "). The canvas stays overlay-free either way."), notice && /* @__PURE__ */ React.createElement("div", { style: { margin: "6px 0", padding: "5px 8px", fontSize: 11, borderRadius: 6, background: `${positiveColor}22`, color: positiveColor } }, notice), shown.length === 0 && /* @__PURE__ */ React.createElement("div", { style: { padding: "12px 4px", fontSize: 12, color: theme.textMutedColor } }, threads.length === 0 ? scope === "story" ? hotkeysOnMap ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Press ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.pin, DEFAULT_HOTKEYS.pin)), " in the canvas and click an element \u2014 or ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.region, DEFAULT_HOTKEYS.region)), " to drag a region. Everything saves automatically to the dev-server store.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads for this story. Click an element with the toolbar Pin button \u2014 or drag a region with the toolbar Box button. Everything saves automatically to the dev-server store.") : hotkeysOnMap ? /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Press ", /* @__PURE__ */ React.createElement("b", null, hotkeyLabel(hkMap.pin, DEFAULT_HOTKEYS.pin)), " in the canvas and click an element.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "No threads yet. Use the toolbar Pin button, then click an element in the canvas.") : filter === "open" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing open \u2014 everything is fixed (awaiting review), rejected (awaiting re-work) or resolved. Switch the filter to \u201Cto review\u201D, \u201Crejected\u201D or \u201Call\u201D.") : filter === "active" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing outstanding \u2014 every thread is resolved. New pins and agent replies land back here automatically.") : filter === "review" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing awaiting review \u2014 no agent fixes pending.") : filter === "rejected" ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Nothing rejected \u2014 no fixes awaiting re-work.") : (
+    /* v0.6.13 (S9/U2, 33-d P3): the “All threads resolved 🎉”
+     * branch lived here — UNREACHABLE dead code: under
+     * filter === 'all' the predicate is `true` for every
+     * status, so shown ≡ threads and shown.length === 0 with
+     * threads.length > 0 cannot hold. Removed. */
+    null
+  )), shown.map((t) => {
     const active = t.id === activeThread;
     return /* @__PURE__ */ React.createElement(
       "div",
@@ -668,6 +756,14 @@ function ReviewPanel() {
         /* @__PURE__ */ React.createElement(LinkIcon, { width: 10, height: 10 }),
         " ",
         t.gh.issue
+      ), t.gh && ghStat?.configured && ghStat.repo && ghMappingRepo(t.gh) !== null && ghMappingRepo(t.gh) !== ghStat.repo && /* @__PURE__ */ React.createElement(
+        "span",
+        {
+          title: `mirror DETACHED \u2014 issue #${t.gh.issue} lives on ${ghMappingRepo(t.gh)}, the active repo is ${ghStat.repo}. This thread is frozen (no push, no pull, no close). Restore the repo setting or unlink the thread to re-mirror.`,
+          style: chip("#7c2d1233", "#fb7185"),
+          onClick: (e) => e.stopPropagation()
+        },
+        "detached"
       ), t.component?.name && /* @__PURE__ */ React.createElement("span", { style: chip(`${theme.colorSecondary}18`, theme.colorSecondary) }, t.component.name), t.transient && /* @__PURE__ */ React.createElement(
         "span",
         {
@@ -690,8 +786,9 @@ function ReviewPanel() {
       ), snapshotIds.has(t.id) && /* @__PURE__ */ React.createElement(
         "button",
         {
-          title: "Recall \u2014 re-create the exact view at pin time and show this pin alone (read-only; Esc returns to the live view)",
-          style: { ...chip("#0c4a6e18", "#0369a1"), border: "none", font: "inherit", textDecoration: "none", display: "inline-flex", gap: 3, alignItems: "center", cursor: "pointer" },
+          title: recallPending ? "Recall pending \u2014 the new story is still settling (retries until the view mounts, ~2s worst case)" : "Recall \u2014 re-create the exact view at pin time and show this pin alone (read-only; Esc returns to the live view)",
+          disabled: !!recallPending,
+          style: { ...chip("#0c4a6e18", "#0369a1"), border: "none", font: "inherit", textDecoration: "none", display: "inline-flex", gap: 3, alignItems: "center", cursor: recallPending ? "default" : "pointer", opacity: recallPending ? 0.55 : 1 },
           onClick: (e) => {
             e.stopPropagation();
             recallThread(t);
@@ -699,8 +796,9 @@ function ReviewPanel() {
         },
         /* @__PURE__ */ React.createElement(EyeIcon, { width: 10, height: 10 }),
         " view"
-      ), scope === "all" && t.story.name && /* @__PURE__ */ React.createElement("span", { style: chip("#64748b18", theme.textMutedColor) }, t.story.name), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, t.createdAt.slice(0, 10))),
-      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, marginTop: 3, color: theme.textColor, textDecoration: t.status === "resolved" ? "line-through" : "none" } }, t.comments[0]?.body?.split("\n")[0]?.slice(0, 140) ?? "(no text)"),
+      ), scope === "all" && t.story.name && /* @__PURE__ */ React.createElement("span", { style: chip("#64748b18", theme.textMutedColor) }, t.story.name), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor }, title: `pinned ${t.createdAt.slice(0, 10)}` }, sortMode === "recent" ? ago(t.updatedAt ?? t.createdAt) || t.updatedAt?.slice(0, 10) || t.createdAt.slice(0, 10) : t.createdAt.slice(0, 10))),
+      sortMode === "recent" && lastActivity(t) && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, marginTop: 3, color: theme.textColor } }, /* @__PURE__ */ React.createElement("b", null, lastActivity(t).author, ":"), " ", lastActivity(t).body.split("\n")[0].slice(0, 120), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: theme.textMutedColor } }, " \xB7 ", ago(lastActivity(t).createdAt) || "")),
+      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, marginTop: 3, color: sortMode === "recent" && lastActivity(t) ? theme.textMutedColor : theme.textColor, textDecoration: t.status === "resolved" ? "line-through" : "none" } }, t.comments[0]?.body?.split("\n")[0]?.slice(0, 140) ?? "(no text)"),
       t.component?.source && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: theme.textMutedColor, fontFamily: theme.fontMonospace, marginTop: 2 } }, t.component.source.file, t.component.source.line ? `:${t.component.source.line}` : ""),
       t.comments.length > 1 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: theme.textMutedColor, marginTop: 2 } }, "+", t.comments.length - 1, " replies"),
       /* @__PURE__ */ React.createElement(ThreadActions, { thread: t, busy, onReply: reply, onSetStatus: setStatus, onDelete: del, active })
@@ -829,12 +927,16 @@ function MiniButton(props) {
     props.children
   );
 }
+var lastUiState = null;
 function useAnnotaHotkeys() {
-  const [ui, setUi] = useState(null);
+  const [ui, setUi] = useState(lastUiState);
   useEffect(() => {
     const ch = addons.getChannel();
     const onState = (s) => {
-      if (s && typeof s === "object") setUi(s);
+      if (s && typeof s === "object") {
+        lastUiState = s;
+        setUi(s);
+      }
     };
     ch.on(UI_STATE, onState);
     return () => {
@@ -914,12 +1016,12 @@ function AnnotaKitTool() {
   const rejected = ui?.rejected ?? 0;
   const total = ui?.total ?? 0;
   const layout = sbState.layout;
-  const panelShown = sbState.selectedPanel === PANEL_ID && ((layout?.bottomPanelHeight ?? 0) > 0 || (layout?.rightPanelWidth ?? 0) > 0) && sbState.viewMode === "story";
-  const kPin = hotkeysOn ? ` (${hotkeyLabel(hk.pin)})` : "";
-  const kRegion = hotkeysOn ? ` (${hotkeyLabel(hk.region)})` : "";
-  const kLayer = hotkeysOn ? ` (${hotkeyLabel(hk.layer)})` : "";
-  const kDrawer = hotkeysOn ? ` (${hotkeyLabel(hk.drawer)})` : "";
-  const kFreeze = hotkeysOn ? hotkeyLabel(hk.freeze) : "";
+  const panelShown = sbState.selectedPanel === PANEL_ID && panelShownNow(storybookApi, layout) && sbState.viewMode === "story";
+  const kPin = hotkeysOn ? ` (${hotkeyLabel(hk.pin, DEFAULT_HOTKEYS.pin)})` : "";
+  const kRegion = hotkeysOn ? ` (${hotkeyLabel(hk.region, DEFAULT_HOTKEYS.region)})` : "";
+  const kLayer = hotkeysOn ? ` (${hotkeyLabel(hk.layer, DEFAULT_HOTKEYS.layer)})` : "";
+  const kDrawer = hotkeysOn ? ` (${hotkeyLabel(hk.drawer, DEFAULT_HOTKEYS.drawer)})` : "";
+  const kFreeze = hotkeysOn ? hotkeyLabel(hk.freeze, DEFAULT_HOTKEYS.freeze) : "";
   return /* @__PURE__ */ React.createElement("div", { key: "annotakit-tool", style: { display: "inline-flex", alignItems: "center", gap: 2 } }, btn(`Pin a comment to an element${kPin}`, /* @__PURE__ */ React.createElement(PinIcon, { width: 14, height: 14 }), ui?.mode === "pin", () => emit("pin")), btn(`Mark a region${kRegion}`, /* @__PURE__ */ React.createElement(BoxIcon, { width: 14, height: 14 }), ui?.mode === "region", () => emit("region")), frozenViewEnabled && btn(
     ui?.frozen === true ? "Thaw the frozen view (Esc) \u2014 pin what you see while it lasts" : kFreeze ? `Freeze the current view (${kFreeze} \u2014 best-effort from the toolbar; the hotkey is the reliable path: no mouse movement, so hover-driven UI cannot close)` : "Freeze the current view (best-effort from the toolbar)",
     /* @__PURE__ */ React.createElement("span", { style: { fontSize: 14, lineHeight: "14px" }, "aria-hidden": true }, "\u2744"),

@@ -192,6 +192,16 @@ export interface DomSnapshot {
    *  the legacy story-root shape (recall positions it at the live root's
    *  rect). Additive: old snapshots simply lack it. */
   surface?: 'story' | 'frozen';
+  /** v0.6.13 (S9/DD-17a): the scroller position at capture time, so recall
+   *  re-shows the VIEW the pinner saw, not just the DOM. Two semantics, one
+   *  field: the legacy story-root shape stores the WINDOW scroll (the SB
+   *  preview document is the scroller — verified live; recall translates it
+   *  by the live window's current scroll because the holder sits at the live
+   *  root's today-rect); the 'frozen' surface stores the frozen container's
+   *  OWN exploration scroll (applied verbatim — the stored children's inline
+   *  rects already encode the freeze-time window scroll). Optional: absent
+   *  on legacy snapshots → recall keeps today's top + pin-centering. */
+  scroll?: { x: number; y: number };
 }
 
 /** The pinned element anchor package (ported multi-selector engine). */
@@ -223,6 +233,13 @@ export interface Comment {
 export interface ThreadGhRef {
   issue: number;
   url?: string;
+  /** DD-21 (v0.6.15): the repo this issue was minted on — the mapping's
+   *  IDENTITY. A mapping whose repo differs from the active config is
+   *  DETACHED (inert + loud): the pull never reconciles it, the push never
+   *  writes to it, the delete never closes the foreign issue. Optional:
+   *  legacy docs derive it from `url` (see ghMappingRepo) and get stamped
+   *  on their next verify. */
+  repo?: string;
   /** Last issue state we pushed or pulled — diffing against thread.status is
    *  how both directions of the lifecycle sync are decided. */
   state?: 'open' | 'closed';
@@ -249,6 +266,17 @@ export interface Thread {
    *  Never rendered; rides exports/seeds verbatim (the seed is an
    *  operator-trusted build artifact). */
   reopenedAt?: string;
+  /** DD-19 (S9): the deliberate gh-unlink MARKER — set by the engine's
+   *  unlink door when the remote issue is DELETED (404: the mapping points
+   *  at a tombstone issue). Delete-wins in every merge (see merge.ts): the
+   *  either-side gh rule is for stale gh-LESS copies (duplicate-issue
+   *  protection), but resurrecting a deliberately-unlinked mapping would
+   *  push to the dead issue forever (the 404 livelock). Cleared only by a
+   *  NEW mapping — the engine's re-create stamps a fresh gh and clears this
+   *  at the same write. Store-owned: every PATCH door normalizes it away
+   *  from full-doc bodies, exactly like reopenedAt. Never rendered; rides
+   *  exports/seeds/wire verbatim. */
+  ghUnlinkedAt?: string;
   /** Author of the first comment (thread owner). */
   author: string;
   story: StoryRef;
@@ -356,6 +384,10 @@ export interface GhSyncStatus {
   /** Threads with a gh mapping / total threads. */
   mapped: number;
   threads: number;
+  /** DD-21 (v0.6.15): mapped threads whose issue lives on a DIFFERENT repo
+   *  than the active config — DETACHED (frozen: never pushed, never pulled,
+   *  never closed). Restore the repo config or unlink to re-mirror. */
+  detached: number;
   /** Queued + in-flight push tasks. */
   pending: number;
   /** Threads with un-mirrored local deltas (retries exhausted — self-heal via
@@ -384,6 +416,10 @@ export interface GhSyncStatus {
 
 /** Result of POST /sync (force reconcile both directions). */
 export interface GhSyncSummary {
+  /** v0.6.13 (44-b P2-2): true when the rate-limit window was armed when the
+   *  summary was built (a forced cycle deferred by a mid-flight 429 shows
+   *  all-zero counters with this flag — honest instead of silent). */
+  backoffActive?: boolean;
   ok: true;
   /** True when the mirror is unconfigured: nothing was done, `reason` says why
    *  (with a/b/c setup steps). Local mode is NOT an error. */

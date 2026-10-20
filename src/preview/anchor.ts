@@ -320,6 +320,23 @@ function withinOverlay(el: Element): boolean {
   return el.closest(`[${OVERLAY_ATTR}]`) != null;
 }
 
+/** v0.6.13 (S9/DD-18c, 33-e P2-3): the textQuote pass's acceptance gate. The
+ *  pass was completely un-scored (any text match won → status `approx`), so a
+ *  portal pin (a context menu's "Save", captured against the frozen
+ *  CONTAINER) whose text also occurs in the story resolved on the PRIMARY
+ *  pass to the story clone's copy — the pin visibly jumps to the wrong
+ *  element while frozen/recalled, and after thaw the same steal happens
+ *  against the live root (menu/tooltip labels collide with the story's own
+ *  buttons constantly), silently violating the documented live-orphan
+ *  contract. The gate mirrors scoreCandidate's rule: same capture viewport
+ *  width → the candidate's bbox must agree (IoU ≥ threshold); a DIFFERENT
+ *  width means a responsive relayout moved every box, so the text evidence
+ *  alone carries it there (today's behavior). Pure so the s6 suite pins it. */
+export function textQuoteGate(bboxNow: BBox, bboxThen: BBox, widthNow: number, widthThen: number): boolean {
+  if (Math.abs(widthNow - widthThen) > WIDTH_TOLERANCE) return true; // relayout — text alone
+  return iou(bboxNow, bboxThen) >= IOU_THRESHOLD;
+}
+
 function findByTextQuote(ann: AnchorLike, root: HTMLElement): HTMLElement | null {
   const q = ann.selector.textQuote;
   if (!q?.exact) return null;
@@ -396,7 +413,31 @@ function findByFingerprint(ann: AnchorLike, root: HTMLElement): HTMLElement | nu
           el = el.parentElement;
           hops++;
         }
-        if (el && el !== root && !withinOverlay(el)) return el;
+        // v0.6.14 (54-b, the DD-18c failure class at the neighbor rung): the
+        // walk must land on the RECORDED tag — hops-exhausted used to return
+        // a mismatched ancestor (a wrong-element pin masquerading as alive)...
+        if (!el || el === root || el.tagName.toLowerCase() !== fp.tag || withinOverlay(el)) continue;
+        // v0.6.15 (55-d P3-1, the shift-up residual): deleting a list row
+        // shifts the NEXT row (same tag, matching neighbor text) INTO the
+        // recorded bbox — tag + text + bbox all agreed on the SIBLING. The
+        // fingerprint's identifying attrs (id / data-testid) discriminate it;
+        // a candidate carrying a DIFFERENT id is not our element. Pins
+        // without any identifying attr keep the documented residual (the
+        // own-text fingerprint extension is the follow-up).
+        const idAttr = fp.attrs.find((a) => a.name === 'id' || a.name === 'data-testid');
+        if (idAttr && el.getAttribute(idAttr.name) !== idAttr.value) continue;
+        // ...and the candidate must AGREE with the recorded bbox at the same
+        // capture width — the v0.6.13 textQuoteGate, applied here: the pinned
+        // element being DELETED while a surviving sibling carries matching
+        // text used to re-anchor SILENTLY onto the neighbor ('approx' renders
+        // identically to a healthy pin). With the gate, a genuine deletion
+        // falls through to the honest orphan instead. (The walk goes UP from
+        // the text's owner, never ACROSS — it cannot return the original
+        // element, so this rung never legitimately served rerender-survival;
+        // the gate makes it stop lying about it. A cross-walk is the
+        // documented follow-up.)
+        if (!ann.bbox || !textQuoteGate(bboxOf(el, root), ann.bbox, rootWidth(root), ann.captureViewportWidth)) continue;
+        return el;
       }
     }
   }
@@ -415,8 +456,14 @@ export function resolveAnchor(ann: AnchorLike, root: HTMLElement): AnchorResolut
       /* fall through */
     }
   }
+  // v0.6.13 (S9/DD-18c): the textQuote answer is GATED (bbox agreement at the
+  // same capture viewport width) — an out-of-place text match falls through to
+  // the fingerprint pass, then orphan, so resolveAll's secondary pass (the
+  // frozen container, where a portal pin's own text lives) can take over.
   const byText = findByTextQuote(ann, root);
-  if (byText) return { element: byText, status: 'approx', strategy: 'text' };
+  if (byText && textQuoteGate(bboxOf(byText, root), ann.bbox, rootWidth(root), ann.captureViewportWidth)) {
+    return { element: byText, status: 'approx', strategy: 'text' };
+  }
   const byAttr = findByFingerprint(ann, root);
   if (byAttr) return { element: byAttr, status: 'approx', strategy: 'attr' };
   return { element: null, status: 'orphan', strategy: 'none' };

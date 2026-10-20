@@ -32,9 +32,9 @@ python3 scripts/serve-static.py examples/nimbus/dist-storybook 3000
 
 | aspect | fact |
 |--------|------|
-| bake output | `annotakit-threads.json` ({threads}, resolution env.ts) — ALWAYS, even empty: seed + static-mode marker |
+| bake output | `annotakit-threads.json` ({threads, deleted} — v0.6.13 carries the tombstones; a live row with a standing tombstone is zombie-filtered, resolution env.ts) — ALWAYS, even empty: seed + static-mode marker |
 | detection | shared/mode.ts: health 404s + seed 200s in ms → static mode on the FIRST probe; no config |
-| static mode | pins from the seed; mutations → localStorage `annotakit:static:<scope>`; panel lists/replies/exports client-side; cross-doc via `storage` events; snapshots OFF |
+| static mode | pins from the seed; mutations → localStorage `annotakit:static:<scope>`; panel lists/replies/exports client-side; cross-doc convergence via `storage` events AND v0.6.13's read-merge-write persist (DD-2: every write merges the disk doc into memory and ADOPTS the result — a stale tab can no longer resurrect a cross-tab delete or drop a cross-tab reply; the doors stamp a MONOTONIC clock so same-ms sequential acts survive the merge); the seed carries `deleted` tombstones (dev-side deletes propagate to re-baked statics); snapshots OFF |
 | client GH config | the bake ALSO writes `annotakit-gh.json` (PAT+repo+labels+pollMs) when token+repo resolve (`--gh-*` flags / `ANNOTAKIT_*` / project .env) |
 | browser mirror | the BROWSER mirrors threads to GitHub issues — full lifecycle incl. pull-back of replies/state flips; no server (api.github.com speaks CORS) |
 | outbox | every op hits `annotakit:ghq:<scope>` BEFORE the network; drains on next load, any mutation, the 30s sweep |
@@ -82,9 +82,9 @@ Verify: health → `"ok": true` + `agentSurfaces`, `gh.repo`/`gh.hasToken`, `git
 
 ## 2. The reviewer surface (human)
 
-NATIVE toolbar buttons (pin · region · ❄ freeze · threads+count · show/hide) + ⌥-hotkeys (`⌥C` pin · `⌥B` region · `⌥I` freeze · `⌥L` show/hide · `⌥P` threads panel · `?` help — off SB 9/10's alt-defaults (F/D/R double-fired pre-v0.6.10); ANY focus via the manager bridge; alt+shift is SB's, never matches). PHYSICAL `e.code` matching (Option-compose-proof); legacy plain-key configs work with ⌥ held. Esc cancels; ⌘/Ctrl+Enter submits. Composer shows the EXACT element identity live. v0.6.11: the floating drawer is DELETED — `⌥P`/toolbar open the SB bottom panel (natively dockable): reply, resolve/confirm/reject/clear/reopen (fixed = blue, `to review`+`recent` = check-latest-batch; rejected = DURABLE verdict, red, own filter — the re-work queue; reject/clear append a system notice comment mirrored to the still-OPEN issue), exports, sync status, issue links, 📷 dom chip → snapshot html (§3).
+NATIVE toolbar buttons (pin · region · ❄ freeze · threads+count · show/hide) + ⌥-hotkeys (`⌥C` pin · `⌥B` region · `⌥I` freeze · `⌥L` show/hide · `⌥P` threads panel · `?` help — off SB 9/10's alt-defaults (F/D/R double-fired pre-v0.6.10); ANY focus via the manager bridge; alt+shift is SB's, never matches). PHYSICAL `e.code` matching (Option-compose-proof); legacy plain-key configs work with ⌥ held. Esc cancels; ⌘/Ctrl+Enter submits. Composer shows the EXACT element identity live. v0.6.11: the floating drawer is DELETED — `⌥P`/toolbar open the SB bottom panel (natively dockable): reply, resolve/confirm/reject/clear/reopen (fixed = blue, `to review`+`latest` = check-latest-batch; rejected = DURABLE verdict, red, own filter — the re-work queue; reject/clear append a system notice comment mirrored to the still-OPEN issue), exports, sync status, issue links, 📷 dom chip → snapshot html (§3). v0.6.14 (user directives): the panel list sorts LATEST-first by default (updatedAt DESC — the newest-touched thread is the TOP row; persisted via `annotakit:sort`, the stable `by story` grouping stays the option), and the thread card's comments render NEWEST-first by default with a `⇅` header toggle (persisted via `annotakit:commentOrder`).
 
-**Frozen views + recall (v0.6.9, hardened v0.6.10)**: ⌥I freezes the CURRENT DOM — story clone + body-portal sweep, no live-DOM writes — so focus-driven UI (context menus, tooltips, hovers) survives to be pinned; pins inside it carry `transient` + honestly NO component/jsx (static clones have no fiber). Esc thaws to the LIVE present. The panel's `view` action (snapshot threads) recalls the EXACT pin-time view: that pin ALONE, card at the pin, read-only; legacy snapshots recall too, sanitized (the overlay stripped — no ghost composer from an old capture).
+**Frozen views + recall (v0.6.9, hardened v0.6.10)**: ⌥I freezes the CURRENT DOM — story clone + body-portal sweep, no live-DOM writes — so focus-driven UI (context menus, tooltips, hovers) survives to be pinned; pins inside it carry `transient` + honestly NO component/jsx (static clones have no fiber). Esc thaws to the LIVE present. The panel's `view` action (snapshot threads) recalls the EXACT pin-time view: that pin ALONE, card at the pin, read-only; legacy snapshots recall too, sanitized (the overlay stripped — no ghost composer from an old capture). v0.6.14: NO sticky state surfaces on the canvas (user directive — the persistent frozen/recall pill is deleted, like the "dev only" badge before it); freeze/recall entry announces via the TRANSIENT 2.6s hint, then the canvas carries only pins/regions/cards.
 
 ## 3. The agent flow — detect your path, then follow it
 
@@ -109,7 +109,10 @@ curl -X POST $API/threads/<id>/comments -H 'content-type: application/json' \
   -d '{"author":"agent","body":"fixed in abc123"}'
 curl -X PATCH $API/threads/<id> -H 'content-type: application/json' -d '{"status":"fixed"}'
 curl -X DELETE $API/threads/<id>                   # path form (?id= also works)
-curl -X POST $API/sync                             # force mirror reconcile (idempotent — §4)
+curl -X POST $API/sync                             # force mirror reconcile (idempotent — §4); v0.6.13: CLEARS the
+                                                   # rate-limit window + per-thread retry parks first —
+                                                   # "Sync now" means retry NOW (the debounced tick still
+                                                   # respects an active window)
 curl -X POST $API/gh/reload                        # token rotation without restart — contract:
                                                    #   gh/reload row below
 ```
@@ -172,11 +175,16 @@ node scripts/ghsync-fake.mjs         # mirror engine vs fake GH: idempotency, or
 node scripts/store-robust.mjs        # git-durable store vs real repos + bare remote (NODE only, ~6 min)
 node scripts/static-store-test.mjs   # static-mode store: scope, seed merge, tombstones, digest, quota, transient
                                      #   plumb-through, comment union on patch, unlinkGh engine door
+node scripts/lattice-test.mjs       # the 576-cell merge lattice (44-a P2-2: adopted permanently at v0.6.13
+                                     #   — run on EVERY merge.ts change; walk vs the documented intent)
 node scripts/s6-unit-test.mjs        # hotkey kernel (shift guard, legacy alt fallback) + pin hit-tester (pe:none
                                      #   refinement, overlay exclusion, gate) — injectable fake DOM; runs anywhere
 node scripts/ghclient-test.mjs       # client publisher: outbox durability, idempotency, pull self-heal, AND-label wire
                                      #   format (repeated `labels=` is last-wins on GitHub — comma-join), disabled-mode
                                      #   freeze, 422 parking + unpark, 404-unstick, heal negatives, quota
+node scripts/bake-static-threads.mjs --selftest   # the repo-door shape probes (44-d P2-1: the github: shorthand
+                                     #   normalizes, 3-segment/colon-owner shapes exit-1) — run on ANY parser/gate
+                                     #   change in bake-static-threads.mjs / env.ts ghRepoEnv / ghClient resolveGhConfig
 node scripts/release-check.mjs       # release gate: dist chunk drift + version agreement + dist FRESHNESS (stale dist
                                      #   fails) + dist exact-set + AGENTS.md truth + npm-pack leak; --selftest
 node scripts/stress-live.mjs         # live stress: GH unreachable, kill -9 backfill, black-hole, 500-retry,
@@ -201,7 +209,7 @@ Suites self-report totals + exit nonzero — expected counts live in scripts, no
 - **Config changes need a dev-server RESTART** — main.ts/allowedHosts/addons are read once at boot; a reload does not re-read (kill → await the ~15s flush → relaunch).
 - **Bare `fs` in `node -e` is an eval-context injection, not a global** — `require('fs')` resolves everywhere (and `node -e` scripts in package.json need double-escaped quotes in JSON).
 - **engine-dev traps** (engine/test dev only): kill-flush ordering, insteadOf url-rewrite repo detection, runtime-singleton subprocess rule, push-stderr capture, cwd-relative git pathspecs, logOnce counters, shutdown JOIN-don't-skip, wake-re-arm `ranWork` gate + `wakePending` latch: `.agents/reference/engine-traps.md`.
-- **sync-robustness facts**: lease `{id, nonce, at}` (nonce-less counts as expired → rolling upgrade takes over ≤1 TTL); re-verified per flush-loop iteration AND before every remote write (loss → transient re-queue for the new leader); pull-401 5-min backoff (a manual Sync or a settings save clears it); `syncedAt` stamps are SERVER-CLOCK (GitHub `updated_at` — skew can't hide third-party replies; a legacy future-stamp is repaired by re-listing without `since`).
+- **sync-robustness facts**: lease `{id, nonce, at}` (nonce-less counts as expired → rolling upgrade takes over ≤1 TTL); re-verified per flush-loop iteration AND before every remote write (loss → transient re-queue for the new leader); pull-401 5-min backoff (a manual Sync or a settings save clears it — v0.6.13: the SERVER engine's POST /sync clears its global window the same way, and the window gates PUSHES too); `syncedAt` stamps are SERVER-CLOCK (GitHub `updated_at` — skew can't hide third-party replies; a legacy future-stamp is repaired by re-listing without `since`). The 404-unlink is DURABLE through merges (v0.6.13's `ghUnlinkedAt` marker — a merge can no longer resurrect a mapping whose issue was deleted on GitHub; a re-created issue clears it at the stamp).
 
 ## 7. Verification checklist (before reporting success)
 

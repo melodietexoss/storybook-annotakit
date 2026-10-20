@@ -20,7 +20,7 @@ import { BoxIcon, CameraIcon, CheckIcon, CommentIcon, CommentsIcon, EyeIcon, Eye
 import { API_BASE, FOCUS_THREAD, RECALL_THREAD, THREADS_CHANGED, THREAD_FOCUSED, THREAD_RECALLED, TOGGLE_THREADS_PANEL, UI_COMMAND, UI_STATE, type ThreadsChangedPayload, type UiCommand, type UiState } from '../shared/events';
 import { DEFAULT_HOTKEYS, parseHotkey, hotkeyLabel, hotkeyMatches, isTypingTarget, type Hotkeys } from '../shared/hotkeys';
 import { probeMode, type KitMode } from '../shared/mode';
-import { getGhLinkedStaticStore, ghClientStatus, type GhClientSettings, type GhClientStatus } from '../shared/ghClient';
+import { getGhLinkedStaticStore, ghClientStatus, ghMappingRepo, type GhClientSettings, type GhClientStatus } from '../shared/ghClient';
 import { renderStaticDigest } from '../shared/staticStore';
 import type { GhSyncStatus, GhSyncSummary, Thread } from '../shared/types';
 import { MAX_BODY_CHARS } from '../shared/types';
@@ -29,6 +29,11 @@ const ADDON_ID = 'annotakit';
 const PANEL_ID = `${ADDON_ID}/panel`;
 const TOOL_ID = `${ADDON_ID}/tool`;
 const AUTHOR_KEY = 'annotakit:author';
+/** v0.6.14 (user directive 2026-10-19: "latest first — I open the panel to
+ *  click the latest"): the persisted list-order choice. 'recent' (updatedAt
+ *  DESC — newest activity on top) is the DEFAULT; 'story' stays the stable
+ *  grouping option. Survives reloads like the author name. */
+const SORT_KEY = 'annotakit:sort';
 
 /** v0.6.11 (S7-B): toggle the SB bottom panel with OUR panel selected — the
  *  threads surface (the floating drawer is DELETED). One shared helper for
@@ -42,7 +47,7 @@ const AUTHOR_KEY = 'annotakit:author';
  *  else's); selectedPanel persists — the next native open shows ours.
  *  v0.6.12 (S7-AUDIT-C7): the implementation lives in src/shared/panelToggle
  *  (node unit-testable; the truth table + degrade cells are pinned there). */
-import { toggleThreadsPanel as sharedToggleThreadsPanel, type PanelToggleApi } from '../shared/panelToggle';
+import { toggleThreadsPanel as sharedToggleThreadsPanel, panelShownNow, type PanelToggleApi, type PanelLayoutState } from '../shared/panelToggle';
 
 const toggleThreadsPanel = (api: PanelToggleApi): void => {
   sharedToggleThreadsPanel(api, PANEL_ID);
@@ -131,7 +136,35 @@ function ago(iso: string): string {
   return `${Math.round(s / 3600)}h ago`;
 }
 
+/** v0.6.14 (sweep 53-d P2-1): the thread's LATEST comment (max createdAt —
+ *  the array is append-ordered in practice, but a merge can interleave; the
+ *  instant pick is honest either way). Powers the latest-mode row's
+ *  last-activity line. Returns null when a row has no comment-shaped entry
+ *  (a hostile/degenerate doc must not break the row render). */
+function lastActivity(t: Thread): { author: string; body: string; createdAt: string } | null {
+  let best: { author: string; body: string; createdAt: string } | null = null;
+  let bestT = -Infinity;
+  for (const c of t.comments ?? []) {
+    if (!c || typeof c.body !== 'string' || !c.body) continue;
+    const ts = Date.parse(c.createdAt ?? '');
+    if (!Number.isFinite(ts)) continue;
+    if (ts > bestT) {
+      bestT = ts;
+      best = { author: String(c.author ?? '?'), body: c.body, createdAt: c.createdAt };
+    }
+  }
+  return best;
+}
+
 /* ------------------------------------ panel ----------------------------------- */
+
+/** v0.6.13 (S9/U2, 33-d P3): the GH settings form's EDITOR state — the
+ *  persisted GhClientSettings plus the poll field's RAW string (an
+ *  emptied/garbage input used to snap back to "60" mid-edit: parseInt NaN
+ *  → 60_000, no explanation). The raw string is the editor's truth; the
+ *  parsed pollMs rides alongside (collapse/reopen preservation + the
+ *  save-time diff). UI-only: pollRaw never reaches saveSettings. */
+type GhFormState = GhClientSettings & { pollRaw?: string };
 
 /** SB theme palette fields are NESTED (theme.color.positive) in current
  *  Storybook builds — the historical top-level names (theme.colorPositive…)
@@ -156,11 +189,30 @@ function ReviewPanel(): React.ReactElement {
   const { hk: hkMap, hotkeysOn: hotkeysOnMap, ui: uiState } = useAnnotaHotkeys();
 
   const [scope, setScope] = useState<'story' | 'all'>('story');
-  const [filter, setFilter] = useState<'open' | 'review' | 'rejected' | 'all'>('all');
-  /** v0.6.3: list order — 'story' = stable (resolving never reorders);
-   * 'recent' = updatedAt DESC (every reply/status flip bumps it — the
-   * "what was addressed since my last visit" view; opt-in because it moves). */
-  const [sortMode, setSortMode] = useState<'story' | 'recent'>('story');
+  const [filter, setFilter] = useState<'open' | 'active' | 'review' | 'rejected' | 'all'>('all');
+  /** List order — 'recent' = updatedAt DESC (every reply/status flip bumps
+   *  it — the "latest first" working view; v0.6.14 DEFAULT per user
+   *  directive: "usually I open up to click on the latest"); 'story' = stable
+   *  (story title, then per-story number ascending — resolving never
+   *  reorders; the opt-in for scan-reading a story top-to-bottom). The choice
+   *  persists (SORT_KEY) — a manual switch survives reloads. */
+  const [sortMode, setSortMode] = useState<'story' | 'recent'>(
+    () => {
+      try {
+        return localStorage.getItem(SORT_KEY) === 'story' ? 'story' : 'recent';
+      } catch {
+        return 'recent';
+      }
+    },
+  );
+  const changeSort = (m: 'story' | 'recent'): void => {
+    setSortMode(m);
+    try {
+      localStorage.setItem(SORT_KEY, m);
+    } catch {
+      /* ignore — a blocked storage must not break sorting */
+    }
+  };
   const [threads, setThreads] = useState<Thread[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -180,7 +232,12 @@ function ReviewPanel(): React.ReactElement {
    *  the chip + settings panel. The browser itself pushes feedback. */
   const [ghStat, setGhStat] = useState<GhClientStatus | null>(null);
   const [ghSettingsOpen, setGhSettingsOpen] = useState(false);
-  const [ghForm, setGhForm] = useState<GhClientSettings>({});
+  /** v0.6.13 (S9/U2, 33-d P3): the settings form's EDITOR state — GhClientSettings
+   *  plus the poll field's RAW string (an emptied/garbage input used to snap
+   *  back to "60" mid-edit: parseInt NaN → 60_000, no explanation). The raw
+   *  string is the editor's truth; the parsed pollMs rides alongside for the
+   *  collapse/reopen preservation + the save-time diff. */
+  const [ghForm, setGhForm] = useState<GhFormState>({});
   const [ghBusy, setGhBusy] = useState(false);
 
   useEffect(() => {
@@ -332,7 +389,14 @@ function ReviewPanel(): React.ReactElement {
       // then, re-emit (max 5 attempts, 400 ms apart).
       const ch = addons.getChannel();
       let attempts = 0;
-      const ack = () => { attempts = 99; ch.removeListener(THREAD_FOCUSED, ack); };
+      // v0.6.13 (S9/DD-3a, 34-b): filter the PAYLOAD — a focus ack for thread
+      // Y used to stop thread X's pending loop (a free one-line fix; the
+      // preview's guard absorbs the late emits either way).
+      const ack = (id: unknown): void => {
+        if (id !== t.id) return;
+        attempts = 99;
+        ch.removeListener(THREAD_FOCUSED, ack);
+      };
       ch.on(THREAD_FOCUSED, ack);
       const emitOnce = () => {
         if (attempts >= 5) { ch.removeListener(THREAD_FOCUSED, ack); return; }
@@ -347,6 +411,21 @@ function ReviewPanel(): React.ReactElement {
     setActiveThread(t.id);
   };
 
+  /** v0.6.13 (S9/DD-3a belt): a cross-story recall's retry loop is live —
+   *  every view chip disables while pending (the loop's own lifetime, keyed
+   *  off the attempts counter's window: set at loop start, cleared on ack or
+   *  give-up; no new channel). Double-clicks and cross-thread clicks during
+   *  the ~2 s window were the overlapping-recall trigger the preview's
+   *  in-flight guard now absorbs — this belt keeps the UX honest too: worst
+   *  case the view appears with the LAST emit's fetch (~2.4 s).
+   *  v0.6.13 (audit 44-c P3-5): a COUNT, not a single slot — two overlapping
+   *  cross-story loops used to re-enable every chip when the FIRST ack
+   *  landed while the second loop was still mid-flight. Each loop
+   *  increments at start and decrements on its OWN exit (its ack or its
+   *  give-up — the payload filter keeps loops from acking each other); the
+   *  chips re-enable only at 0. Consumers stay truthiness-based (0). */
+  const [recallPending, setRecallPending] = useState(0);
+
   /** v0.6.9 (S5): recall a thread — re-create the exact view at pin time and
    *  show this pin ALONE (focused one-pin-at-a-time review). Same cross-story
    *  retry-until-ack pattern as focusThread; THREAD_RECALLED fires when the
@@ -357,10 +436,22 @@ function ReviewPanel(): React.ReactElement {
       storybookApi.selectStory(t.storyId);
       const ch = addons.getChannel();
       let attempts = 0;
-      const ack = () => { attempts = 99; ch.removeListener(THREAD_RECALLED, ack); };
+      setRecallPending((n) => n + 1);
+      // v0.6.13 (S9/DD-3a, 34-b): payload filter (a recall of thread Y must
+      // not ack thread X's pending loop — same free fix as focusThread).
+      const ack = (id: unknown): void => {
+        if (id !== t.id) return;
+        attempts = 99;
+        ch.removeListener(THREAD_RECALLED, ack);
+        setRecallPending((n) => Math.max(0, n - 1));
+      };
       ch.on(THREAD_RECALLED, ack);
       const emitOnce = () => {
-        if (attempts >= 5) { ch.removeListener(THREAD_RECALLED, ack); return; }
+        if (attempts >= 5) {
+          ch.removeListener(THREAD_RECALLED, ack);
+          setRecallPending((n) => Math.max(0, n - 1));
+          return;
+        }
         attempts += 1;
         ch.emit(RECALL_THREAD, t.id);
         window.setTimeout(emitOnce, 400);
@@ -540,13 +631,36 @@ function ReviewPanel(): React.ReactElement {
     setGhSettingsOpen((v) => !v);
     if (!ghSettingsOpen) {
       setGhForm({
-        repo: ghStat?.repo ?? ghForm.repo ?? '',
-        labels: ghStat?.labels?.length ? ghStat.labels : ghForm.labels ?? ['annotakit'],
+        // v0.6.13 (S9/U2, 33-d P3): per-field preservation like the token —
+        // an unsaved edit made before collapsing the section used to be
+        // silently DISCARDED on reopen (only the token survived; the old
+        // ghStat-first seeding only kept an edit when ghStat's own value was
+        // null/empty).
+        repo: ghForm.repo ?? ghStat?.repo ?? '',
+        labels: Array.isArray(ghForm.labels) ? ghForm.labels : ghStat?.labels?.length ? ghStat.labels : ['annotakit'],
         token: ghForm.token ?? '',
-        pollMs: ghStat?.pollMs ?? 60_000,
-        disabled: ghStat?.suppressed,
+        pollMs: ghForm.pollMs ?? ghStat?.pollMs ?? 60_000,
+        // the RAW poll string does NOT survive the re-seed (a stale
+        // half-typed value must not masquerade as the effective setting);
+        // a VALID unsaved poll edit survives via pollMs (kept fresh on
+        // change) and re-displays as its parsed seconds.
+        pollRaw: undefined,
+        // the disable-publishing checkbox is an edit like the rest (the
+        // audit named repo/labels/poll; the checkbox is the same drop class
+        // — a toggled-but-unsaved local-only switch must not flip back).
+        disabled: ghForm.disabled ?? ghStat?.suppressed,
       });
     }
+  };
+
+  /** v0.6.13 (S9/U2, 33-d P3): poll-field seconds → ms; undefined when empty
+   *  or not a number ≥ 0 (the parse-at-save rule — an emptied or garbage
+   *  field is NEVER silently coerced to 60s). */
+  const pollSeconds = (raw: string): number | undefined => {
+    const t = raw.trim();
+    if (!t) return undefined;
+    const n = Number(t);
+    return Number.isFinite(n) && n >= 0 ? Math.round(n * 1000) : undefined;
   };
 
   const saveGhSettings = async (): Promise<void> => {
@@ -566,10 +680,30 @@ function ReviewPanel(): React.ReactElement {
       const patch: GhClientSettings = {};
       const repo = (ghForm.repo ?? '').trim();
       if (repo && repo !== freshStat.repo) patch.repo = repo;
+      // DD-21 amendment 6: WARN at save time when this repo change DETACHES
+      // existing mirrored threads (their issues live on the old repo — they
+      // freeze; restore the repo or unlink per-thread to re-mirror).
+      let detaching = 0;
+      if (patch.repo) {
+        const threads = (store as { list?: () => { id: string; gh?: Parameters<typeof ghMappingRepo>[0] }[] }).list?.() ?? [];
+        for (const t of threads) {
+          if (!t.gh) continue;
+          const r = ghMappingRepo(t.gh);
+          if (r && r !== patch.repo) detaching++;
+        }
+      }
       const tok = (ghForm.token ?? '').trim();
       if (tok) patch.token = tok; // whitespace-only input is IGNORED (SR-A N1: it used to save token:"" and disarm the whole config)
       if (labels.length && labels.join(',') !== (freshStat.labels ?? []).join(',')) patch.labels = labels;
-      if (ghForm.pollMs !== undefined && ghForm.pollMs !== freshStat.pollMs) patch.pollMs = ghForm.pollMs;
+      // v0.6.13 (S9/U2, 33-d P3): the poll field parses HERE, at save time
+      // (the raw string is the editor's truth). Empty = no opinion of its
+      // own — the seeded pollMs diffs as before (the whitespace-token N1
+      // precedent); a NON-EMPTY unparseable value is refused HONESTLY below
+      // (pollInvalid), never silently dropped from the patch.
+      const pollRaw = (ghForm.pollRaw ?? '').trim();
+      const pollMs = pollRaw !== '' ? pollSeconds(pollRaw) : (ghForm.pollMs ?? freshStat.pollMs);
+      const pollInvalid = pollRaw !== '' && pollMs === undefined;
+      if (pollMs !== undefined && pollMs !== freshStat.pollMs) patch.pollMs = pollMs;
       patch.disabled = ghForm.disabled ? true : undefined;
       const tokIgnored = Boolean(ghForm.token) && !tok;
       store.gh.saveSettings(patch);
@@ -585,8 +719,14 @@ function ReviewPanel(): React.ReactElement {
         setError(String(s.lastError));
       } else if (!s.configured && !patch.disabled) {
         setNotice('saved — but NOT publishing yet: repo must be owner/name and a token must be present (check GitHub settings below)');
+      } else if (pollInvalid) {
+        // v0.6.13 (S9/U2, 33-d P3): the rest saved, the poll interval did
+        // NOT — report it, never a blanket "saved" over a dropped field.
+        setNotice('saved — but the poll interval was NOT: enter seconds (a number ≥ 0; 0 disables polling) — it keeps the previous value');
       } else if (tokIgnored) {
         setNotice('saved — token unchanged (whitespace-only input ignored; use "use baked" to drop a saved override)');
+      } else if (detaching > 0) {
+        setNotice(`saved — publishing → ${patch.repo} · ⚠ ${detaching} mirrored thread${detaching === 1 ? '' : 's'} DETACHED (issue${detaching === 1 ? '' : 's'} live on the old repo; frozen, not synced — restore the repo or unlink to re-mirror)`);
       } else {
         setNotice(`saved — publishing${patch.disabled ? ' disabled' : ` → ${patch.repo ?? freshStat.repo ?? '(baked repo)'}`}${labels.length ? ` · labels: ${labels.join(', ')}` : ''}`);
       }
@@ -625,7 +765,18 @@ function ReviewPanel(): React.ReactElement {
 
   const clearGhSettings = async (): Promise<void> => {
     const store = await getGhLinkedStaticStore();
-    store.gh?.clearSettings();
+    try {
+      store.gh?.clearSettings();
+    } catch (e) {
+      // v0.6.13 (S9/U2, 33-d P3): clearSettings' removeItem has NO internal
+      // catch (unlike clearTokenOverride) — quota/privacy-mode stores THROW
+      // on write paths. Without this catch the async fn REJECTED (unhandled
+      // via `void clearGhSettings()`), the form/status/notice never ran, and
+      // the UI kept showing the overrides Reset claimed to clear. Report the
+      // failure; run NOTHING of the success path.
+      setError(`overrides NOT cleared — ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
     setGhForm({});
     setGhStat(await ghClientStatus());
     setNotice('local overrides cleared — baked config (if any) applies again');
@@ -634,7 +785,12 @@ function ReviewPanel(): React.ReactElement {
 
   const ordered = useMemo(
     () => (sortMode === 'recent'
-      ? [...threads].sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
+      ? [...threads].sort((a, b) =>
+          // v0.6.14: updatedAt falls back to createdAt (a thread never touched
+          // since pinning is "as recent as it was born"); both-missing → ''
+          // which already sorts LAST in this DESC comparator (legacy threads
+          // sink, they never masquerade as freshest).
+          String(b.updatedAt ?? b.createdAt ?? '').localeCompare(String(a.updatedAt ?? a.createdAt ?? '')))
       : stableSort(threads)),
     [threads, sortMode],
   );
@@ -644,14 +800,17 @@ function ReviewPanel(): React.ReactElement {
         filter === 'all'
           ? true
           : filter === 'open'
-            ? t.status === 'open'
-            : filter === 'review'
-              ? t.status === 'fixed'
-              : t.status === 'rejected',
+            ? t.status !== 'fixed' && t.status !== 'rejected' && t.status !== 'resolved' // v0.6.15 (55-c P3-4, the H-B-15 UI twin): unknown/legacy counts OPEN — the digest buckets do
+            : filter === 'active'
+              ? t.status !== 'resolved' // v0.6.14 (sweep 53-d P3-7): the unresolved work view — open + to review + rejected, resolved excluded
+              : filter === 'review'
+                ? t.status === 'fixed'
+                : t.status === 'rejected',
       ),
     [ordered, filter],
   );
-  const openCount = ordered.filter((t) => t.status === 'open').length;
+  // v0.6.15 (55-c P3-4): unknown → open (the count twin of the filter above)
+  const openCount = ordered.filter((t) => t.status !== 'fixed' && t.status !== 'rejected' && t.status !== 'resolved').length;
   const fixedCount = ordered.filter((t) => t.status === 'fixed').length;
   const rejectedCount = ordered.filter((t) => t.status === 'rejected').length;
   // v0.6.11 (S7-B): orphan threads (anchor unresolvable in the live DOM) —
@@ -697,6 +856,9 @@ function ReviewPanel(): React.ReactElement {
           <button style={miniBtn(theme.colorSecondary, filter === 'open')} onClick={() => setFilter('open')} title="Show only open (agent work queue)">
             open
           </button>
+          <button style={miniBtn(theme.colorSecondary, filter === 'active')} onClick={() => setFilter('active')} title="Everything unresolved — open + to review + rejected (resolved excluded): the full outstanding-work view">
+            active
+          </button>
           <button style={miniBtn(theme.colorSecondary, filter === 'review')} onClick={() => setFilter('review')} title="Threads the agent marked fixed — awaiting your verification (the check-latest-batch view)">
             to review
           </button>
@@ -705,11 +867,11 @@ function ReviewPanel(): React.ReactElement {
           </button>
         </div>
         <div style={{ display: 'flex', gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: 'hidden' }}>
-          <button style={miniBtn(theme.colorSecondary, sortMode === 'story')} onClick={() => setSortMode('story')} title="Stable order: story title, then thread number — resolving never reorders the list">
+          <button style={miniBtn(theme.colorSecondary, sortMode === 'story')} onClick={() => changeSort('story')} title="Stable order: story title, then thread number — resolving never reorders the list">
             by story
           </button>
-          <button style={miniBtn(theme.colorSecondary, sortMode === 'recent')} onClick={() => setSortMode('recent')} title="Most recently touched first (replies, status flips) — the what-was-addressed-since-my-last-visit view">
-            recent
+          <button style={miniBtn(theme.colorSecondary, sortMode === 'recent')} onClick={() => changeSort('recent')} title="Latest first: most recently touched (replies, status flips, new pins) on top — the default (persisted; the 'by story' switch is remembered too)">
+            latest
           </button>
         </div>
         <span style={{ fontSize: 11, color: theme.textMutedColor }}>
@@ -913,11 +1075,11 @@ function ReviewPanel(): React.ReactElement {
               <span style={{ color: theme.textMutedColor }}>poll (s)</span>
               <input
                 style={{ width: 60, padding: '3px 8px', fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || 'transparent', color: theme.textColor }}
-                value={String(Math.round((ghForm.pollMs ?? 60_000) / 1000))}
-                onChange={(e) => {
-                  const n = Number.parseInt(e.target.value, 10);
-                  setGhForm((f) => ({ ...f, pollMs: Number.isFinite(n) && n >= 0 ? n * 1000 : 60_000 }));
-                }}
+                // v0.6.13 (S9/U2, 33-d P3): the RAW string while edited (no
+                // snap-back to "60" on empty/garbage); the parsed seconds
+                // while untouched. Parse-at-save — see saveGhSettings.
+                value={ghForm.pollRaw ?? String(Math.round((ghForm.pollMs ?? 60_000) / 1000))}
+                onChange={(e) => setGhForm((f) => ({ ...f, pollRaw: e.target.value, pollMs: pollSeconds(e.target.value) ?? f.pollMs }))}
                 title="How often to pull remote replies/state — 0 disables polling (manual sync only)"
               />
             </label>
@@ -972,18 +1134,24 @@ function ReviewPanel(): React.ReactElement {
           {threads.length === 0
             ? scope === 'story'
               ? hotkeysOnMap
-                ? <>No threads for this story. Press <b>{hotkeyLabel(hkMap.pin)}</b> in the canvas and click an element — or <b>{hotkeyLabel(hkMap.region)}</b> to drag a region. Everything saves automatically to the dev-server store.</>
+                ? <>No threads for this story. Press <b>{hotkeyLabel(hkMap.pin, DEFAULT_HOTKEYS.pin)}</b> in the canvas and click an element — or <b>{hotkeyLabel(hkMap.region, DEFAULT_HOTKEYS.region)}</b> to drag a region. Everything saves automatically to the dev-server store.</>
                 : <>No threads for this story. Click an element with the toolbar Pin button — or drag a region with the toolbar Box button. Everything saves automatically to the dev-server store.</>
               : hotkeysOnMap
-                ? <>No threads yet. Press <b>{hotkeyLabel(hkMap.pin)}</b> in the canvas and click an element.</>
+                ? <>No threads yet. Press <b>{hotkeyLabel(hkMap.pin, DEFAULT_HOTKEYS.pin)}</b> in the canvas and click an element.</>
                 : <>No threads yet. Use the toolbar Pin button, then click an element in the canvas.</>
             : filter === 'open'
               ? <>Nothing open — everything is fixed (awaiting review), rejected (awaiting re-work) or resolved. Switch the filter to “to review”, “rejected” or “all”.</>
+              : filter === 'active'
+                ? <>Nothing outstanding — every thread is resolved. New pins and agent replies land back here automatically.</> // v0.6.14 (54-a P4): the active filter's own empty state
               : filter === 'review'
                 ? <>Nothing awaiting review — no agent fixes pending.</>
                 : filter === 'rejected'
                   ? <>Nothing rejected — no fixes awaiting re-work.</>
-                  : <>All threads resolved 🎉.</>}
+                  : /* v0.6.13 (S9/U2, 33-d P3): the “All threads resolved 🎉”
+                     * branch lived here — UNREACHABLE dead code: under
+                     * filter === 'all' the predicate is `true` for every
+                     * status, so shown ≡ threads and shown.length === 0 with
+                     * threads.length > 0 cannot hold. Removed. */ null}
         </div>
       )}
       {shown.map((t) => {
@@ -1030,6 +1198,18 @@ function ReviewPanel(): React.ReactElement {
                   <LinkIcon width={10} height={10} /> {t.gh.issue}
                 </a>
               )}
+              {/* DD-21 (v0.6.15): a mapping whose repo differs from the active
+                  config — frozen (never synced); the chip says WHY the issue
+                  link points at the OLD repo and nothing moves. */}
+              {t.gh && ghStat?.configured && ghStat.repo && ghMappingRepo(t.gh) !== null && ghMappingRepo(t.gh) !== ghStat.repo && (
+                <span
+                  title={`mirror DETACHED — issue #${t.gh.issue} lives on ${ghMappingRepo(t.gh)}, the active repo is ${ghStat.repo}. This thread is frozen (no push, no pull, no close). Restore the repo setting or unlink the thread to re-mirror.`}
+                  style={chip('#7c2d1233', '#fb7185')}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  detached
+                </span>
+              )}
               {t.component?.name && <span style={chip(`${theme.colorSecondary}18`, theme.colorSecondary)}>{t.component.name}</span>}
               {t.transient && (
                 <span
@@ -1053,8 +1233,13 @@ function ReviewPanel(): React.ReactElement {
               )}
               {snapshotIds.has(t.id) && (
                 <button
-                  title="Recall — re-create the exact view at pin time and show this pin alone (read-only; Esc returns to the live view)"
-                  style={{ ...chip('#0c4a6e18', '#0369a1'), border: 'none', font: 'inherit', textDecoration: 'none', display: 'inline-flex', gap: 3, alignItems: 'center', cursor: 'pointer' }}
+                  title={
+                    recallPending
+                      ? 'Recall pending — the new story is still settling (retries until the view mounts, ~2s worst case)'
+                      : 'Recall — re-create the exact view at pin time and show this pin alone (read-only; Esc returns to the live view)'
+                  }
+                  disabled={!!recallPending}
+                  style={{ ...chip('#0c4a6e18', '#0369a1'), border: 'none', font: 'inherit', textDecoration: 'none', display: 'inline-flex', gap: 3, alignItems: 'center', cursor: recallPending ? 'default' : 'pointer', opacity: recallPending ? 0.55 : 1 }}
                   onClick={(e) => {
                     e.stopPropagation();
                     recallThread(t);
@@ -1065,9 +1250,25 @@ function ReviewPanel(): React.ReactElement {
               )}
               {scope === 'all' && t.story.name && <span style={chip('#64748b18', theme.textMutedColor)}>{t.story.name}</span>}
               <span style={{ flex: 1 }} />
-              <span style={{ fontSize: 10, color: theme.textMutedColor }}>{t.createdAt.slice(0, 10)}</span>
+              {/* v0.6.14 (sweep 53-d P2-1): in latest mode the row's date is
+                  the LAST TOUCH (relative — the sort key made visible); the
+                  stable view keeps the pinned-on date. */}
+              <span style={{ fontSize: 10, color: theme.textMutedColor }} title={`pinned ${t.createdAt.slice(0, 10)}`}>
+                {sortMode === 'recent' ? (ago(t.updatedAt ?? t.createdAt) || t.updatedAt?.slice(0, 10) || t.createdAt.slice(0, 10)) : t.createdAt.slice(0, 10)}
+              </span>
             </div>
-            <div style={{ fontSize: 12, marginTop: 3, color: theme.textColor, textDecoration: t.status === 'resolved' ? 'line-through' : 'none' }}>
+            {/* v0.6.14 (sweep 53-d P2-1): in latest mode the row leads with the
+                LAST ACTIVITY (author · time · excerpt) — the thing the sort
+                exists for ("what did the agent just say?") — with the original
+                pin text muted beneath; the stable by-story view keeps the
+                subject-first scan layout. */}
+            {sortMode === 'recent' && lastActivity(t) && (
+              <div style={{ fontSize: 12, marginTop: 3, color: theme.textColor }}>
+                <b>{lastActivity(t)!.author}:</b> {lastActivity(t)!.body.split('\n')[0].slice(0, 120)}
+                <span style={{ fontSize: 10, color: theme.textMutedColor }}> · {ago(lastActivity(t)!.createdAt) || ''}</span>
+              </div>
+            )}
+            <div style={{ fontSize: 12, marginTop: 3, color: sortMode === 'recent' && lastActivity(t) ? theme.textMutedColor : theme.textColor, textDecoration: t.status === 'resolved' ? 'line-through' : 'none' }}>
               {t.comments[0]?.body?.split('\n')[0]?.slice(0, 140) ?? '(no text)'}
             </div>
             {t.component?.source && (
@@ -1240,15 +1441,35 @@ function MiniButton(props: { theme: ReturnType<typeof useTheme>; onClick: () => 
 
 /* ------------------------------------ tool ------------------------------------ */
 
+/** v0.6.13 (S9/DD-17d + 33-d P3-1, folded): the last UiState, cached at
+ *  MODULE level. ReviewPanel unmounts on every addon-tab switch (render:
+ *  active ? <ReviewPanel/> : null), and its useAnnotaHotkeys copy went NULL
+ *  on remount — the orphan line vanished and the empty-state letters fell
+ *  back to the DEFAULTS until the next preview emit, which a quiet canvas
+ *  never sends. Both hook instances now seed from and write through this
+ *  cache. The design's alternative — a manager→preview re-request ping on
+ *  tab select — was rejected after reading the channel code: no ping event
+ *  exists to reuse (FOCUS_THREAD requires a thread id; a UI_STATE_REQUEST
+ *  would be NEW channel surface), while the preview half of the fix is
+ *  ALREADY true (the layer REMOUNTS on every story switch — SB keys the
+ *  story subtree — and its mount-time UI_STATE effect re-emits; verified).
+ *  Staleness is bounded by one story-transition emit — the same one-render
+ *  staleness the UI_STATE pattern already tolerates (index.tsx's own note
+ *  at the freeze button). */
+let lastUiState: UiState | null = null;
+
 /** v0.6.10 (S6-D3e): the ACTIVE hotkey map + flags from UI_STATE — the
  *  manager's strings render the REAL config (per-story customizations flow
  *  through), falling back to the defaults before the first state lands. */
 function useAnnotaHotkeys(): { hk: Hotkeys; hotkeysOn: boolean; frozenViewEnabled: boolean; ui: UiState | null } {
-  const [ui, setUi] = useState<UiState | null>(null);
+  const [ui, setUi] = useState<UiState | null>(lastUiState);
   useEffect(() => {
     const ch = addons.getChannel();
     const onState = (s: UiState | undefined) => {
-      if (s && typeof s === 'object') setUi(s);
+      if (s && typeof s === 'object') {
+        lastUiState = s;
+        setUi(s);
+      }
     };
     ch.on(UI_STATE, onState);
     return () => {
@@ -1352,23 +1573,38 @@ function AnnotaKitTool(): React.ReactElement {
   const rejected = ui?.rejected ?? 0;
   const total = ui?.total ?? 0;
   // v0.6.11 (S7-B): active = our panel selected AND shown AND story view.
-  // Live visibility derives from panel HEIGHTS (SB's togglePanel writes
-  // bottomPanelHeight/rightPanelWidth; layout.showPanel is startup-only and
-  // never flips — verified against SB 10.6). Degrade to unlit if the fields
-  // are absent (older SB) — an honest fallback.
-  const layout = (sbState as { layout?: { bottomPanelHeight?: number; rightPanelWidth?: number } }).layout;
+  // v0.6.13 (S9/DD-14, 34-b 14a/14b): the "shown" term is the runtime's
+  // getIsPanelShown ?? the PURE position-scoped layout rule (shared/
+  // panelToggle.ts — the exact rule 9.1.16 and 10.6 both implement; verified
+  // byte-identical against the shipped 9.1.16 manager-api). Never ?? false:
+  // on a runtime without the method the degrade cell must stay CORRECT, not
+  // silently dark. The other two terms are unchanged (14b): the finding was
+  // only ever about "shown". useStorybookState remains the re-render trigger.
+  // v0.6.14 (usability row 8, browser-proven by 53-a2): SB 10.6.0 commits the
+  // drag's layout state at RELEASE, not during pointermove (the DD-14
+  // premise held on 9.1.16) — the light lands at drag END on 10.6.0, both
+  // directions, and the RESTING states are exact. Accepted as the runtime's
+  // behavior: a mid-drag light would need DOM scraping of SB's panes (the
+  // exact fragility the pure rule exists to avoid — still-correct beats
+  // early-but-fragile). The mobile <600px documented case (AGENTS.md — the
+  // panel hides behind SB's native "Open addon panel" control) is NOT
+  // layout state; it stays documented.
+  const layout = (sbState as { layout?: PanelLayoutState }).layout;
   const panelShown =
     sbState.selectedPanel === PANEL_ID &&
-    ((layout?.bottomPanelHeight ?? 0) > 0 || (layout?.rightPanelWidth ?? 0) > 0) &&
+    panelShownNow(storybookApi, layout) &&
     sbState.viewMode === 'story';
   // v0.6.10 (audit C-P1-1/C-P2-2): every letter renders from the ACTIVE map,
   // and NO letter renders while hotkeys === false (the keys are dead then —
   // advertising them is the lie the truth-rendering exists to prevent).
-  const kPin = hotkeysOn ? ` (${hotkeyLabel(hk.pin)})` : '';
-  const kRegion = hotkeysOn ? ` (${hotkeyLabel(hk.region)})` : '';
-  const kLayer = hotkeysOn ? ` (${hotkeyLabel(hk.layer)})` : '';
-  const kDrawer = hotkeysOn ? ` (${hotkeyLabel(hk.drawer)})` : '';
-  const kFreeze = hotkeysOn ? hotkeyLabel(hk.freeze) : '';
+  // v0.6.13 (audit 44-c P3-2): the labels carry the DEFAULT as fallback — a
+  // degenerate spec ('alt+', whitespace-only) binds the default chord (see
+  // parseHotkey) and the label must show the REAL chord, never a bare '⌥'.
+  const kPin = hotkeysOn ? ` (${hotkeyLabel(hk.pin, DEFAULT_HOTKEYS.pin)})` : '';
+  const kRegion = hotkeysOn ? ` (${hotkeyLabel(hk.region, DEFAULT_HOTKEYS.region)})` : '';
+  const kLayer = hotkeysOn ? ` (${hotkeyLabel(hk.layer, DEFAULT_HOTKEYS.layer)})` : '';
+  const kDrawer = hotkeysOn ? ` (${hotkeyLabel(hk.drawer, DEFAULT_HOTKEYS.drawer)})` : '';
+  const kFreeze = hotkeysOn ? hotkeyLabel(hk.freeze, DEFAULT_HOTKEYS.freeze) : '';
   return (
     <div key="annotakit-tool" style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
       {btn(`Pin a comment to an element${kPin}`, <PinIcon width={14} height={14} />, ui?.mode === 'pin', () => emit('pin'))}

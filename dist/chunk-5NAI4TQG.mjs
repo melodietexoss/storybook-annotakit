@@ -75,6 +75,9 @@ function deepestGreyedAt(x, y, scopeEl, stack, deps = {}) {
   }
   return best;
 }
+function isPinnableTarget(target, scopeEl) {
+  return !!target && target !== scopeEl && scopeEl.contains(target);
+}
 function hitTest(x, y, scopeEl, gate, deps = {}) {
   const efp = deps.elementsFromPoint ?? ((px, py) => document.elementsFromPoint(px, py));
   const stack = efp(x, y).filter((el) => !inOverlay(el));
@@ -88,5 +91,6 @@ export {
   inOverlay,
   GreyedGate,
   deepestGreyedAt,
+  isPinnableTarget,
   hitTest
 };

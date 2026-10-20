@@ -3,10 +3,11 @@ import {
   MIRROR_VERBATIM_MARKER,
   elementSummary,
   getStaticStore,
+  metaLine,
   mirrorStateOf,
   renderThreadBlock,
   staticScope
-} from "./chunk-MHG5WIGU.mjs";
+} from "./chunk-DEMUCS72.mjs";
 
 // src/shared/legacyMirror.ts
 function fmtDate(iso) {
@@ -248,15 +249,15 @@ async function ghJsonPaged(cfg, pathname, maxPages = 10) {
     } else {
       try {
         url = new URL(next[1]).origin === new URL(cfg.apiBase).origin ? next[1] : null;
-        if (!url) truncated = false;
+        if (!url) truncated = true;
       } catch {
         url = null;
-        truncated = false;
+        truncated = true;
       }
     }
   }
-  if (truncated && url) {
-    pullWarning = `GitHub pagination cap hit (${maxPages} pages) on ${pathname} \u2014 results truncated`;
+  if (truncated) {
+    pullWarning = truncated && url ? `GitHub pagination cap hit (${maxPages} pages) on ${pathname} \u2014 results truncated` : `GitHub pagination stopped early on ${pathname} (cross-origin/malformed next link) \u2014 results truncated`;
   }
   return out;
 }
@@ -384,26 +385,34 @@ function resolveGhConfig(baked, override) {
   }
   const token = (merged.token ?? "").trim();
   const repo = (merged.repo ?? "").trim();
-  if (!token || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return null;
+  if (!token || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return null;
   const labels = (merged.labels ?? []).map((l) => String(l).trim()).filter(Boolean);
   const pollMs = typeof merged.pollMs === "number" && Number.isFinite(merged.pollMs) && merged.pollMs >= 0 ? Math.floor(merged.pollMs) : DEFAULT_POLL_MS;
   const apiBase = (merged.apiBase ?? "").trim().replace(/\/+$/, "") || DEFAULT_API;
+  if (!/^https?:\/\/[^/\s]+(\/[^\s]*)?$/i.test(apiBase)) {
+    throw new Error(`apiBase must be an http(s) origin like https://github.example.com/api/v3 (got ${JSON.stringify(merged.apiBase)})`);
+  }
   return { token, repo, labels: labels.length ? labels : [DEFAULT_LABEL], apiBase, pollMs };
 }
 async function probeGhConfig() {
   const baked = await probeBakedGhConfig();
-  return resolveGhConfig(baked, readOverride());
+  try {
+    return resolveGhConfig(baked, readOverride());
+  } catch (err) {
+    if (state) state.lastError = `client GH config refused: ${err instanceof Error ? err.message : String(err)} (fix or clear the saved GitHub settings)`;
+    return null;
+  }
 }
 function mirrorIssueTitle(t) {
-  const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
-  const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
+  const storyLabel = metaLine(t.story?.name ?? t.story?.title ?? t.storyId, 120);
+  const headline = metaLine(t.comments[0]?.body ?? "", 100);
   return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 160);
 }
 function mirrorIssueBody(t, cfg) {
   const origin = staticScope();
   const storyUrl = t.story?.url ?? `${origin}?path=/story/${t.storyId}`;
   const out = [];
-  out.push(`# UI review \u2014 ${t.story?.title ?? t.storyId}`);
+  out.push(`# UI review \u2014 ${metaLine(t.story?.title ?? t.storyId)}`);
   out.push("");
   out.push(`storybook (static deployment): ${origin}`);
   out.push(`mirror: ${cfg.repo} \xB7 labels: ${cfg.labels.join(", ")} \xB7 client-side publish`);
@@ -427,8 +436,8 @@ function mirrorIssueBody(t, cfg) {
   return body;
 }
 function mirrorBody(c) {
-  return `**${c.author}:** ${c.body}
-<!-- annotakit:c_${c.id} -->`;
+  return `**${metaLine(c.author, 60)}:** ${c.body}
+<!-- annotakit:c_${metaLine(c.id)} -->`;
 }
 function parseSentinel(body) {
   const m = body.match(SENTINEL_RE);
@@ -486,10 +495,10 @@ function enqueue(kind, ref, opts) {
   const key = kind === "sync" ? `sync:${ref}` : `close:${ref}`;
   const existing = ops.find((o) => opKeyOf(o) === key);
   const unpark = Boolean(existing?.parked) && !opts?.fromSweep;
-  const op = existing ? { ...existing, enqueuedAt: (/* @__PURE__ */ new Date()).toISOString(), notBefore: 0, lastError: void 0, ...unpark ? { parked: false, attempts: 0 } : {} } : {
+  const op = existing ? { ...existing, enqueuedAt: (/* @__PURE__ */ new Date()).toISOString(), notBefore: 0, lastError: void 0, ...unpark ? { parked: false, attempts: 0, parkReason: void 0 } : {}, ...opts?.repo ? { repo: opts.repo } : {}, ...opts?.threadId && kind === "close" ? { threadId: opts.threadId } : {} } : {
     id: `op_${Math.random().toString(36).slice(2, 10)}`,
     kind,
-    ...kind === "sync" ? { threadId: String(ref) } : { issue: Number(ref) },
+    ...kind === "sync" ? { threadId: String(ref) } : { issue: Number(ref), ...opts?.repo ? { repo: opts.repo } : {}, ...opts?.threadId ? { threadId: opts.threadId } : {} },
     enqueuedAt: (/* @__PURE__ */ new Date()).toISOString()
   };
   const next = existing ? ops.map((o) => opKeyOf(o) === key ? op : o) : [...ops, op];
@@ -605,6 +614,57 @@ function freshThread(base, id) {
   base.reloadFromPersisted();
   return base.list().find((t) => t.id === id);
 }
+function ghMappingRepo(ref) {
+  if (!ref) return null;
+  if (typeof ref.repo === "string" && ref.repo) return ref.repo;
+  if (typeof ref.url === "string" && ref.url) {
+    try {
+      const segs = new URL(ref.url).pathname.split("/").filter(Boolean);
+      const owner = segs[segs.length - 4];
+      const name = segs[segs.length - 3];
+      if (segs[segs.length - 2] === "issues" && /^[A-Za-z0-9_.-]+$/.test(owner ?? "") && /^[A-Za-z0-9_.-]+$/.test(name ?? "")) {
+        return `${owner}/${name}`;
+      }
+    } catch {
+    }
+  }
+  return null;
+}
+function isDetachedMapping(ref, cfgRepo) {
+  const r = ghMappingRepo(ref);
+  return r !== null && r !== cfgRepo;
+}
+var verifiedForeign = /* @__PURE__ */ new Set();
+async function verifyAndStampMapping(base, cfg, t) {
+  if (!t.gh) return false;
+  if (verifiedForeign.has(t.id)) return false;
+  let body = null;
+  try {
+    const issue = await getIssueRemote(cfg, t.gh.issue);
+    body = typeof issue.body === "string" ? issue.body : null;
+  } catch {
+    body = null;
+  }
+  const m = body !== null ? body.match(/^- thread id: (.+)$/m) : null;
+  if (m?.[1]?.trim() === t.id) {
+    const fresh = freshThread(base, t.id);
+    if (fresh?.gh && fresh.gh.issue === t.gh.issue) {
+      await base.patch({ ...fresh, gh: { ...fresh.gh, repo: cfg.repo } });
+    }
+    return true;
+  }
+  verifiedForeign.add(t.id);
+  return false;
+}
+function parkOpDetached(opId, why) {
+  const ops = readQueue();
+  writeQueue(ops.map((o) => o.id === opId ? { ...o, parked: true, parkReason: "detached", notBefore: 0, lastError: why } : o));
+}
+function unparkDetachedOps() {
+  const ops = readQueue();
+  if (!ops.some((o) => o.parked && o.parkReason === "detached")) return;
+  writeQueue(ops.map((o) => o.parked && o.parkReason === "detached" ? { ...o, parked: false, parkReason: void 0, attempts: 0, lastError: void 0 } : o));
+}
 function threadPending(id) {
   return readQueue().some((o) => o.kind === "sync" && o.threadId === id && !o.parked);
 }
@@ -626,26 +686,50 @@ function lostLeaseError() {
 }
 async function processSyncOp(base, cfg, op) {
   const t = freshThread(base, String(op.threadId));
-  if (!t) return;
+  if (!t) return "done";
+  if (t.gh) {
+    const mapRepo = ghMappingRepo(t.gh);
+    if (mapRepo === null) {
+      const verified = await verifyAndStampMapping(base, cfg, t);
+      if (!verified) {
+        parkOpDetached(op.id, `issue #${t.gh.issue} does not belong to this thread on ${cfg.repo} (unstamped mapping, verify mismatch) \u2014 op parked (mirror DETACHED); restore the repo setting or unlink the thread`);
+        return "parked";
+      }
+    } else if (mapRepo !== cfg.repo) {
+      parkOpDetached(op.id, `issue #${t.gh.issue} lives on ${mapRepo}; the mirror now targets ${cfg.repo} \u2014 op parked (mirror DETACHED); restore the repo setting or unlink the thread to re-mirror`);
+      return "parked";
+    }
+  }
   if (!t.gh) {
     try {
       const listed = await listLabeledIssuesRemote(cfg);
-      const mapped = new Set(base.list().filter((x) => x.gh).map((x) => x.gh?.issue));
+      const mapped = new Set(
+        base.list().filter((x) => x.gh && !isDetachedMapping(x.gh, cfg.repo)).map((x) => x.gh?.issue)
+      );
       const orphan = listed.find((i) => {
         if (mapped.has(i.number) || typeof i.body !== "string" || !i.body) return false;
         const m = i.body.match(/^- thread id: (.+)$/m);
         return m?.[1]?.trim() === t.id;
       });
       if (orphan) {
+        const importResolved = String(orphan.state) === "closed" && t.status !== "resolved";
         const stampedOrphan = {
           ...t,
+          ...importResolved ? {
+            status: "resolved",
+            resolvedAt: orphan.closed_at ?? (/* @__PURE__ */ new Date()).toISOString()
+          } : {},
           // v0.6.6 (F12): server-clock high-water mark — a local-clock stamp
           // re-opened the clock-skew permanent-miss window at every seam
-          gh: { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: orphan.updated_at ?? (/* @__PURE__ */ new Date()).toISOString() }
+          gh: { issue: orphan.number, url: orphan.html_url, repo: cfg.repo, state: orphan.state, syncedAt: orphan.updated_at ?? (/* @__PURE__ */ new Date()).toISOString() }
         };
+        if (importResolved) {
+          appendSystemComment(stampedOrphan, `gh-close-${orphan.number}`, orphan.closed_by?.login ?? "github", "closed on GitHub");
+        }
+        if (importResolved) delete stampedOrphan.reopenedAt;
         await base.patch(stampedOrphan);
         if (state) state.lastPushAt = (/* @__PURE__ */ new Date()).toISOString();
-        return;
+        return "done";
       }
     } catch {
     }
@@ -656,11 +740,11 @@ async function processSyncOp(base, cfg, op) {
       await addIssueCommentRemote(cfg, created.number, `${GH_SENTINEL}
 thread deleted in Storybook (static) \u2014 closing.`);
       await setIssueStateRemote(cfg, created.number, "closed");
-      return;
+      return "done";
     }
     const stamped = {
       ...cur,
-      gh: { issue: created.number, url: created.html_url, state: "open", syncedAt: created.updated_at ?? (/* @__PURE__ */ new Date()).toISOString() },
+      gh: { issue: created.number, url: created.html_url, repo: cfg.repo, state: "open", syncedAt: created.updated_at ?? (/* @__PURE__ */ new Date()).toISOString() },
       comments: cur.comments.map((c) => c.ghId || c.source === "github" ? c : { ...c, ghId: "issue-body" })
     };
     await base.patch(stamped);
@@ -671,17 +755,42 @@ thread deleted in Storybook (static) \u2014 closing.`);
       if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, state: "closed" } });
     }
     state && (state.lastPushAt = (/* @__PURE__ */ new Date()).toISOString());
-    return;
+    return "done";
   }
   let pushed = 0;
   let remoteStamp;
-  for (const c of t.comments) {
+  {
+    const unstamped = t.comments.filter((c) => !c.ghId && c.source !== "github");
+    if (unstamped.length > 0) {
+      try {
+        const remoteComments = await listIssueCommentsRemote(cfg, t.gh.issue, t.gh.syncedAt);
+        for (const rc of remoteComments) {
+          const localId = parseSentinel(String(rc.body ?? ""));
+          if (!localId) continue;
+          const hit = unstamped.some((c) => c.id === localId);
+          if (!hit) continue;
+          const cur = freshThread(base, t.id);
+          if (!cur || !cur.gh) return "done";
+          const idx = cur.comments.findIndex((x) => x.id === localId && !x.ghId);
+          if (idx >= 0) {
+            const comments = [...cur.comments];
+            comments[idx] = { ...comments[idx], ghId: String(rc.id) };
+            await base.patch({ ...cur, gh: cur.gh, comments });
+          }
+        }
+      } catch {
+      }
+    }
+  }
+  const tF = freshThread(base, t.id);
+  if (!tF || !tF.gh) return "done";
+  for (const c of tF.comments) {
     if (c.ghId || c.source === "github") continue;
     if (!stillLeading()) throw lostLeaseError();
     const gh = await addIssueCommentRemote(cfg, t.gh.issue, mirrorBody(c));
     remoteStamp = gh.updated_at ?? gh.created_at ?? remoteStamp;
     const cur = freshThread(base, t.id);
-    if (!cur) return;
+    if (!cur) return "done";
     const idx = cur.comments.findIndex((x) => x.id === c.id);
     const curGh2 = cur.gh;
     if (idx >= 0 && curGh2 && !cur.comments[idx].ghId) {
@@ -691,11 +800,11 @@ thread deleted in Storybook (static) \u2014 closing.`);
     }
     pushed++;
   }
-  const curGh = t.gh;
-  const want = mirrorStateOf(t.status);
+  const curGh = tF.gh;
+  const want = mirrorStateOf(tF.status);
   if (curGh.state !== want) {
     if (!stillLeading()) throw lostLeaseError();
-    await addIssueCommentRemote(cfg, curGh.issue, want === "closed" ? resolutionNotice(t) : reopenNotice(t));
+    await addIssueCommentRemote(cfg, curGh.issue, want === "closed" ? resolutionNotice(tF) : reopenNotice(tF));
     const flipped = await setIssueStateRemote(cfg, curGh.issue, want);
     remoteStamp = flipped.updated_at ?? remoteStamp;
     const fresh = freshThread(base, t.id);
@@ -706,13 +815,33 @@ thread deleted in Storybook (static) \u2014 closing.`);
     if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, syncedAt: remoteStamp ?? (/* @__PURE__ */ new Date()).toISOString() } });
   }
   if (pushed > 0 && state) state.lastPushAt = (/* @__PURE__ */ new Date()).toISOString();
+  return "done";
 }
 async function processCloseOp(cfg, op) {
-  if (!op.issue) return;
+  if (!op.issue) return "done";
+  if (op.repo && op.repo !== cfg.repo) {
+    parkOpDetached(op.id, `close of issue #${op.issue} parked \u2014 it lives on ${op.repo}, the mirror now targets ${cfg.repo} (restoring the repo setting will land this close on the original issue)`);
+    return "parked";
+  }
+  if (!op.repo && op.threadId) {
+    let bodyMatch = false;
+    try {
+      const issue = await getIssueRemote(cfg, op.issue);
+      const m = typeof issue.body === "string" ? issue.body.match(/^- thread id: (.+)$/m) : null;
+      bodyMatch = m?.[1]?.trim() === op.threadId;
+    } catch {
+      bodyMatch = false;
+    }
+    if (!bodyMatch) {
+      parkOpDetached(op.id, `close of issue #${op.issue} parked \u2014 its body does not carry this thread's id stamp on ${cfg.repo} (legacy unstamped mapping; refusing to close a possible foreign issue)`);
+      return "parked";
+    }
+  }
   if (!stillLeading()) throw lostLeaseError();
   await addIssueCommentRemote(cfg, op.issue, `${GH_SENTINEL}
 thread deleted in Storybook (static) \u2014 closing.`);
   await setIssueStateRemote(cfg, op.issue, "closed");
+  return "done";
 }
 async function flushOnce(base) {
   if (!state) return;
@@ -733,9 +862,9 @@ async function flushOnce(base) {
       ranWork = true;
       const op = ops[0];
       try {
-        if (op.kind === "sync") await processSyncOp(base, cfg, op);
-        else await processCloseOp(cfg, op);
-        removeOp(op.id);
+        const res = op.kind === "sync" ? await processSyncOp(base, cfg, op) : await processCloseOp(cfg, op);
+        if (res !== "parked") removeOp(op.id);
+        else continue;
         if (state) state.lastError = pullWarning ?? void 0;
       } catch (err) {
         if (op.kind === "sync" && err?.status === 404) {
@@ -757,6 +886,21 @@ async function flushOnce(base) {
               enqueue("sync", String(op.threadId));
               continue;
             }
+          }
+        }
+        if (op.kind === "close" && op.issue !== void 0 && err?.status === 404) {
+          let closeGone = false;
+          try {
+            await getIssueRemote(cfg, op.issue);
+          } catch (e2) {
+            closeGone = e2?.status === 404;
+          }
+          if (closeGone) {
+            removeOp(op.id);
+            const note = `close skipped \u2014 issue #${op.issue} already deleted on GitHub`;
+            if (state) state.lastError = note;
+            console.warn(`[storybook-annotakit] gh client (static): ${note}`);
+            continue;
           }
         }
         if (err?.status === 401) {
@@ -808,6 +952,10 @@ function systemComment(ghId, author, body) {
     source: "github"
   };
 }
+function appendSystemComment(t, ghId, author, body) {
+  if (t.comments.some((c) => c.ghId === ghId)) return;
+  t.comments = [...t.comments, systemComment(ghId, author, body)];
+}
 async function pullOnce(base) {
   if (!state) return { pulled: 0, healed: 0 };
   const cfg = await probeGhConfig();
@@ -817,10 +965,21 @@ async function pullOnce(base) {
   let pulled = 0;
   let healed = 0;
   const remote = new Map((await listLabeledIssuesRemote(cfg)).map((i) => [i.number, i]));
+  let detachedSeen = 0;
   for (const t of base.list()) {
     if (!t.gh) continue;
     if (threadPending(t.id)) continue;
     const mir = t.gh;
+    if (ghMappingRepo(mir) === null) {
+      const verified = await verifyAndStampMapping(base, cfg, t);
+      if (!verified) {
+        detachedSeen++;
+        continue;
+      }
+    } else if (isDetachedMapping(mir, cfg.repo)) {
+      detachedSeen++;
+      continue;
+    }
     let issue = remote.get(mir.issue);
     if (!issue) {
       try {
@@ -869,7 +1028,7 @@ async function pullOnce(base) {
           malformed++;
           continue;
         }
-        if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
+        if (!known.has(String(c.id)) && !String(c.body ?? "").trimStart().startsWith(GH_SENTINEL)) fresh.push(c);
       }
       if (malformed > 0) {
         pullWarning = `pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at)`;
@@ -884,12 +1043,12 @@ async function pullOnce(base) {
       if (statusChange === "resolved" && next.status !== "resolved") {
         next.status = "resolved";
         next.resolvedAt = issue.closed_at ?? pullStartedAt;
-        next.comments = [...next.comments, systemComment(`gh-close-${mir.issue}`, issue.closed_by?.login ?? "github", "closed on GitHub")];
+        appendSystemComment(next, `gh-close-${mir.issue}`, issue.closed_by?.login ?? "github", "closed on GitHub");
       } else if (statusChange === "reopen" && next.status === "resolved") {
         next.status = "open";
         delete next.resolvedAt;
         next.reopenedAt = pullStartedAt;
-        next.comments = [...next.comments, systemComment(`gh-reopen-${mir.issue}`, "github", "reopened on GitHub")];
+        appendSystemComment(next, `gh-reopen-${mir.issue}`, "github", "reopened on GitHub");
       }
       if (next.status === "resolved") delete next.reopenedAt;
       const knownNow = new Set(next.comments.map((c) => c.ghId).filter((x) => Boolean(x)));
@@ -1024,10 +1183,12 @@ function startRuntime(base) {
   void flushOnce(base);
 }
 var LINKED = /* @__PURE__ */ Symbol("annotakit-gh-linked");
-function buildStatus() {
+function buildStatus(base) {
   const override = readOverride();
   const resolved = resolveGhConfig(resolvedBaked, override);
   const ops = readQueue();
+  const detached = base && resolved ? base.list().filter((t) => t.gh && (verifiedForeign.has(t.id) || isDetachedMapping(t.gh, resolved.repo))).length : 0;
+  const detachedParked = ops.filter((o) => Boolean(o.parked) && o.parkReason === "detached").length;
   const suppressed = Boolean(override?.disabled);
   const tokenOverridden = typeof override?.token === "string" && override.token.trim().length > 0;
   return {
@@ -1053,7 +1214,8 @@ function buildStatus() {
     // the durable trace. Stale after a later fresh save by design (harmless:
     // the panel hint gates on !tokenOverridden).
     tokenDroppedAt: override?.tokenDroppedAt ?? null,
-    pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS
+    pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS,
+    ...detached > 0 || detachedParked > 0 ? { detached, detachedParked } : {}
   };
 }
 async function ghClientStatus() {
@@ -1088,12 +1250,13 @@ async function getGhLinkedStaticStore() {
   linked.deleteThread = (threadId) => {
     const victim = base.list().find((t) => t.id === threadId);
     const issue = victim?.gh?.issue;
+    const opRepo = victim?.gh ? ghMappingRepo(victim.gh) : null;
     return base.deleteThread(threadId).then(() => {
-      if (issue) enqueue("close", issue);
+      if (issue) enqueue("close", issue, { repo: opRepo, threadId });
     });
   };
   linked.gh = {
-    status: buildStatus,
+    status: () => buildStatus(base),
     saveSettings(patch) {
       const ok = writeOverride(patch);
       if (!ok && state) {
@@ -1102,6 +1265,8 @@ async function getGhLinkedStaticStore() {
       }
       clearOpBackoff();
       if (state) state.pullBackoffUntil = 0;
+      unparkDetachedOps();
+      verifiedForeign.clear();
       if (state?.leader) void flushOnce(base);
     },
     clearSettings() {
@@ -1188,6 +1353,7 @@ export {
   probeGhConfig,
   mirrorIssueTitle,
   mirrorIssueBody,
+  ghMappingRepo,
   ghClientStatus,
   getGhLinkedStaticStore,
   __ghResetForTests

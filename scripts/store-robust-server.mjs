@@ -19,7 +19,10 @@ if (!configDir) {
 
 // NOTE: insteadOf (set by the suite) rewrites `git remote get-url`, breaking
 // github detection — pin the repo explicitly (production has real remotes).
-process.env.ANNOTAKIT_GH_REPO = 'testowner/testrepo';
+// Arg 2 'noenv' DELETES the pin: the v0.6.15 configrepo case must observe
+// the CONFIG-door precedence with no env repo present.
+if (process.argv[3] === 'noenv') delete process.env.ANNOTAKIT_GH_REPO;
+else process.env.ANNOTAKIT_GH_REPO = 'testowner/testrepo';
 process.env.ANNOTAKIT_GH_AUTO = '0'; // store sync only — mirror engine off
 
 const DIST = new URL('../dist/server.cjs', import.meta.url).pathname;

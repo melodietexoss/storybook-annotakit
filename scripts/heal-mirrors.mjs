@@ -75,7 +75,11 @@ const originBare = origin.replace(/\/+$/, '');
 const apply = has('apply');
 const token = arg('token') ?? process.env.ANNOTAKIT_GH_TOKEN;
 
-if (!repo || !/^[^/\s]+\/[^/\s]+$/.test(repo)) {
+// v0.6.13 (audit 44-d P2-1): GitHub's real owner/name charset — the same
+// gate at every door (env.ts ghRepoEnv, the bake's normalizeGhRepoInput,
+// ghClient's runtime gate). The old lax class `/^[^/\s]+\/[^/\s]+$/` accepted
+// `github:octocat` as the "owner" and armed a dead heal (every call 404s).
+if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
   console.error('usage: node scripts/heal-mirrors.mjs --repo owner/name [--db threads.db] [--seed annotakit-threads.json] [--labels a,b] [--origin url] [--token ghp_...] [--apply]');
   process.exit(1);
 }

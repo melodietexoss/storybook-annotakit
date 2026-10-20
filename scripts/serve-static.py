@@ -6,6 +6,13 @@ a reverse proxy / preview gateway forwards the public URL there. Static
 files carry no Host validation, so the 403 "Invalid host" allowlist dance
 from dev mode does NOT apply — any HTTP file server works.
 
+v0.6.13 (s9 DD / 33-g P2-3 + P3-2): bind failures are LOUD and FATAL in the
+PARENT. The port-in-use / bad-port / no-permission cases used to exit 0 with
+the error buried in the daemon log, while a PRE-EXISTING listener kept
+serving — the operator tested the STALE build believing it was fresh. The
+socket is now bound BEFORE the double-fork, so the fd survives into the
+grandchild and any bind error reaches the caller's stderr with exit 1.
+
 Usage: python3 scripts/serve-static.py <dir> [port]   (port default 3000)
 Kill:  kill <pid> (no async flush to await — plain http.server, exits fast).
 """
@@ -34,6 +41,34 @@ LOG_CANDIDATES = [
     os.path.join(os.path.expanduser('~'), f'.annotakit-static-{PORT}.log'),
     os.path.join('/tmp', f'annotakit-static-{PORT}.log'),
 ]
+
+# v0.6.13 (s9 / 33-g P2-3 + P3-2): validate the port BEFORE daemonize — a
+# non-numeric port used to kill the grandchild on int(PORT) with the parent
+# already gone (silent exit-0 death class).
+try:
+    PORT_N = int(PORT)
+except ValueError:
+    print(f'serve-static: FATAL: port {PORT!r} is not an integer', file=sys.stderr)
+    raise SystemExit(1)
+
+# v0.6.13 (s9 / 33-g P2-3): import + BIND in the PARENT, BEFORE any fork.
+# A bind failure here (port already in use / privileged port / out of range)
+# reaches the caller's stderr and exits 1 — instead of exit 0 while the
+# grandchild dies in the side log and a pre-existing listener keeps serving
+# STALE content. The bound+listening fd survives the double-fork, so the
+# grandchild serves the FRESH build or nothing at all.
+import http.server  # noqa: E402  (pre-daemonize BY DESIGN: bind errors must reach the caller, not the log)
+
+try:
+    srv = http.server.ThreadingHTTPServer(
+        ('', PORT_N),
+        lambda *a, **kw: http.server.SimpleHTTPRequestHandler(*a, directory=os.path.abspath(SERVE_DIR), **kw),
+    )
+except (OSError, OverflowError) as e:
+    print(f'serve-static: FATAL: cannot bind port {PORT_N}: {e}\n'
+          f'  (port already in use? `ss -ltnp | grep :{PORT_N}` — refusing to exit 0 while another listener serves STALE content)',
+          file=sys.stderr)
+    raise SystemExit(1)
 
 
 def daemonize():
@@ -64,8 +99,4 @@ daemonize()
 # dir deletes the process cwd (os.getcwd() then raises FileNotFoundError and
 # every request handler dies — observed live in v0.5.3 E2E). Passing
 # `directory=` keeps the server alive across rebuilds.
-import http.server  # noqa: E402  (import AFTER daemonize: stderr → log file)
-
-# SimpleHTTPRequestHandler serves index.html for directory requests.
-with http.server.ThreadingHTTPServer(('', int(PORT)), lambda *a, **kw: http.server.SimpleHTTPRequestHandler(*a, directory=os.path.abspath(SERVE_DIR), **kw)) as srv:
-    srv.serve_forever()
+srv.serve_forever()

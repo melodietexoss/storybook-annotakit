@@ -33,7 +33,7 @@
  */
 
 import http from 'node:http';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -41,6 +41,7 @@ import path from 'node:path';
 
 const DIST = new URL('../dist/server.cjs', import.meta.url).pathname;
 const serverExports = createRequire(import.meta.url)(DIST); // renderDigest + v0.6.5 legacy heal builders
+const require2 = createRequire(import.meta.url); // CJS require for probes (44-b fixtures)
 const GH_PORT = 48171;
 const API_PORT = 48172;
 
@@ -148,6 +149,7 @@ function ghHandler(req, res) {
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
+      if (maybeFail()) return; // DD-12 harness: a 429/401 on the comment PUSH (rate-limit windows)
       const id = gh.nextCommentId++;
       const n = Number(cm[1]);
       (gh.comments[n] = gh.comments[n] ?? []).push({ id, body: JSON.parse(body || '{}').body ?? '', user: { login: 'mirror-bot' }, created_at: new Date().toISOString(), html_url: `${issueUrl(n)}#issuecomment-${id}` });
@@ -296,6 +298,15 @@ async function main() {
   check('mirrored comment carries the per-comment sentinel', Boolean(mirrored && /^<!--\s*annotakit:c_\S+\s*-->$/.exec(mirrored.body.split('\n').slice(1).join('\n').trim())), mirrored?.body);
   const t1b = (await j('GET', '/annotakit/api/threads')).body.threads[0];
   check('local reply got ghId (echo dedupe)', t1b.comments[1]?.ghId === String(gh.comments[1].find((c) => c.body.includes('still broken'))?.id));
+  // v0.6.13 (audit 44-b P3-6): the hostile-author mirror line — the server's
+  // mirrorBody metaLines the author (Batch C's P3-5 fold) and the client twin
+  // now matches; pin the SERVER shape here (every earlier sentinel assertion
+  // used well-formed bodies). The sentinel must still round-trip.
+  const hostileReply = await j('POST', `/annotakit/api/threads/${t1.id}/comments`, { author: '**- evil\nagent', body: 'hostile author probe' });
+  check('POST hostile-author comment → 201', hostileReply.status === 201);
+  await waitFor(() => (gh.comments[1] ?? []).some((c) => c.body.includes('hostile author probe')), 5000, 'hostile mirror comment');
+  const hostileMirror = (gh.comments[1] ?? []).find((c) => c.body.includes('hostile author probe'));
+  check('44-b P3-6: hostile author metaLine\'d (single line, markers gone) + sentinel round-trips', Boolean(hostileMirror && hostileMirror.body.startsWith('**evil agent:** hostile author probe') && /<!--\s*annotakit:c_\S+\s*-->/.test(hostileMirror.body)), hostileMirror?.body);
 
   console.log('== 4. resolve → issue CLOSED; reopen → issue OPEN ==');
   const resolved = { ...t1b, status: 'resolved' };
@@ -529,7 +540,9 @@ async function main() {
   const oldTitle = serverExports.legacyMirrorTitle(healThread);
   check('setup: legacy builder produced a stamped, marker-free body', oldBody.includes(`- thread id: ${healThread.id}`) && !oldBody.includes('(verbatim):**') && oldTitle.length <= 100, oldTitle);
   const headline = (s) => s.replace(/\s+/g, ' ').trim();
-  const wantTitle = `[review] Case 21 — #${healThread.number} ${headline(longBody).slice(0, 100)}`.slice(0, 160);
+  // DD-10 (S9): the engine's title builder is metaLine now — a clipped
+  // headline gets the honest `…` (the old inline form sliced without one)
+  const wantTitle = `[review] Case 21 — #${healThread.number} ${headline(longBody).slice(0, 100)}…`.slice(0, 160);
   healIssue.title = oldTitle;
   healIssue.body = oldBody;
   const verbatimSync = await j('POST', '/annotakit/api/sync');
@@ -688,6 +701,258 @@ async function main() {
     check('F13: legacy server candidates carry the bare origin', candsF13.length > 0 && candsF13.every((c) => /\nstorybook: http:\/\/localhost:6006\n/.test(c)), candsF13[0]?.split('\n').find((l) => l.startsWith('storybook:')));
   }
 
+  console.log('== 21. DD-12: the global rate-limit window gates pushes ==');
+  {
+    const t21 = await j('POST', '/annotakit/api/threads', threadInput(21));
+    await waitFor(() => (t21.body?.gh?.issue ?? 0) > 0 || gh.issues.some((i) => i.body?.includes(t21.body.id)), 5000, 'issue 21 created');
+    const row21 = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === t21.body.id);
+    const num21 = row21?.gh?.issue;
+    // 429 the next comment push; Retry-After 3s → the global window (a real
+    // Retry-After maps to retryMs in ms — gh.ts retryAfterMs)
+    const pre429 = countCalls('POST', /\/comments$/);
+    gh.fail = { regex: /\/comments$/, count: 1, status: 429, retryAfter: 3 };
+    await j('POST', `/annotakit/api/threads/${t21.body.id}/comments`, { author: 'reviewer', body: 'dd12 first reply' });
+    await waitFor(() => countCalls('POST', /\/comments$/) > pre429, 5000, 'the 429 push attempted');
+    const armWindow = async () => { for (let i = 0; i < 40; i++) { const st = await j('GET', '/annotakit/api/sync'); if (st.body.backoffUntil) return st; await sleep(50); } return null; };
+    const stW = await armWindow();
+    check('DD-12: the 429 armed the global window (status.backoffUntil)', Boolean(stW?.body?.backoffUntil), JSON.stringify(stW?.body?.backoffUntil ?? null));
+    // during the window: another mutation — the debounce must NOT push
+    const callsInWindow = countCalls('POST', /\/comments$/);
+    await j('POST', `/annotakit/api/threads/${t21.body.id}/comments`, { author: 'reviewer', body: 'dd12 second reply' });
+    await sleep(600); // the debounce + worker ticks fire well inside the 3s window
+    check('DD-12: the debounced push is PAUSED inside the window', countCalls('POST', /\/comments$/) === callsInWindow, `calls=${countCalls('POST', /\/comments$/)} frozen=${callsInWindow}`);
+    // the window expires (~3s from the 429); the next worker tick drains the RETAINED queue
+    await waitFor(() => countCalls('POST', /\/comments$/) > callsInWindow, 8000, 'the window expired and the queue drained');
+    await waitFor(() => (gh.comments[num21] ?? []).some((c) => c.body.includes('dd12 first reply')) && (gh.comments[num21] ?? []).some((c) => c.body.includes('dd12 second reply')), 5000, 'both retained replies landed');
+    check('DD-12: the queue SURVIVED the window (retention — nothing dropped)', (gh.comments[num21] ?? []).some((c) => c.body.includes('dd12 first reply')) && (gh.comments[num21] ?? []).some((c) => c.body.includes('dd12 second reply')));
+    // POST /sync clears the window (retry NOW)
+    const callsPre30 = countCalls('POST', /\/comments$/);
+    gh.fail = { regex: /\/comments$/, count: 1, status: 429, retryAfter: 30 };
+    await j('POST', `/annotakit/api/threads/${t21.body.id}/comments`, { author: 'reviewer', body: 'dd12 third reply' });
+    await waitFor(() => countCalls('POST', /\/comments$/) > callsPre30, 5000, 'the 429 push attempted');
+    const st30 = await armWindow();
+    check('DD-12: the 30s window armed', Boolean(st30?.body?.backoffUntil), JSON.stringify(st30?.body?.backoffUntil ?? null));
+    const forced = await j('POST', '/annotakit/api/sync');
+    await waitFor(() => (gh.comments[num21] ?? []).some((c) => c.body.includes('dd12 third reply')), 5000, 'forced sync pushed through the window');
+    check('DD-12: POST /sync CLEARS the window (forced reconcile pushed immediately)', (gh.comments[num21] ?? []).some((c) => c.body.includes('dd12 third reply')) && forced.status === 200);
+    const stClear = await j('GET', '/annotakit/api/sync');
+    check('DD-12: the window is clear after the forced sync', stClear.body.backoffUntil == null, JSON.stringify(stClear.body.backoffUntil));
+    // 401 on the pull → PULL_401_BACKOFF arms; pushes pause too (both directions, one token)
+    gh.fail = { regex: /\/issues$/, count: 1, status: 401 };
+    const s401 = await j('POST', '/annotakit/api/sync'); // the pull phase 401s → the 5-min window
+    const st401 = await armWindow();
+    check('DD-12: a pull 401 arms the window', Boolean(st401?.body?.backoffUntil), JSON.stringify(st401?.body?.backoffUntil ?? null));
+    const calls401 = countCalls('POST', /\/comments$/);
+    await j('POST', `/annotakit/api/threads/${t21.body.id}/comments`, { author: 'reviewer', body: 'dd12 after-401 reply' });
+    await sleep(450);
+    check('DD-12: a pull 401 pauses PUSHES too (one token, both directions)', countCalls('POST', /\/comments$/) === calls401 && s401.status === 200, `calls=${countCalls('POST', /\/comments$/)} frozen=${calls401}`);
+    await j('POST', '/annotakit/api/sync'); // clear the 5-min window — the suite must continue
+    await waitFor(() => (gh.comments[num21] ?? []).some((c) => c.body.includes('dd12 after-401 reply')), 5000, 'the 401 window cleared and the queue drained');
+    check('DD-12: POST /sync cleared the 401 window (the suite is unstalled)', (gh.comments[num21] ?? []).some((c) => c.body.includes('dd12 after-401 reply')));
+  }
+
+  console.log('== 22. DD-13: adoption READS the issue state (the 2x2, no state fight) ==');
+  {
+    const stampBody = (id) => `# UI review — orphaned\nstorybook: http://127.0.0.1:${GH_PORT}\n- thread id: ${id}\n- element: button`;
+    // cell 1: closed orphan + local unconfirmed → IMPORT resolved
+    const c1 = await j('POST', '/annotakit/api/threads', threadInput(22));
+    const closedAt = new Date(Date.now() - 3_600_000).toISOString();
+    const n1 = gh.nextIssue++;
+    gh.issues.push({ number: n1, title: '[review] orphan 1', body: stampBody(c1.body.id), labels: ['annotakit'], state: 'closed', closed_at: closedAt, closed_by: { login: 'third-party' }, comments: 0, updated_at: closedAt });
+    gh.comments[n1] = [];
+    await j('POST', '/annotakit/api/sync');
+    await sleep(500); // the push phase adopts via the orphan listing
+    const row1 = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === c1.body.id);
+    check('DD-13 c1: a closed orphan imports RESOLVED (resolvedAt = closed_at, not a local nowIso)', row1?.status === 'resolved' && row1?.resolvedAt === closedAt, JSON.stringify({ status: row1?.status, resolvedAt: row1?.resolvedAt, want: closedAt }));
+    check('DD-13 c1: the gh-close system comment is attributed to the closer', row1?.comments.some((c) => c.body.includes('closed on GitHub') && c.author === 'third-party'));
+    check('DD-13 c1: NO state fight (no reopened-in-Storybook notice, no issue reopen)', !gh.comments[n1].some((c) => c.body.includes('reopened in Storybook')) && !(row1?.comments.some((c) => c.body.includes('reopened in Storybook'))) && gh.issues.find((i) => i.number === n1)?.state === 'closed');
+    // cell 2: closed orphan + local resolved → mirror match (no state write)
+    const c2 = await j('POST', '/annotakit/api/threads', threadInput(23));
+    await j('PATCH', `/annotakit/api/threads/${c2.body.id}`, { ...c2.body, status: 'resolved' });
+    const row2pre = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === c2.body.id);
+    const n2 = gh.nextIssue++;
+    gh.issues.push({ number: n2, title: '[review] orphan 2', body: stampBody(c2.body.id), labels: ['annotakit'], state: 'closed', closed_at: closedAt, closed_by: { login: 'third-party' }, comments: 0, updated_at: closedAt });
+    gh.comments[n2] = [];
+    await j('POST', '/annotakit/api/sync');
+    await sleep(500);
+    const row2 = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === c2.body.id);
+    check('DD-13 c2: closed + local resolved → the mirror MATCHES (no state write; local resolvedAt kept)', row2?.status === 'resolved' && row2?.resolvedAt === row2pre?.resolvedAt && row2?.gh?.issue === n2, JSON.stringify({ status: row2?.status, resolvedAt: row2?.resolvedAt, pre: row2pre?.resolvedAt }));
+    check('DD-13 c2: no gh-close comment was fabricated (the confirm already agrees)', !row2?.comments.some((c) => c.body.includes('closed on GitHub')));
+    // cell 3: OPEN orphan + local resolved → KEEP the resolve; the issue closes as catch-up
+    const c3 = await j('POST', '/annotakit/api/threads', threadInput(24));
+    await j('PATCH', `/annotakit/api/threads/${c3.body.id}`, { ...c3.body, status: 'resolved' });
+    const n3 = gh.nextIssue++;
+    gh.issues.push({ number: n3, title: '[review] orphan 3', body: stampBody(c3.body.id), labels: ['annotakit'], state: 'open', closed_at: null, closed_by: null, comments: 0, updated_at: new Date().toISOString() });
+    gh.comments[n3] = [];
+    await j('POST', '/annotakit/api/sync');
+    await waitFor(() => gh.issues.find((i) => i.number === n3)?.state === 'closed', 5000, 'the catch-up closed the orphan');
+    const row3 = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === c3.body.id);
+    check('DD-13 c3: open orphan + local resolved → the resolve is KEPT (never reverted to fight the issue)', row3?.status === 'resolved' && row3?.gh?.issue === n3);
+    check('DD-13 c3: the next push closed the issue as catch-up (the pushed state wins on GitHub)', gh.issues.find((i) => i.number === n3)?.state === 'closed');
+    // cell 4: open orphan + local unconfirmed → the baseline (adopt with local state)
+    const c4 = await j('POST', '/annotakit/api/threads', threadInput(25));
+    const n4 = gh.nextIssue++;
+    gh.issues.push({ number: n4, title: '[review] orphan 4', body: stampBody(c4.body.id), labels: ['annotakit'], state: 'open', closed_at: null, closed_by: null, comments: 0, updated_at: new Date().toISOString() });
+    gh.comments[n4] = [];
+    await j('POST', '/annotakit/api/sync');
+    await sleep(500);
+    const row4 = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === c4.body.id);
+    check('DD-13 c4: the baseline — an open orphan + unconfirmed local adopts with local state', row4?.status === 'open' && row4?.gh?.issue === n4, JSON.stringify({ status: row4?.status, gh: row4?.gh?.issue, want: n4 }));
+  }
+
+  console.log('== 23. DD-11: a quote-reply quoting our notice is NOT a system notice ==');
+  {
+    const anyRow = (await j('GET', '/annotakit/api/threads')).body.threads[0];
+    const num = anyRow?.gh?.issue;
+    // a human QUOTES our notice (the sentinel mid-body) — must be IMPORTED
+    commentRemote(num, '> for context, their notice said <!-- annotakit --> resolved in Storybook — but I still see the bug', 'quoter');
+    // a REAL system notice (starts with the sentinel) — must be SUPPRESSED
+    commentRemote(num, '<!-- annotakit -->\nresolved in Storybook — thread #1.', 'mirror-bot');
+    await j('POST', '/annotakit/api/sync');
+    await sleep(400);
+    const row = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === anyRow.id);
+    check('DD-11: the quote-reply (sentinel mid-body) is IMPORTED as a reply', row?.comments.some((c) => c.author === 'quoter' && c.body.includes('I still see the bug')), JSON.stringify(row?.comments.filter((c) => c.author === 'quoter')));
+    check('DD-11: the real notice (sentinel at start) is still SUPPRESSED', !row?.comments.some((c) => c.body.includes('resolved in Storybook — thread #1')), JSON.stringify(row?.comments.map((c) => c.body.slice(0, 40))));
+  }
+
+  console.log('== 24. 44-b P2-1: the raced adoption never mints a duplicate ==');
+  {
+    // a thread whose create-crash orphan exists; the adoption's listing stalls
+    // (gh.delay); a CONCURRENT git-merge-style mapping lands mid-stall (a
+    // second sqlite connection — the exact premise the raced guard names).
+    // The old code fell through to createIssue: a DUPLICATE + the false
+    // "thread deleted" note. The fix: the no-op + getThread(id).gh guard.
+    const c24 = await j('POST', '/annotakit/api/threads', threadInput(26));
+    const n24 = gh.nextIssue++;
+    gh.issues.push({ number: n24, title: '[review] orphan 24', body: `# UI review\n- thread id: ${c24.body.id}\n- element: button`, labels: ['annotakit'], state: 'open', closed_at: null, closed_by: null, comments: 0, updated_at: new Date().toISOString() });
+    gh.comments[n24] = [];
+    const createsBefore = countCalls('POST', /\/issues$/);
+    gh.delay = { regex: /\/issues$/, count: 1, ms: 700 }; // stall the ADOPTION listing (GET)
+    const forced24 = j('POST', '/annotakit/api/sync'); // NOT awaited — the listing is stalled
+    await sleep(250); // the drain reached the stalled listing
+    // a concurrent mapping lands MID-STALL (a second sqlite connection — the git-merge premise)
+    const { DatabaseSync } = require2('node:sqlite');
+    const dbPath24 = (await j('GET', '/annotakit/api/health')).body.storePath;
+    const db24 = new DatabaseSync(dbPath24);
+    const row24 = db24.prepare('SELECT payload FROM threads WHERE id = ?').get(c24.body.id);
+    const doc24 = JSON.parse(row24.payload);
+    doc24.gh = { issue: n24, url: issueUrl(n24), state: 'open', syncedAt: new Date().toISOString() };
+    db24.prepare('UPDATE threads SET payload = ? WHERE id = ?').run(JSON.stringify(doc24), c24.body.id);
+    db24.close();
+    await forced24; // the listing resumes; the raced guard fires
+    await sleep(500);
+    const createsAfter = countCalls('POST', /\/issues$/);
+    check('44-b P2-1: NO duplicate issue was minted on the raced adoption', createsAfter === createsBefore, `creates ${createsBefore}->${createsAfter}`);
+    const row24b = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === c24.body.id);
+    check('44-b P2-1: the thread ends up MAPPED exactly once (to the concurrent winner)', row24b?.gh?.issue === n24, JSON.stringify(row24b?.gh));
+    check('44-b P2-1: no false "thread deleted" closing note was posted', !gh.comments[n24].some((c) => c.body.includes('thread deleted in Storybook')), JSON.stringify(gh.comments[n24].map((c) => c.body.slice(0, 40))));
+  }
+
+  console.log('== 25. 44-b P2-2: the window gates PER ITERATION + the summary reports it ==');
+  {
+    // three threads with pending deltas; a 429 that arms MID-drain: iteration
+    // 1's 429 arms the window; the in-loop re-check gates iterations 2..3.
+    const nums25 = [];
+    for (const n of [27, 28, 29]) {
+      const t = await j('POST', '/annotakit/api/threads', threadInput(n));
+      await waitFor(() => gh.issues.some((i) => i.body?.includes(t.body.id)), 8000, `mirror ${n} created`);
+      nums25.push(gh.issues.find((i) => i.body?.includes(t.body.id)).number);
+    }
+    gh.fail = { regex: /\/comments$/, count: 3, status: 429, retryAfter: 60 };
+    const postsBefore = countCalls('POST', /\/comments$/);
+    for (const num of nums25) {
+      // a reply on each thread → three pushes queue; the drain fires them in order
+      const th = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.gh?.issue === num);
+      await j('POST', `/annotakit/api/threads/${th.id}/comments`, { author: 'reviewer', body: 'p25 reply' });
+    }
+    await sleep(800); // the drain runs: iteration 1's 429 arms; the re-check gates 2..3
+    const fired25 = countCalls('POST', /\/comments$/) - postsBefore;
+    check('44-b P2-2: exactly ONE comment POST fired into the window (the in-loop re-check gated the rest)', fired25 === 1, `fired=${fired25} (want 1)`);
+    const st25 = await j('GET', '/annotakit/api/sync');
+    check('44-b P2-2: the status reports the armed window', Boolean(st25.body.backoffUntil), JSON.stringify(st25.body.backoffUntil));
+    const forced25 = await j('POST', '/annotakit/api/sync'); // clears + forces — the summary must report honestly
+    check('44-b P2-2: the sync summary carries backoffActive (honest, additive)', typeof forced25.body.backoffActive === 'boolean', JSON.stringify({ backoffActive: forced25.body.backoffActive, pushed: forced25.body.pushed }));
+    // the forced cycle re-armed the window via gh.fail's remaining counts (the
+    // in-loop re-check gated its later iterations) — clear the fails + window,
+    // then the retained queue drains
+    gh.fail = null;
+    await j('POST', '/annotakit/api/sync');
+    await waitFor(() => nums25.every((num) => (gh.comments[num] ?? []).some((c) => c.body.includes('p25 reply'))), 8000, 'the queue drained after the clear');
+    check('44-b P2-2: the cleared window drained every retained reply', nums25.every((num) => (gh.comments[num] ?? []).some((c) => c.body.includes('p25 reply'))));
+  }
+
+  console.log('== 17. v0.6.15 (DD-21): repo re-point — server mappings DETACH, never contaminate ==');
+  {
+    // (a) mint a fresh mapping on test/repo (the pre-switch state)
+    const cr17 = await j('POST', '/annotakit/api/threads', threadInput(101));
+    await waitFor(async () => (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === cr17.body?.id)?.gh, 5000, 'mint 17');
+    const t17 = (await j('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === cr17.body?.id);
+    const n17 = t17?.gh?.issue;
+    check('17a mapping minted with repo stamped', typeof n17 === 'number' && t17?.gh?.repo === 'test/repo', JSON.stringify(t17?.gh));
+
+    // (b) boot a SUBPROCESS on the SAME store with the repo re-pointed (the
+    //     restart-with-a-different-repo shape) — the mapping must DETACH
+    const proc17 = spawn(
+      process.execPath,
+      [
+        '-e',
+        `const http = require('node:http');
+         const { createMiddleware } = require(${JSON.stringify(DIST)});
+         const srv = http.createServer((req, res) => createMiddleware(${JSON.stringify(configDir)})(req, res, () => { res.writeHead(404); res.end(); }));
+         srv.listen(0, '127.0.0.1', () => console.log('READY ' + srv.address().port));
+         setInterval(() => {}, 1 << 30);`,
+      ],
+      { env: { ...process.env, ANNOTAKIT_GH_REPO: 'other/repo' }, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let port17 = 0;
+    proc17.stdout.on('data', (d) => {
+      const m = String(d).match(/READY (\d+)/);
+      if (m) port17 = Number(m[1]);
+    });
+    const booted17 = await waitFor(() => port17 > 0, 15000, 'subprocess boot');
+    check('17b the re-pointed server boots on the shared store', booted17);
+    const B17 = `http://127.0.0.1:${port17}`;
+    const jb = async (method, p, body) => {
+      const res = await fetch(`${B17}${p}`, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+      const text = await res.text();
+      return { status: res.status, body: text ? JSON.parse(text) : null };
+    };
+    // a reply on the detached thread must NEVER reach the issue
+    gh.calls.length = 0;
+    const rep17 = await jb('POST', `/annotakit/api/threads/${t17.id}/comments`, { author: 'reviewer', body: 'p17 detached reply' });
+    check('17c the reply landed locally (201)', rep17.status === 201);
+    await jb('POST', '/annotakit/api/sync');
+    await sleep(700);
+    const noComment17 = !gh.calls.some((c) => c.method === 'POST' && new RegExp(`/issues/${n17}/comments$`).test(c.path));
+    check('17d NO comment POST hit the issue (the detached push is a no-op)', noComment17, JSON.stringify(gh.calls.map((c) => c.method + ' ' + c.path)).slice(0, 200));
+    const st17 = await jb('GET', '/annotakit/api/sync');
+    // (every mapping minted this run lives on test/repo — under other/repo they
+    // ALL detach; ours is among them: >= 1 is the honest assertion)
+    check('17e the status reports the DETACHED mappings', (st17.body?.detached ?? 0) >= 1, JSON.stringify({ detached: st17.body?.detached, stalled: st17.body?.stalled }));
+    check('17f the detached thread is NOT stalled (the sweep excludes it)', st17.body?.stalled === 0, JSON.stringify(st17.body?.stalled));
+
+    // (c) delete → the tombstone close VERIFY: a foreign body stamp → skip +
+    //     done (never close a possible foreign issue, never spin)
+    const issue17 = gh.issues.find((x) => x.number === n17);
+    if (issue17) issue17.body = '- thread id: SOMEONE_ELSE\n';
+    const del17 = await jb('DELETE', `/annotakit/api/threads/${t17.id}`);
+    check('17g the thread deleted locally', del17.status === 200);
+    await jb('POST', '/annotakit/api/sync');
+    await sleep(500);
+    const patches17 = gh.calls.filter((c) => c.method === 'PATCH' && new RegExp(`/issues/${n17}$`).test(c.path)).length;
+    check('17h the tombstone close SKIPPED the foreign-stamped issue', patches17 === 0 && gh.issues.find((x) => x.number === n17)?.state === 'open', `patches=${patches17}`);
+    await jb('POST', '/annotakit/api/sync');
+    await sleep(400);
+    const patches17b = gh.calls.filter((c) => c.method === 'PATCH' && new RegExp(`/issues/${n17}$`).test(c.path)).length;
+    check('17i the skipped tombstone is DONE (no retry spin)', patches17b === 0, `patches=${patches17b}`);
+
+    proc17.kill();
+    await new Promise((r) => {
+      const done = setTimeout(r, 5000);
+      proc17.once('exit', () => { clearTimeout(done); r(); });
+    });
+  }
+
   api.close();
   console.log(`\n${passed} passed, ${failed} failed (in-process)`);
 
@@ -716,6 +981,58 @@ async function main() {
   check('POST /sync without token → 200 local-mode noop', code === '200' && parsed.noop === true, `code=${code} body=${String(text).slice(0, 120)}`);
   check('noop reason lists a/b/c self-healing steps', /a\).*b\).*c\)/s.test(parsed.reason ?? '') && (parsed.reason ?? '').includes('ANNOTAKIT_GH_TOKEN'), String(parsed.reason).slice(0, 120));
   check('noop reason mentions the local fallback path', /local|digest/i.test(parsed.reason ?? ''), String(parsed.reason).slice(0, 160));
+
+  console.log('== 17. 44-d P2-1: the env door normalizes + re-validates the repo (fresh processes) ==');
+  {
+    const tmp3 = fs.mkdtempSync(path.join(os.tmpdir(), 'annotakit-envdoor-'));
+    const configDir3 = path.join(tmp3, '.storybook');
+    fs.mkdirSync(configDir3, { recursive: true });
+    fs.writeFileSync(path.join(configDir3, 'annotakit.config.json'), '{}');
+    /** Boot a fresh middleware with a custom ANNOTAKIT_GH_REPO and read the
+     *  BOOT-resolved repo back from /health (ghRepoEnv is env-read at boot —
+     *  the cached runtime forbids in-process reuse). GH_AUTO=0 keeps the
+     *  engine quiet (this probe never wants network). */
+    const probeEnvRepo = (repoValue) => {
+      const p = spawnSync(
+        process.execPath,
+        ['-e', `
+          const http = require('node:http');
+          const { createMiddleware } = require(${JSON.stringify(DIST)});
+          const srv = http.createServer((req, res) => createMiddleware(${JSON.stringify(configDir3)})(req, res, () => { res.writeHead(404); res.end(); }));
+          srv.listen(0, '127.0.0.1', () => {
+            fetch('http://127.0.0.1:' + srv.address().port + '/annotakit/api/health')
+              .then(async (r) => { console.log(r.status + '|' + JSON.stringify((await r.json()).gh?.repo ?? null)); srv.close(); })
+              .catch((e) => { console.log('ERR|' + e.message); srv.close(); });
+          });
+        `],
+        {
+          env: {
+            ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('ANNOTAKIT_') && k !== 'NODE_ENV')),
+            ANNOTAKIT_GH_TOKEN: 'tok-envdoor-probe',
+            ANNOTAKIT_GH_AUTO: '0',
+            ...(repoValue ? { ANNOTAKIT_GH_REPO: repoValue } : {}),
+          },
+          cwd: tmp3,
+          timeout: 20000,
+        },
+      );
+      const line = (p.stdout.toString().trim() || 'ERR|' + (p.stderr.toString().trim().slice(0, 200) || 'no output'));
+      const [code, body] = line.split('|');
+      return { code, repo: (() => { try { return JSON.parse(body ?? 'null'); } catch { return 'unparsed'; } })() };
+    };
+    // THE incident shape: ANNOTAKIT_GH_REPO=github:octocat/widgets used to
+    // pass ghRepoEnv's lax gate VERBATIM (`github:octocat` as the "owner")
+    // and arm a dead engine — now it normalizes like the bake door.
+    const sh17 = probeEnvRepo('github:octocat/widgets');
+    check('44-d P2-1: env github: shorthand NORMALIZES to owner/name', sh17.code === '200' && sh17.repo === 'octocat/widgets', JSON.stringify(sh17));
+    const url17 = probeEnvRepo('ssh://git@github.com:443/octocat/widgets.git');
+    check('44-d P2-1: env ssh+port URL normalizes', url17.code === '200' && url17.repo === 'octocat/widgets', JSON.stringify(url17));
+    const bad17 = probeEnvRepo('octocat/widgets/extra');
+    check('44-d P2-1: env 3-segment shorthand rejected (unconfigured, not a dead mirror)', bad17.code === '200' && bad17.repo === null, JSON.stringify(bad17));
+    const colon17 = probeEnvRepo('github:gh:octocat/widgets');
+    check('44-d P2-1: env non-charset parser OUTPUT rejected', colon17.code === '200' && colon17.repo === null, JSON.stringify(colon17));
+    fs.rmSync(tmp3, { recursive: true, force: true });
+  }
 
   fs.rmSync(tmp, { recursive: true, force: true });
   fs.rmSync(tmp2, { recursive: true, force: true });

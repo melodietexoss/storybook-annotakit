@@ -27,7 +27,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { gitCommonDir, isGitRepo, projectRoot, ghToken } from './env';
@@ -155,6 +155,14 @@ function redact(text: string): string {
 
 interface GitResult { ok: boolean; out: string }
 
+/** v0.6.15 (Y1): WHY a remote-doc read has no doc — 'absent' (nothing to
+ *  clobber; pushes may proceed) vs 'unreadable' (content exists but no hop
+ *  parsed; pushing local-only rows would REPLACE it — refuse). */
+type RemoteDocRead =
+  | { kind: 'doc'; doc: StoreFileDoc }
+  | { kind: 'absent' }
+  | { kind: 'unreadable' };
+
 /** Async git (spawn) — the debounced path; never blocks the event loop. */
 function gitAsync(root: string, args: string[], timeoutMs: number, opts?: { env?: Record<string, string>; stdin?: string }): Promise<GitResult> {
   return new Promise((resolve) => {
@@ -191,29 +199,39 @@ function gitAsync(root: string, args: string[], timeoutMs: number, opts?: { env?
   });
 }
 
-/** Binary git output (git show of the db blob) — Buffer, never utf8-decoded. */
-function gitAsyncBuffer(root: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; buf: Buffer; out: string }> {
+/** v0.6.15 (Y1, wave-3 P1): stream a git blob STRAIGHT to a file — the
+ *  child's stdout is wired to the destination FD, so no in-memory chunk
+ *  buffer exists and no size cap can fail a big store's read. The old
+ *  gitAsyncBuffer bailed past ~64 stdout chunks (~4MB) as "absurd for our
+ *  store"; a store grown past it (90 threads × ~56KB evidence comments ≈
+ *  5MB is a perfectly plausible review corpus) read as UNREADABLE, the
+ *  syncOnce union silently skipped, and the push REPLACED the remote's
+ *  content with local-only rows (fast-forward — no rejection ever fired). */
+function gitBlobToFile(root: string, args: string[], dest: string, timeoutMs: number): Promise<{ ok: boolean; out: string }> {
   return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
     let out = '';
     let settled = false;
+    let fd: number;
+    try {
+      fd = openSync(dest, 'w');
+    } catch {
+      resolve({ ok: false, out: 'open dest failed' });
+      return;
+    }
     const finish = (ok: boolean): void => {
       if (settled) return;
       settled = true;
-      resolve({ ok, buf: Buffer.concat(chunks), out: redact(out).slice(0, 200) });
+      try { closeSync(fd); } catch { /* best effort */ }
+      resolve({ ok, out: redact(out).slice(0, 200) });
     };
     const child = spawn('git', ['--no-optional-locks', '-C', root, ...args], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', fd, 'pipe'],
     });
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       finish(false);
     }, timeoutMs);
-    child.stdout.on('data', (d: Buffer) => {
-      if (chunks.length < 64) chunks.push(d);
-      else finish(false); // >~4MB — absurd for our store, bail
-    });
-    child.stderr.on('data', (d: Buffer) => (out += d.toString()));
+    child.stderr?.on('data', (d: Buffer) => (out += d.toString()));
     child.on('error', () => {
       clearTimeout(timer);
       finish(false);
@@ -448,29 +466,43 @@ export function createAutoSync(opts: {
     return gitAsync(root, [...auth.args, 'push', '--no-verify', url, refspec], timeoutMs, auth.env ? { env: auth.env } : undefined);
   };
 
-  /** Read the remote db blob at a commit → validated StoreFileDoc (A13:
-   *  corrupt blob walks to the parent commit, up to 3 hops). */
-  const readRemoteDoc = async (commitSha: string): Promise<StoreFileDoc | null> => {
+  /** Read the remote db blob at a commit → a DISCRIMINATED read (v0.6.15
+   *  Y1). A13 keeps the corrupt-blob parent walk (up to 3 hops), but the
+   *  caller now LEARNS WHY no doc came back:
+   *  - 'doc'       — the parsed StoreFileDoc (the only mergeable outcome)
+   *  - 'absent'    — NO threads.db blob anywhere in the walk: the remote head
+   *                  holds nothing a push could clobber — proceeding is safe
+   *  - 'unreadable'— a blob EXISTS but no hop parsed (corrupt / read error):
+   *                  pushing the local-only tree over it would REPLACE
+   *                  remote content we could not union — syncOnce REFUSES */
+  const readRemoteDoc = async (commitSha: string): Promise<RemoteDocRead> => {
     let sha = commitSha;
+    let sawBlob = false;
     for (let hop = 0; hop < 4; hop++) {
-      const show = await gitAsyncBuffer(root, ['show', `${sha}:threads.db`], 8000);
-      if (show.ok && show.buf.length > 0) {
+      const exists = await gitAsync(root, ['cat-file', '-e', `${sha}:threads.db`], 5000);
+      if (exists.ok) {
+        sawBlob = true;
         const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'annotakit-restore-'));
         const tmp = path.join(tmpDir, 'threads.db');
         try {
-          writeFileSync(tmp, show.buf);
-          const doc = readStoreFile(tmp);
-          if (doc && doc.threads.length >= 0) return { threads: doc.threads, deletedIds: doc.deletedIds };
+          // Y1: stream straight to the file — no cap, any store size
+          const show = await gitBlobToFile(root, ['show', `${sha}:threads.db`], tmp, 15_000);
+          if (show.ok) {
+            const doc = readStoreFile(tmp);
+            if (doc && doc.threads.length >= 0) return { kind: 'doc', doc: { threads: doc.threads, deletedIds: doc.deletedIds } };
+          } else {
+            logOnce(`remote db blob read failed at ${sha.slice(0, 8)} (${show.out})`);
+          }
         } finally {
           try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
         }
       }
       // A13: corrupt/missing → walk to the parent
       const parent = await gitAsync(root, ['rev-parse', '--verify', '--quiet', `${sha}^`], 5000);
-      if (!parent.ok || !SHA_RE.test(parent.out.trim())) return null;
+      if (!parent.ok || !SHA_RE.test(parent.out.trim())) return sawBlob ? { kind: 'unreadable' } : { kind: 'absent' };
       sha = parent.out.trim();
     }
-    return null;
+    return sawBlob ? { kind: 'unreadable' } : { kind: 'absent' };
   };
 
   /** Import a merged/restored doc through row-level upserts (A7) — never a
@@ -510,7 +542,13 @@ export function createAutoSync(opts: {
         trace(`restore: fetched=${fetched ? fetched.slice(0, 8) : 'none'}`);
         if (fetched) remote = { sha: fetched, ref: REMOTE_CACHE_REF };
         if (!remote) {
-          state = `no remote store yet (${branch}) — first snapshot will create it`;
+          // DD-6 (S9-i P1-2): with no GitHub repo configured there IS no remote
+          // store to create — the old line promised one ("first snapshot will
+          // create it") to consumers whose origin is GitLab/file:// (the
+          // orphan branch only ever pushes to the GH mirror repo).
+          state = repo
+            ? `no remote store yet (${branch}) — first snapshot will create it`
+            : `local orphan branch only (${branch}) — no GitHub repo configured; set ANNOTAKIT_GH_REPO for cross-machine durability`;
           return;
         }
         // A14: validate the ref the head ACTUALLY came from (a fresh clone
@@ -546,12 +584,19 @@ export function createAutoSync(opts: {
             return;
           }
         }
-        const remoteDoc = await readRemoteDoc(remote.sha);
+        const remoteRead = await readRemoteDoc(remote.sha);
         const localCount = await opts.countThreads();
-        if (!remoteDoc) {
-          state = `remote store unreadable (walked parents) — local data safe (${localCount} threads)`;
+        if (remoteRead.kind !== 'doc') {
+          // Y1: the boot path was ALREADY safe (local data untouched) — the
+          // distinction now says WHY, and 'absent' stops lying "unreadable"
+          // for a README-only branch.
+          state =
+            remoteRead.kind === 'unreadable'
+              ? `remote store unreadable (walked parents) — local data safe (${localCount} threads)`
+              : `remote ${branch} carries no store blob (README-only) — local data safe (${localCount} threads)`;
           return;
         }
+        const remoteDoc = remoteRead.doc;
         if (localCount === 0 && (remoteDoc.threads.length > 0 || remoteDoc.deletedIds.size > 0)) {
           // wholesale adoption — including remote tombstones (a remote that
           // deleted everything must teach THIS clone what died, or a later
@@ -576,7 +621,16 @@ export function createAutoSync(opts: {
             });
           if (changed) {
             const n = await importDoc(merged);
-            state = `merged remote ${branch} → ${n} threads (boot)`;
+            // S9-i P2-1: the merge log NAMES the ids delete-wins dropped —
+            // a silent drop (the DD-1 zombie class annihilating a row) was
+            // indistinguishable from a clean merge in the boot log.
+            const droppedIds = [
+              ...local.threads.filter((t) => merged.deletedIds.has(t.id)).map((t) => t.id),
+              ...remoteDoc.threads.filter((t) => merged.deletedIds.has(t.id)).map((t) => t.id),
+            ].filter((id, i, a) => a.indexOf(id) === i);
+            state =
+              `merged remote ${branch} → ${n} threads (boot)` +
+              (droppedIds.length > 0 ? ` — delete-wins dropped: ${droppedIds.slice(0, 10).join(', ')}${droppedIds.length > 10 ? ` (+${droppedIds.length - 10} more)` : ''}` : '');
             console.warn(`[storybook-annotakit] store restore: ${state}`);
             void syncOnce(9000, 'boot-merge');
           } else {
@@ -645,9 +699,28 @@ export function createAutoSync(opts: {
       // tree is built (A3/A7). No-op when already in sync — the comparison
       // is exact. This is what makes the push safe WITHOUT needing a non-FF
       // rejection to trigger reconciliation.
+      // v0.6.15 (Y1, wave-3 P1): a remote head whose blob EXISTS but cannot be
+      // read used to fall through here with the union silently skipped — the
+      // push then replaced the remote's content with LOCAL-ONLY rows (a
+      // fast-forward push: no rejection ever fired, every remote-only thread
+      // silently gone). An uncomputed union must NEVER be pushed; 'absent'
+      // (no blob anywhere in the walk) is the only safe-to-proceed outcome.
       if (parent) {
-        const remoteDoc = await readRemoteDoc(parent);
-        if (remoteDoc) {
+        const remoteRead = await readRemoteDoc(parent);
+        if (remoteRead.kind === 'unreadable') {
+          logOnce(
+            `remote ${branch} store unreadable at ${parent.slice(0, 8)} — REFUSING to push an uncomputed union (it would wholesale-replace remote content)`,
+          );
+          state = 'refusing to push — remote store unreadable (union uncomputed); local data safe';
+          if (repo) {
+            consecutivePushFailures += 1;
+            lastPushError = 'remote store unreadable — push refused (union uncomputed)';
+            lastSyncAttemptAt = new Date().toISOString();
+          }
+          return false;
+        }
+        if (remoteRead.kind === 'doc') {
+          const remoteDoc = remoteRead.doc;
           const local = { threads: await opts.store.listThreads(), deletedIds: await opts.store.listDeletedIds() };
           const merged = logicalMerge(local, { threads: remoteDoc.threads, deletedIds: remoteDoc.deletedIds });
           const changed =
@@ -667,11 +740,21 @@ export function createAutoSync(opts: {
             }
           }
         }
+        // 'absent': the remote head holds no store blob — nothing to clobber.
       }
 
       const tree = await buildTree(timeoutMs);
       if (!tree) {
         state = 'error: git tree';
+        // DD-16 (S9-a P2, the 24-b carry-over): a cycle dying BEFORE the push
+        // step was invisible to gitHealth — a store failing every cycle at
+        // buildTree/commitTree reported healthy:true / consecutivePushFailures:0
+        // / durability 'git-push'. Count pre-push failures like push failures.
+        if (repo) {
+          consecutivePushFailures += 1;
+          lastPushError = 'git tree build failed (pre-push cycle failure)';
+          lastSyncAttemptAt = new Date().toISOString();
+        }
         return false;
       }
       const commit = await commitTree(
@@ -682,10 +765,24 @@ export function createAutoSync(opts: {
       );
       if (!commit) {
         state = 'error: git commit-tree';
+        // DD-16: pre-push failure twin of the buildTree case above.
+        if (repo) {
+          consecutivePushFailures += 1;
+          lastPushError = 'git commit-tree failed (pre-push cycle failure)';
+          lastSyncAttemptAt = new Date().toISOString();
+        }
         return false;
       }
 
       let push = await pushCommit(commit, timeoutMs);
+      // Y1 (CAS): the sha actually pushed + the head it is parented on — the
+      // A4.4 update-ref CAS below must use THESE, never the cycle's first
+      // fetch (the retry path pushes commit2 on freshHead while the old code
+      // CAS'd on remoteHead AND stamped the ABANDONED first commit into the
+      // local refs — a stale expected value silently failed every update-ref,
+      // and a later offline cycle could parent on the orphaned commit).
+      let pushedSha = commit;
+      let pushedParent = parent;
       trace(`syncOnce(${reason}): push1=${push.ok} ${push.out.slice(0, 80)}`);
       // Transient push failures BOTH matter: non-FF (racing writer committed
       // first) AND ref-lock races ("cannot lock ref" — two machines pushing
@@ -695,15 +792,26 @@ export function createAutoSync(opts: {
         // re-fetch, re-merge (the union is idempotent), ONE retry
         const freshHead = await fetchRemote(timeoutMs);
         if (freshHead && (await refHasOurReadme(REMOTE_CACHE_REF))) {
-          const remoteDoc = await readRemoteDoc(freshHead);
-          if (remoteDoc) {
-            const local = { threads: await opts.store.listThreads(), deletedIds: await opts.store.listDeletedIds() };
-            const merged = logicalMerge(local, { threads: remoteDoc.threads, deletedIds: remoteDoc.deletedIds });
-            await importDoc(merged);
-            opts.checkpoint();
+          const freshRead = await readRemoteDoc(freshHead);
+          if (freshRead.kind === 'unreadable') {
+            // Y1: same refusal as the pre-push site — the merge push would
+            // replace the fresh remote's content with local-only rows
+            logOnce('diverged and the fresh remote store is unreadable — REFUSING the merge push (union uncomputed); will retry next mutation');
+          } else {
+            if (freshRead.kind === 'doc') {
+              const local = { threads: await opts.store.listThreads(), deletedIds: await opts.store.listDeletedIds() };
+              const merged = logicalMerge(local, { threads: freshRead.doc.threads, deletedIds: freshRead.doc.deletedIds });
+              await importDoc(merged);
+              opts.checkpoint();
+            }
+            // 'absent': nothing to merge — the local tree AS-IS, re-parented
             const tree2 = await buildTree(timeoutMs);
             const commit2 = tree2 ? await commitTree(tree2, freshHead, `annotakit store merge (${reason})`, timeoutMs) : null;
-            if (commit2) push = await pushCommit(commit2, timeoutMs);
+            if (commit2) {
+              pushedSha = commit2;
+              pushedParent = freshHead;
+              push = await pushCommit(commit2, timeoutMs);
+            }
           }
         } else {
           logOnce('diverged but remote head unavailable/foreign — will retry next mutation');
@@ -740,13 +848,16 @@ export function createAutoSync(opts: {
       lastSyncAttemptAt = lastSyncAt;
       // A4.4: move the local refs only AFTER a successful push (CAS where the
       // expected old value is known, so a racing writer cannot be silently
-      // overtaken)
-      if (remoteHead) {
-        await gitAsync(root, ['update-ref', REMOTE_CACHE_REF, commit, remoteHead], timeoutMs);
-        await gitAsync(root, ['update-ref', `refs/heads/${branch}`, commit, remoteHead], timeoutMs);
+      // overtaken). Y1: the CAS pair is the sha ACTUALLY pushed + the head it
+      // was ACTUALLY parented on (pushedSha/pushedParent) — after a retry-path
+      // push the old code CAS'd on the cycle's first fetch and stamped the
+      // abandoned first commit into both refs.
+      if (pushedParent) {
+        await gitAsync(root, ['update-ref', REMOTE_CACHE_REF, pushedSha, pushedParent], timeoutMs);
+        await gitAsync(root, ['update-ref', `refs/heads/${branch}`, pushedSha, pushedParent], timeoutMs);
       } else {
-        await gitAsync(root, ['update-ref', REMOTE_CACHE_REF, commit], timeoutMs);
-        await gitAsync(root, ['update-ref', `refs/heads/${branch}`, commit], timeoutMs);
+        await gitAsync(root, ['update-ref', REMOTE_CACHE_REF, pushedSha], timeoutMs);
+        await gitAsync(root, ['update-ref', `refs/heads/${branch}`, pushedSha], timeoutMs);
       }
       state = `pushed ${branch} → ${repo} (${reason})`;
       return true;

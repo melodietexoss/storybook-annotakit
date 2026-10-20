@@ -151,6 +151,21 @@ export function deepestGreyedAt(
 }
 
 /**
+ * v0.6.13 (S9/DD-18b, 33-e P2-2): a pin target must be a STRICT descendant of
+ * the hit scope. elementsFromPoint happily answers `<body>` at exposed canvas
+ * padding (story shorter than the iframe / SB body padding) and the frozen
+ * container itself on the exposed frozen background — neither is story
+ * content, and both minted honest-looking junk threads (cssPath throws on an
+ * ancestor of the root, textQuote grabs the story's first text as "the
+ * element's text", the pin rides our own container chrome). actOnHit
+ * consults this before accepting a hit and speaks a hint on rejection;
+ * pure so the s6 suite can pin the rule.
+ */
+export function isPinnableTarget(target: Element | null, scopeEl: Element): boolean {
+  return !!target && target !== scopeEl && scopeEl.contains(target);
+}
+
+/**
  * The pin-mode hit at (x, y): today's elementsFromPoint answer, refined to
  * the deepest greyed (pe:none) descendant when one exists at the point.
  * Overlay chrome is skipped at every level.

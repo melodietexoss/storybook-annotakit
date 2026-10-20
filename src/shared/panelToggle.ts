@@ -22,6 +22,40 @@ export interface PanelToggleApi {
   togglePanel: (toggled?: boolean) => void;
 }
 
+/** v0.6.13 (S9/DD-14, 34-b amendment 14a): the layout fields the pure panel
+ *  light reads. Present in SB layout state since well before 9 (34-b verified
+ *  the rule byte-identical across the supported range: the shipped 9.1.16
+ *  manager-api AND the installed 10.6 both implement
+ *  `panelPosition === "bottom" && bottomPanelHeight > 0 ||
+ *   panelPosition === "right" && rightPanelWidth > 0`). */
+export interface PanelLayoutState {
+  bottomPanelHeight?: number;
+  rightPanelWidth?: number;
+  panelPosition?: string;
+}
+
+/** The position-scoped axis rule over layout state: the panel is shown when
+ *  ITS dock's axis is open — bottomPanelHeight > 0 docked bottom (the
+ *  default), rightPanelWidth > 0 docked right. The old hand rule ORed both
+ *  axes, so a right-dock drag with the bottom dock closed (and vice versa)
+ *  lit the button while the panel was hidden. */
+export function isPanelShownFromLayout(layout: PanelLayoutState | null | undefined): boolean {
+  const pos = layout?.panelPosition ?? 'bottom';
+  return pos === 'right' ? (layout?.rightPanelWidth ?? 0) > 0 : (layout?.bottomPanelHeight ?? 0) > 0;
+}
+
+/** The panel LIGHT's "shown" term (DD-14): the runtime's getIsPanelShown when
+ *  it exists (verified present across 9.1.16 → 10.6), else the pure layout
+ *  rule — NEVER `?? false`: on a runtime without the method the degrade cell
+ *  must be "still correct", not "silently dark" (34-b 14a: for the LIGHT,
+ *  false is a lie about state — unlike the TOGGLE, where a false default is
+ *  the safe no-op). The caller keeps useStorybookState as the re-render
+ *  trigger: the api call reads store state at render time, so every layout
+ *  change (incl. live divider drags) re-renders through it. */
+export function panelShownNow(api: Pick<PanelToggleApi, 'getIsPanelShown'>, layout: PanelLayoutState | null | undefined): boolean {
+  return api.getIsPanelShown?.() ?? isPanelShownFromLayout(layout);
+}
+
 export function toggleThreadsPanel(api: PanelToggleApi, panelId: string): void {
   // Invariant: every caller (toolbar click, bridge ⌥P, the
   // TOGGLE_THREADS_PANEL channel listener) is story-view-only by

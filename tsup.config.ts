@@ -33,6 +33,14 @@ export default [
       // v0.6.12 (S7-AUDIT-C7): the panel-toggle helper — same pattern (the
       // manager bundle is not node-importable; the truth table is unit-pinned).
       panelToggle: 'src/shared/panelToggle.ts',
+      // v0.6.13 (S9/DD-3, DD-18): the recall guard, the recall sanitizer, and
+      // the anchor gate — same pattern (layer.tsx/manager.tsx are not
+      // node-importable; the s6 suite pins shouldApplyRecall,
+      // sanitizeMountedView's frame neutralization, isPinnableTarget, and
+      // textQuoteGate through these standalone exports).
+      recall: 'src/shared/recall.ts',
+      snapshot: 'src/preview/snapshot.ts',
+      anchor: 'src/preview/anchor.ts',
     },
     format: ['esm'],
     platform: 'browser',

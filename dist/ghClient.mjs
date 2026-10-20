@@ -5,6 +5,7 @@ import {
   __setBakedNullRetryMsForTests,
   getGhLinkedStaticStore,
   ghClientStatus,
+  ghMappingRepo,
   legacyClientBodyCandidates,
   legacyMirrorTitle,
   mirrorIssueBody,
@@ -12,10 +13,10 @@ import {
   probeBakedGhConfig,
   probeGhConfig,
   resolveGhConfig
-} from "./chunk-NI2PFIAZ.mjs";
+} from "./chunk-23RNGYKC.mjs";
 import {
   ISSUE_BODY_LIMIT
-} from "./chunk-MHG5WIGU.mjs";
+} from "./chunk-DEMUCS72.mjs";
 export {
   GH_CLIENT_SENTINEL,
   ISSUE_BODY_LIMIT,
@@ -24,6 +25,7 @@ export {
   __setBakedNullRetryMsForTests,
   getGhLinkedStaticStore,
   ghClientStatus,
+  ghMappingRepo,
   legacyClientBodyCandidates,
   legacyMirrorTitle,
   mirrorIssueBody,

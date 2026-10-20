@@ -36,6 +36,14 @@ export function parseDotEnv(text: string): Record<string, string> {
     let value = cleaned.slice(eq + 1).trim();
     const m = value.match(/^(["'])([\s\S]*)\1$/);
     if (m) value = m[2] ?? '';
+    else {
+      // S9-a P3: unquoted inline comments — `TOKEN=xxx # note` used to keep
+      // ` # note` IN the value (a poisoned token that fails auth with a
+      // confusing message). dotenv convention: whitespace+# ends an unquoted
+      // value. Quoted values keep their # verbatim (the m branch above).
+      const hash = value.search(/\s#/);
+      if (hash >= 0) value = value.slice(0, hash).trim();
+    }
     if (key) out[key] = value;
   }
   return out;
@@ -71,11 +79,16 @@ export function loadDotEnv(configDir: string): DotEnvResult {
     const applied: string[] = [];
     for (const key of ENV_KEYS) {
       const v = parsed[key];
-      if (v && !process.env[key]) {
+      // S9-a P3: presence, not truthiness — a key that was EMPTY (or only
+      // whitespace) in .env at boot never entered bootAppliedKeys, so a
+      // later .env edit giving it a real value was invisible to reloadDotEnv
+      // forever. Empty values still apply (as '') + register, so the reload
+      // path sees the '' → 'real' transition.
+      if (v !== undefined && !process.env[key]) {
         process.env[key] = v;
-        applied.push(key);
         bootAppliedKeys.push(key); // v0.6.6 (F8): reloadDotEnv may only touch these
         envFileCache = file;
+        if (v) applied.push(key);
       }
     }
     if (applied.length) {
@@ -166,10 +179,39 @@ export function reloadDotEnv(configDir: string): ReloadDotEnvResult {
   return out;
 }
 
-/** Repo override from env (beats detection, loses to config file). */
+/** v0.6.13 (audit 44-d P2-1): GitHub's real owner/name charset — the SAME
+ *  gate at every door (the bake's normalizeGhRepoInput, ghClient's runtime
+ *  resolveGhConfig gate, heal-mirrors' usage gate). The old lax class
+ *  `/^[^/\s]+\/[^/\s]+$/` excluded only `/` and whitespace, so the npm-style
+ *  shorthand `github:octocat/widgets` passed VERBATIM with `github:octocat`
+ *  as the "owner" and armed a dead engine (every GitHub call 404s). */
+const GH_OWNER_NAME_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+/** v0.6.15 (Y3): the ONE input normalizer for every ghRepo door. owner/name
+ *  passes, github.com URL forms + the `github:` npm shorthand normalize to
+ *  owner/name, anything else → null (refused). Extracted from ghRepoEnv so
+ *  the CONFIG-FILE door (routes.ts) can share it — that door used to take
+ *  its ghRepo VERBATIM, the only ungated door of the four (env / bake /
+ *  client-runtime / config), so `"ghRepo": "github:octocat/widgets"` armed
+ *  a dead mirror whose every API call 404s. */
+export function normalizeGhRepoInput(v: string): string | null {
+  const t = v.trim();
+  if (!t) return null;
+  if (GH_OWNER_NAME_RE.test(t)) return t;
+  const parsed = parseGithubRepo(t);
+  return parsed && GH_OWNER_NAME_RE.test(parsed) ? parsed : null;
+}
+
+/** Repo override from env (beats detection, loses to config file).
+ *  v0.6.13 (audit 44-d P2-1): the value must be owner/name in GitHub's
+ *  charset, or any github URL form the parser knows (https/ssh/scp/port/
+ *  .git + the `github:` npm shorthand) — normalized to owner/name exactly
+ *  like the bake's --gh-repo door. A non-charset parser OUTPUT is rejected
+ *  too (null → the config-file/detection precedence chain continues)
+ *  instead of arming a dead mirror. */
 export function ghRepoEnv(): string | null {
   const v = process.env.ANNOTAKIT_GH_REPO;
-  return v && /^[^/\s]+\/[^/\s]+$/.test(v) ? v : null;
+  return v ? normalizeGhRepoInput(v) : null;
 }
 
 /* --------------------------------- git facts --------------------------------- */
@@ -218,10 +260,24 @@ function git(root: string, args: string[]): string | null {
   }
 }
 
-/** Parse any github remote URL form → owner/name. */
+/** Parse any github remote URL form → owner/name.
+ *  S9 parser fix (applied at BOTH doors — env.ts here and the bake script's
+ *  twin): PORT forms. `ssh://git@github.com:443/owner/name.git` (the
+ *  corporate-firewall 443 escape hatch) and `github.com:443/owner/name` used
+ *  to SILENTLY MISPARSE — the port digits were captured as the OWNER
+ *  (`443/name`), producing a repo that fails every later API call with no
+ *  hint why. The optional `(?::\d+)?` consumes the port before the owner
+ *  capture; non-numeric segments still parse as the scp-style owner (the
+ *  inherent `host:owner/name` ambiguity is unchanged).
+ *  v0.6.13 (audit 44-d P2-1): the bake twin's shorthand name class was
+ *  synced to this one (`[^/\s]+`) — the two regexes are byte-identical
+ *  again (the "kept in sync by comment contract" claim is textually true).
+ *  NOTE: the classes here exclude only `/` and whitespace — callers that
+ *  feed user input (ghRepoEnv) re-validate the OUTPUT against GitHub's
+ *  charset (GH_OWNER_NAME_RE above). */
 export function parseGithubRepo(url: string): string | null {
   const m =
-    url.match(/github\.com[/:]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?(?:[/\s?#].*)?$/i) ??
+    url.match(/github\.com(?::\d+)?[/:]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?(?:[/\s?#].*)?$/i) ??
     url.match(/^github:([^/\s]+)\/([^/\s]+)$/i);
   if (!m) return null;
   const [, owner, name] = m;

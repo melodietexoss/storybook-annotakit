@@ -12,6 +12,7 @@
 import type { ExportedStory, Thread } from '../shared/types';
 import { DIGEST_CLIP_CHARS } from '../shared/types';
 import { elementSummary } from '../shared/describe';
+import { metaLine } from '../shared/metaline'; // DD-10 (S9): the ONE source — the local copy below is gone; same budgets
 import { repoRelPath } from './env';
 
 function fmtDate(iso: string | undefined): string {
@@ -28,16 +29,10 @@ function oneLine(body: string): string {
   return body.replace(/\s+/g, ' ').trim();
 }
 
-/** Hardening C22 (H-B-09): metadata lines (element summary, css selector,
- * props, chain, story paths) are ATTACKER-INFLUENCED strings — newlines in
- * them inject fake digest/mirror structure (fake `### headings`, fake
- * `- thread id:` stamps), and unbounded length pushed the header past the
- * 60k clip so every verbatim marker was lost (H-B-02's infinite-heal loop).
- * Every metadata value is single-lined and capped before it hits a digest. */
-function metaLine(value: string, cap = 300): string {
-  const line = oneLine(String(value ?? ''));
-  return line.length > cap ? line.slice(0, cap) + '…' : line;
-}
+/** Hardening C22 (H-B-09) — v0.6.13 (S9/DD-10): the implementation moved to
+ *  shared/metaline.ts (the ONE source — the client twins rendered the same
+ *  fields raw; see that module's header for the injection class it closes).
+ *  The local oneLine/cap shape below is RETIRED; import metaLine instead. */
 
 /** First line of a body, single-line-safe for markdown headings (full mode). */
 function firstLine(body: string, n = 80): string {
@@ -88,7 +83,10 @@ function threadBlock(t: Thread, snapshotUrl?: string, full?: boolean): string[] 
     const ip = repoRelPath(t.story.importPath) ?? t.story.importPath;
     if (t.story.importPath) out.push(`- story: ${metaLine(`${t.story.title ?? ''}/${t.story.name ?? ''} (${ip})`)}`);
   }
-  out.push(`- thread id: ${t.id}`);
+  // DD-10 (S9, 33-f): the thread id is adopted verbatim from the create
+  // doors — a hostile id carried a newline + a fake `- thread id:` stamp (the
+  // exact pattern heal-mirrors keys re-push decisions on). metaLine'd.
+  out.push(`- thread id: ${metaLine(t.id)}`);
   const comp = t.component;
   if (comp) {
     if (comp.name) out.push(`- component: ${metaLine(comp.name + (comp.key ? ` (key="${comp.key}")` : ''))}`);
@@ -183,8 +181,10 @@ export function renderDigest(
     out.push(`## ${metaLine(storyTitle, 160)}`);
     out.push('');
     out.push(`story id: \`${metaLine(st.storyId, 200)}\``);
-    if (st.importPath) out.push(`story file: ${repoRelPath(st.importPath) ?? st.importPath}`);
-    if (st.componentPath) out.push(`component file: ${repoRelPath(st.componentPath) ?? st.componentPath}`);
+    // DD-10 (S9): importPath/componentPath were the LAST raw metadata lines
+    // (attacker-influenced story metadata; a newline split the digest line)
+    if (st.importPath) out.push(`story file: ${metaLine(repoRelPath(st.importPath) ?? st.importPath)}`);
+    if (st.componentPath) out.push(`component file: ${metaLine(repoRelPath(st.componentPath) ?? st.componentPath)}`);
     if (st.url) out.push(`open: ${metaLine(st.url, 300)}`);
     out.push('');
     if (s.threads.length === 0) {

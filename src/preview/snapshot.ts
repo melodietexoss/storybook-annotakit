@@ -22,8 +22,9 @@ const MARK = 'data-annota-snap';
 
 /** v0.6.10 (S6-D6): perf observability — measure pairs queryable via
  *  performance.getEntriesByName('annotakit:<name>'). Best-effort: jsdom and
- *  stripped environments have no perf timeline. A FAILED op records a
- *  `:failed` mark, never a normal-looking measure (audit B-F8). */
+ *  stripped environments have no perf timeline. A failed op simply throws
+ *  (v0.6.13/S9-DD-17c dropped the `:failed` mark variant — grep-verified no
+ *  consumer anywhere; a failed capture rethrows to its caller as before). */
 function perfMark(name: string, fn: () => void): void {
   const start = `${name}:start`;
   const end = `${name}:end`;
@@ -32,21 +33,12 @@ function perfMark(name: string, fn: () => void): void {
   } catch {
     /* no perf timeline */
   }
+  fn();
   try {
-    fn();
-    try {
-      performance.mark(end);
-      performance.measure(name, start, end);
-    } catch {
-      /* no perf timeline */
-    }
-  } catch (err) {
-    try {
-      performance.mark(`${name}:failed`);
-    } catch {
-      /* no perf timeline */
-    }
-    throw err;
+    performance.mark(end);
+    performance.measure(name, start, end);
+  } catch {
+    /* no perf timeline */
   }
 }
 
@@ -103,6 +95,12 @@ export function captureSnapshot(root: HTMLElement, pinned: HTMLElement | null): 
     capturedAt: new Date().toISOString(),
     width: Math.max(1, Math.round(rect.width)),
     height: Math.max(1, Math.round(rect.height)),
+    // v0.6.13 (S9/DD-17a): the WINDOW scroll at pin time — the SB preview
+    // document is the scroller (verified live on 10.6: body/html overflow
+    // visible, the doc overflows, #storybook-root never scrolls itself),
+    // so the story root's element scroll would always read 0,0. Recall
+    // translates this by the live window's current scroll (applyRecallScroll).
+    scroll: { x: Math.max(0, Math.round(window.scrollX || 0)), y: Math.max(0, Math.round(window.scrollY || 0)) },
   };
 }
 
@@ -125,8 +123,17 @@ export interface FrozenMount {
 }
 
 /** 90k: the server PUT caps html at 96 * 1024 (98_304) — headroom for the
- *  JSON envelope. Over-budget → the D6 ladder, never a 413. */
+ *  JSON envelope. Over-budget → the D6 ladder, never a 413.
+ * v0.6.14 (audit 54-c P1, empirically proven): measured in UTF-8 BYTES now —
+ * it used to count JS CHARS while the server counts bytes, so a frozen view
+ * with >~32k CJK chars passed the client budget (clipped:false, the ladder
+ * never ran), PUT hit the server's byte cap → 413, and the layer swallowed
+ * it: the thread silently lost its snapshot. Same unit on both sides. */
 const FROZEN_BUDGET = 90_000;
+const byteLen = (() => {
+  const enc = new TextEncoder();
+  return (s: string): number => enc.encode(s).length;
+})();
 const PORTAL_SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'TITLE', 'NOSCRIPT']);
 
 function opaqueBg(el: HTMLElement): string | null {
@@ -163,6 +170,26 @@ function cleanCloneTree(root: HTMLElement): void {
   if (root.hasAttribute('inert')) root.removeAttribute('inert');
   root.querySelectorAll('*').forEach(stripDangerousAttrs);
   stripDangerousAttrs(root);
+}
+
+/** v0.6.13 (S9/DD-17b): the frozen mount's width compensation — the
+ *  container's own classic scrollbar (overflow:auto over a taller-than-
+ *  viewport clone) re-subtracts the ~15px the live document scrollbar
+ *  already subtracted, so the clone (sized to the live width) overflows
+ *  horizontally by exactly its own scrollbar width. Widening the container
+ *  by that scrollbar gives its content area back the live width. Measured
+ *  once at mount (deficit > 0 gates it): a no-op on overlay-scrollbar
+ *  platforms, on stories that fit, and on the frozen-surface recall path
+ *  (whose stored inner fixed div carries its own compensated width inline
+ *  and is out-of-flow inside the fresh container). */
+function unsqueezeContainer(container: HTMLElement, mustFit: HTMLElement): void {
+  const deficit = mustFit.offsetWidth - container.clientWidth;
+  if (deficit <= 0) return;
+  const ownScrollbar = Math.max(0, container.offsetWidth - container.clientWidth);
+  // inset:0 keeps left:0; an explicit width wins over right:0 (over-constrained
+  // boxes resolve left+width in ltr) — the container extends under the live
+  // scrollbar strip, which is exactly the double-counted 15px back.
+  container.style.width = `${mustFit.offsetWidth + ownScrollbar}px`;
 }
 
 function buildFrozenContainer(liveRoot: HTMLElement): HTMLElement {
@@ -223,7 +250,14 @@ function captureFrozenViewInner(liveRoot: HTMLElement): FrozenMount {
   storyClone.style.position = 'absolute';
   storyClone.style.left = `${rect.left}px`;
   storyClone.style.top = `${rect.top}px`;
-  storyClone.style.width = `${Math.max(1, rect.width)}px`;
+  // v0.6.13 (S9/DD-17b): clientWidth, not rect.width. When the story ROOT
+  // itself is the scroller (layouts that scroll at the root), rect.width
+  // carries the root's own ~15px scrollbar strip into the clone — the clone
+  // never scrolls, so the strip is dead width that squeezed a horizontal
+  // scrollbar out of stories that have none live. clientWidth excludes it.
+  // Equal to rect.width in the common SB layout (the DOCUMENT scrolls; the
+  // root is borderless) — verified live. The 0-guard covers no-layout cases.
+  storyClone.style.width = `${Math.max(1, liveRoot.clientWidth || Math.round(rect.width))}px`;
   storyClone.style.height = `${Math.max(1, rect.height)}px`;
   storyClone.style.margin = '0';
 
@@ -257,6 +291,14 @@ function captureFrozenViewInner(liveRoot: HTMLElement): FrozenMount {
   container.appendChild(storyClone);
   for (const pc of portalClones) container.appendChild(pc);
   document.body.appendChild(container);
+  // v0.6.13 (S9/DD-17b): undo the scrollbar double-count — the container's
+  // own classic scrollbar re-subtracts the ~15px the LIVE document scrollbar
+  // already subtracted from the clone's width, squeezing a horizontal
+  // scrollbar out of a story that has none live (invisible on overlay-
+  // scrollbar platforms — macOS/headless — which is why automated passes
+  // missed it). Compensate by the OBSERVED deficit, never a hardcoded 15:
+  // widen the container so its content area fits the clone exactly.
+  unsqueezeContainer(container, storyClone);
 
   // 3.5 (S6-D5): dynamic-state fidelity — form values, canvas bitmaps,
   //  shadow DOM (the properties cloneNode drops). Parallel walk, live-side
@@ -463,7 +505,7 @@ function captureFrozenSnapshotInner(mount: FrozenMount, pinned: HTMLElement | nu
   }
 
   let html = temp.outerHTML;
-  if (html.length > FROZEN_BUDGET) {
+  if (byteLen(html) > FROZEN_BUDGET) {
     // rung 1: style attrs in the STORY-CLONE subtree only (descendants — the
     // clone root keeps its positioning inline styles)
     temp.querySelectorAll('[data-annota-frozen-story] *').forEach((n) => {
@@ -471,16 +513,39 @@ function captureFrozenSnapshotInner(mount: FrozenMount, pinned: HTMLElement | nu
     });
     html = temp.outerHTML;
   }
-  if (html.length > FROZEN_BUDGET) {
-    // rung 2: drop portal clones from the tail (last in document order)
-    while (html.length > FROZEN_BUDGET && temp.children.length > 1) {
-      temp.lastElementChild?.remove();
+  if (byteLen(html) > FROZEN_BUDGET) {
+    // rung 2: drop portal clones from the tail (last in document order).
+    // v0.6.14 (audit 54-c P2): NEVER drop a portal carrying the PINNED
+    // element (data-annota-snap) — the pinned context menu is typically the
+    // LAST body portal, and the tail-drop used to remove exactly the
+    // flagship evidence while clipped stayed false (an honest-looking
+    // snapshot missing its subject).
+    while (byteLen(html) > FROZEN_BUDGET && temp.children.length > 1) {
+      const last = temp.lastElementChild;
+      // v0.6.15 (55-d P2): the guard checked DESCENDANTS only — pinning the
+      // portal ROOT (the whole context-menu container, a primary portal-pin
+      // shape) fell through and dropped exactly the flagship evidence with
+      // clipped:false (empirically proven end-to-end). The marker on the
+      // ROOT itself protects the portal too.
+      if (last && (last.matches(`[${MARK}]`) || last.querySelector(`[${MARK}]`))) break; // the pinned surface stays, whatever the cost — the next rung clips honestly
+      last?.remove();
       html = temp.outerHTML;
     }
   }
   let clipped = false;
-  if (html.length > FROZEN_BUDGET) {
-    html = html.slice(0, FROZEN_BUDGET);
+  if (byteLen(html) > FROZEN_BUDGET) {
+    // v0.6.14: the terminal trim cuts whole CHARS until the BYTE budget fits
+    // (a byte-index slice could split a multibyte codepoint).
+    // v0.6.15 (55-d P3-5): …and never splits a SURROGATE PAIR (a char cut
+    // between the high and low half minted a lone surrogate — harmless but
+    // dishonest bytes; step back one more char when the cut lands mid-pair).
+    let cut = Math.floor(html.length * (FROZEN_BUDGET / byteLen(html)));
+    while (cut > 0 && byteLen(html.slice(0, cut)) > FROZEN_BUDGET) cut -= 64;
+    if (cut > 0 && cut < html.length) {
+      const before = html.charCodeAt(cut - 1);
+      if (before >= 0xd800 && before <= 0xdbff) cut -= 1; // high surrogate at the seam — drop its half
+    }
+    html = cut > 0 ? html.slice(0, cut) : '';
     clipped = true;
   }
 
@@ -492,6 +557,11 @@ function captureFrozenSnapshotInner(mount: FrozenMount, pinned: HTMLElement | nu
     width: Math.max(1, Math.round(rect.width)),
     height: Math.max(1, Math.round(rect.height)),
     surface: 'frozen',
+    // v0.6.13 (S9/DD-17a): the frozen container's OWN scroll at pin time —
+    // the post-freeze exploration delta (the freeze-time window scroll is
+    // already encoded in the clone's inline top). Applies verbatim at recall
+    // (applyRecallScroll) — restoring it literally reproduces the pinner's view.
+    scroll: { x: Math.max(0, Math.round(mount.container.scrollLeft || 0)), y: Math.max(0, Math.round(mount.container.scrollTop || 0)) },
   };
 }
 
@@ -504,10 +574,43 @@ function captureFrozenSnapshotInner(mount: FrozenMount, pinned: HTMLElement | nu
  *  value attrs strip HERE too — pre-0.6.10 stored snapshots stop re-mounting
  *  their cleartext defaults; v0.6.10 (B-F10): the handler-attr and
  *  javascript:-URL loop is the shared stripDangerousAttrs (one canonical
- *  implementation). */
+ *  implementation). v0.6.13 (S9/DD-3, 34-b amendment 3c): every iframe is
+ *  forced sandbox="" (srcdoc KEPT — see the block comment inside) and
+ *  embed/object are replaced by placeholder comments. */
 export function sanitizeMountedView(el: HTMLElement): void {
   el.querySelectorAll('[data-annota-overlay]').forEach((n) => n.remove());
   el.querySelectorAll('script').forEach((n) => n.remove());
+  // v0.6.13 (S9/DD-3, 34-b amendment 3c): frames neutralized — RECALL PATH
+  // ONLY (freeze clones the story's own live iframes by design).
+  // - sandbox="" on EVERY iframe: the frame gets a unique opaque origin, so
+  //   its scripts NEVER run (the P1 was a srcdoc iframe WITHOUT sandbox
+  //   inheriting the parent origin and executing when the container is
+  //   appended). srcdoc STAYS: a sandboxed srcdoc still RENDERS (styles,
+  //   text, images) with scripts dead — stripping it would blank every
+  //   srcdoc-rendering story while sandbox alone already secures it
+  //   (visual parity with freeze).
+  // - embed/object have no sandbox attribute — replaced by an honest
+  //   placeholder comment (un-sandboxable frame types; nothing loads).
+  // Residuals (documented): JS-driven embeds (maps, players — src or srcdoc)
+  // render dead/blank in recall while freeze still shows the live render; a
+  // CSP answer is a doc-level question, not a sanitizer one.
+  el.querySelectorAll('iframe').forEach((n) => n.setAttribute('sandbox', ''));
+  el.querySelectorAll('embed, object').forEach((n) => {
+    const doc = n.ownerDocument;
+    const parent = n.parentElement;
+    if (doc && typeof doc.createComment === 'function' && parent) {
+      try {
+        parent.replaceChild(
+          doc.createComment(` annotakit: <${n.tagName.toLowerCase()}> removed at recall — un-sandboxable frame, content neutralized `),
+          n,
+        );
+        return;
+      } catch {
+        /* fall through — plain removal */
+      }
+    }
+    n.remove();
+  });
   el.querySelectorAll('[inert]').forEach((n) => n.removeAttribute('inert'));
   if (el.hasAttribute('inert')) el.removeAttribute('inert');
   el.querySelectorAll('*').forEach(stripDangerousAttrs);
@@ -542,6 +645,10 @@ function mountRecalledViewInner(snap: DomSnapshot, liveRoot: HTMLElement): Froze
   }
   sanitizeMountedView(container);
   document.body.appendChild(container);
+  // v0.6.13 (S9/DD-17b): same compensation as the freeze mount — the recalled
+  // holder (legacy shape) sits in-flow in the fresh container and is squeezed
+  // by its own scrollbar the same way. mustFit = the resolved story view
+  // (the frozen shape's clone / the legacy shape's holder — see the chain).
 
   const storyClone =
     container.querySelector<HTMLElement>('[data-annota-frozen-story]') ??
@@ -556,5 +663,6 @@ function mountRecalledViewInner(snap: DomSnapshot, liveRoot: HTMLElement): Froze
     (c): c is HTMLElement =>
       c instanceof HTMLElement && c !== storyClone && !c.hasAttribute('data-annota-frozen'),
   );
+  unsqueezeContainer(container, storyClone);
   return { container, storyClone, portalClones, teardown: () => container.remove() };
 }

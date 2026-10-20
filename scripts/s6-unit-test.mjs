@@ -12,11 +12,57 @@
  * copyStoryLink ⌥⇧L), legacy plain-key alt fallback, and the greyed hit-test
  * refinement — including the S6-CRIT P0 regression (our own pe:none overlay
  * chrome must NEVER be a refinement candidate).
+ *
+ * v0.6.13 (S9, Batch U1): the harness's querySelectorAll became selector-aware
+ * (the sanitizer cases drive real selectors through it) and gained the
+ * attribute/mutation surface sanitizeMountedView touches. New sections: the
+ * recall in-flight guard (DD-3a), the recall sanitizer's frame neutralization
+ * (DD-3b/3c), the panel light's position-scoped rule (DD-14), the pin
+ * containment rule (DD-18b / 33-e P2-2), and the textQuote gate
+ * (DD-18c / 33-e P2-3).
+ * v0.6.13 (S9, Batch U2): parseHotkey's tolerant spellings ('alt + c' /
+ * 'alt+' — 33-f P3), the AltGraph acceptance narrowed to
+ * getModifierState('AltGraph') ONLY (33-f P3 / 34-c R5), and
+ * applyRecallScroll's two-shape contract (DD-17a: frozen verbatim, legacy
+ * translated by the live scroll, absent/malformed → untouched).
  */
 
 import assert from 'node:assert';
 
 /* ------------------------------ fake DOM ------------------------------ */
+
+/** v0.6.13 (S9): comment nodes for the sanitizer's embed/object placeholder
+ *  path — real querySelectorAll never returns them; the walk skips them. */
+class FakeComment {
+  constructor(text) {
+    this.isComment = true;
+    this.text = text;
+    this.parent = null;
+  }
+}
+
+const fakeDoc = { createComment: (text) => new FakeComment(text) };
+
+/** v0.6.13 (S9): the selector subset the sanitizer uses — comma lists of
+ *  [tag] with [attr] / [attr=value] / [attr="value"] predicates, plus '*'.
+ *  (The hittest paths only ever pass '*', which matches every element.) */
+const selPartMatches = (el, part) => {
+  if (part === '*') return true;
+  const m = /^([a-zA-Z][a-zA-Z0-9-]*)?((?:\[[^\]]+\])*)$/.exec(part);
+  if (!m) return false;
+  if (m[1] && el.tagName.toLowerCase() !== m[1].toLowerCase()) return false;
+  const attrRe = /\[([a-zA-Z-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]+)))?\]/g;
+  let am;
+  while ((am = attrRe.exec(m[2]))) {
+    const want = am[2] ?? am[3] ?? am[4];
+    if (want === undefined) {
+      if (!(am[1] in el.attrs)) return false;
+    } else if (el.attrs[am[1]] !== want) return false;
+  }
+  return true;
+};
+const selMatches = (el, rawSel) =>
+  rawSel.split(',').map((s) => s.trim()).filter(Boolean).some((part) => selPartMatches(el, part));
 
 class FakeElement {
   constructor(opts = {}) {
@@ -31,8 +77,21 @@ class FakeElement {
   }
   get id() { return this.attrs.id ?? ''; }
   get parentElement() { return this.parent; } // audit D-P2-1: hittest's depthOf walks parentElement — without this every candidate collapsed to depth 1 and the depth assertions passed VACUOUSLY
+  get ownerDocument() { return fakeDoc; } // S9: the sanitizer's placeholder path
+  /** Real-DOM shape: an iterable of {name, value} (stripDangerousAttrs). */
+  get attributes() { return Object.entries(this.attrs).map(([name, value]) => ({ name, value })); }
   hasAttribute(name) { return name in this.attrs; }
   getAttribute(name) { return this.attrs[name] ?? null; }
+  setAttribute(name, value) { this.attrs[name] = String(value); }
+  removeAttribute(name) { delete this.attrs[name]; }
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this);
+    this.parent = null;
+  }
+  replaceChild(newNode, oldNode) {
+    this.children = this.children.map((c) => (c === oldNode ? newNode : c));
+    newNode.parent = this;
+  }
   /** Real-DOM surface used by hittest: the overlay-ancestry walk. */
   closest(sel) {
     const attr = sel.match(/\[(.+)\]/)?.[1] ?? null;
@@ -51,12 +110,15 @@ class FakeElement {
     }
     return false;
   }
-  /** The gate scan + rect-walk enumerate descendants in document order. */
-  querySelectorAll() {
+  /** The gate scan + rect-walk enumerate descendants in document order.
+   *  S9: selector-aware (the sanitizer cases); '*' keeps the hittest
+   *  semantics — every ELEMENT descendant, comment nodes skipped. */
+  querySelectorAll(selector = '*') {
     const out = [];
     const walk = (n) => {
       for (const c of n.children) {
-        out.push(c);
+        if (c.isComment) continue;
+        if (selMatches(c, selector)) out.push(c);
         walk(c);
       }
     };
@@ -75,7 +137,7 @@ const withRoot = (children) => {
 const hotkeys = await import('../dist/hotkeys.mjs');
 const { DEFAULT_HOTKEYS, parseHotkey, hotkeyMatches, altMatches, hotkeyLabel } = hotkeys;
 const hittest = await import('../dist/hittest.mjs');
-const { GreyedGate, deepestGreyedAt, hitTest, inOverlay } = hittest;
+const { GreyedGate, deepestGreyedAt, hitTest, inOverlay, isPinnableTarget } = hittest;
 
 let passed = 0;
 let failed = 0;
@@ -109,6 +171,59 @@ check('parseHotkey: alt-family, plain-key-requires-alt, ?, case-insensitive', ()
   assert.deepStrictEqual(parseHotkey('?', '?'), { key: '?', alt: false });
 });
 
+check('parseHotkey (S9/U2, 33-f P3): the natural "alt + c" spelling and the "alt+" cut-off form parse — never silently-dead specs', () => {
+  // 'alt + c' used to leave key '+ c' (probe: never matched anything).
+  assert.deepStrictEqual(parseHotkey('alt + c', 'alt+c'), { key: 'c', alt: true });
+  assert.deepStrictEqual(parseHotkey('ALT + C', 'alt+c'), { key: 'c', alt: true });
+  assert.deepStrictEqual(parseHotkey('⌥ I', 'alt+i'), { key: 'i', alt: true });
+  // 'alt+' used to return the fallback VERBATIM as the key ('alt+c' — a key
+  // string that can never match). Now the FALLBACK's own key/alt shape is
+  // parsed; bare 'alt' rides the same path.
+  assert.deepStrictEqual(parseHotkey('alt+', 'alt+c'), { key: 'c', alt: true });
+  assert.deepStrictEqual(parseHotkey('alt', 'alt+i'), { key: 'i', alt: true });
+  // a degenerate fallback keeps the verbatim terminal (dead but honest).
+  assert.deepStrictEqual(parseHotkey('alt+', 'alt+'), { key: 'alt+', alt: true });
+  // the label AGREES with the parse (a working ⌥C spec must never display
+  // as '⌥+ C' — the strip is shared by construction). A key-less 'alt +'
+  // labels as '' (v0.6.13 audit 44-c P3-2: the old bare '⌥' was a chord
+  // that does not exist — parseHotkey substitutes the fallback's key at
+  // bind time); with the fallback the label shows the REAL binding.
+  assert.strictEqual(hotkeyLabel('alt + c'), '⌥C');
+  assert.strictEqual(hotkeyLabel('ALT+I'), '⌥I');
+  assert.strictEqual(hotkeyLabel('alt +'), '');
+  assert.strictEqual(hotkeyLabel('alt+', 'alt+c'), '⌥C');
+  assert.strictEqual(hotkeyLabel('alt', 'alt+i'), '⌥I');
+});
+
+check('parseHotkey degenerate specs (44-c P3-2): the default-chord substitution is LOUD and the legacy warning keeps its advice sane', () => {
+  const notes = [];
+  const origInfo = console.info;
+  console.info = (...a) => notes.push(a.join(' '));
+  try {
+    // whitespace-only: strips to '' — DEGENERATE (not a plain key), so the
+    // legacy warning stays SILENT (its "set it to alt+<raw>" advice was
+    // self-referential for this shape) and the substitution note fires.
+    assert.deepStrictEqual(parseHotkey('   ', 'alt+c'), { key: 'c', alt: true });
+    assert.deepStrictEqual(parseHotkey('alt+', 'alt+c'), { key: 'c', alt: true });
+  } finally {
+    console.info = origInfo;
+  }
+  const degenerateNotes = notes.filter((n) => n.includes('is degenerate'));
+  const legacyNotes = notes.filter((n) => n.includes('plain-key spec'));
+  assert.ok(degenerateNotes.length >= 1, 'the substitution speaks (console.info)');
+  assert.ok(degenerateNotes.every((n) => n.includes('binds the DEFAULT') && n.includes('alt+c')), `note text honest: ${degenerateNotes[0]}`);
+  assert.strictEqual(legacyNotes.length, 0, 'whitespace-only never rides the plain-key warning');
+  // dedupe: a second parse of the same spec stays quiet (once per unique spec)
+  const notes2 = [];
+  console.info = (...a) => notes2.push(a.join(' '));
+  try {
+    parseHotkey('alt+', 'alt+c');
+  } finally {
+    console.info = origInfo;
+  }
+  assert.strictEqual(notes2.filter((n) => n.includes('is degenerate')).length, 0, 'the note dedupes (the warnLegacyHotkey shape)');
+});
+
 check('hotkeyMatches: physical e.code, no ctrl/meta', () => {
   assert.ok(hotkeyMatches(kev({ code: 'KeyI', altKey: true }), { key: 'i', alt: true }));
   assert.ok(!hotkeyMatches(kev({ code: 'KeyI', altKey: true, ctrlKey: true }), { key: 'i', alt: true }));
@@ -123,6 +238,27 @@ check('S6-D3b shift guard: alt+shift+letter never matches an alt-family spec', (
   assert.ok(!hotkeyMatches(kev({ code: 'KeyL', altKey: true, shiftKey: true }), { key: 'l', alt: true }));
   // '?' is a NON-letter spec: Shift+/ (US layout) still matches.
   assert.ok(hotkeyMatches(kev({ key: '?', code: 'Slash', shiftKey: true }), { key: '?', alt: false }));
+});
+
+check('AltGraph (S9/U2, 33-f P3 as narrowed by 34-c R5): the RIGHT Alt key of Windows/Linux European layouts is a legitimate Alt — and ONLY via getModifierState', () => {
+  const spec = { key: 'c', alt: true };
+  // AltGr+C: ctrlKey+altKey AND AltGraph — the de/fr/pl/… RIGHT-Alt path
+  // (dead via the blanket ctrl guard before; left-Alt only, undocumented).
+  const altGr = (over = {}) => kev({ code: 'KeyC', altKey: true, ctrlKey: true, getModifierState: (m) => m === 'AltGraph', ...over });
+  assert.ok(hotkeyMatches(altGr(), spec), 'AltGr+C fires ⌥C');
+  // 34-c R5's narrowing: a ctrl+alt WITHOUT the AltGraph modifier stays
+  // REJECTED — Ctrl+Alt+letter is also a live OS-shortcut family (the
+  // blanket ctrlKey+altKey wording would regress the test-pinned guard).
+  assert.ok(!hotkeyMatches(kev({ code: 'KeyC', altKey: true, ctrlKey: true }), spec), 'plain Ctrl+Alt+C still rejected');
+  assert.ok(!hotkeyMatches(altGr({ ctrlKey: true, shiftKey: true }), spec), 'AltGr+Shift+C still rejected (the shift guard stays — 34-c R5)');
+  assert.ok(!hotkeyMatches(altGr({ metaKey: true }), spec), '⌘ is never part of the composition — still rejected');
+  assert.ok(!hotkeyMatches(altGr({ code: 'KeyX' }), spec), 'a different key still does not match');
+  // the legacy plain-key path delegates to hotkeyMatches first — AltGr
+  // carries there too (0.4-era configs work with the RIGHT Alt key).
+  assert.ok(altMatches(altGr(), { key: 'c', alt: true }));
+  // events WITHOUT getModifierState (old engines / the plain fake shape)
+  // degrade to the strict ctrl guard — never an accidental accept.
+  assert.ok(!hotkeyMatches(kev({ code: 'KeyC', altKey: true, ctrlKey: true }), spec));
 });
 
 check('altMatches: legacy plain-key configs respond to alt+same-key (e.code)', () => {
@@ -308,6 +444,186 @@ check('panelToggle degrade: no getSelectedPanel API → selects OURS + opens', (
   const a = rec(OURS, true, { noGetSelected: true });
   panelToggle.toggleThreadsPanel(a, OURS);
   assert.deepStrictEqual(a.calls, ['select:annotakit/panel', 'toggle:true'], 'mine defaults false → open path');
+});
+
+/* ------- v0.6.13 (S9/DD-14, 34-b 14a/14c): the panel LIGHT's shown term ------- */
+
+check('panel light: isPanelShownFromLayout — the position-scoped axis rule (14a)', () => {
+  const { isPanelShownFromLayout } = panelToggle;
+  // bottom dock (the default when panelPosition is absent)
+  assert.strictEqual(isPanelShownFromLayout({ bottomPanelHeight: 300, rightPanelWidth: 0, panelPosition: 'bottom' }), true);
+  assert.strictEqual(isPanelShownFromLayout({ bottomPanelHeight: 0, rightPanelWidth: 260, panelPosition: 'bottom' }), false, 'a right-dock axis open does not light a BOTTOM-docked panel');
+  assert.strictEqual(isPanelShownFromLayout({ bottomPanelHeight: 300 }), true, 'panelPosition absent → bottom (SB default)');
+  assert.strictEqual(isPanelShownFromLayout({ bottomPanelHeight: 0 }), false, 'bottom dock closed stays dark');
+  // right dock — the mirror image
+  assert.strictEqual(isPanelShownFromLayout({ bottomPanelHeight: 0, rightPanelWidth: 260, panelPosition: 'right' }), true);
+  assert.strictEqual(isPanelShownFromLayout({ bottomPanelHeight: 400, rightPanelWidth: 0, panelPosition: 'right' }), false, 'a bottom-dock axis open does not light a RIGHT-docked panel');
+  // both docks closed, both open
+  assert.strictEqual(isPanelShownFromLayout({ bottomPanelHeight: 0, rightPanelWidth: 0, panelPosition: 'bottom' }), false);
+  assert.strictEqual(isPanelShownFromLayout({ bottomPanelHeight: 300, rightPanelWidth: 260, panelPosition: 'right' }), true);
+  // degrade: no layout state at all → honestly not shown
+  assert.strictEqual(isPanelShownFromLayout(undefined), false);
+  assert.strictEqual(isPanelShownFromLayout({}), false);
+});
+
+check('panel light: panelShownNow — the runtime answer wins; the missing-api degrade cell is the PURE rule, never a dark lie', () => {
+  const { panelShownNow } = panelToggle;
+  assert.strictEqual(panelShownNow({ getIsPanelShown: () => true }, { bottomPanelHeight: 0 }), true, 'runtime answer wins');
+  assert.strictEqual(panelShownNow({ getIsPanelShown: () => false }, { bottomPanelHeight: 400 }), false, 'runtime answer wins both ways');
+  // the degrade cell (14a): a runtime without getIsPanelShown falls to the
+  // layout rule — "still correct", not `?? false` (a dark light is a lie
+  // about state; the TOGGLE's false-default no-op semantics do not apply).
+  assert.strictEqual(panelShownNow({}, { bottomPanelHeight: 400 }), true);
+  assert.strictEqual(panelShownNow({}, { bottomPanelHeight: 0, rightPanelWidth: 300, panelPosition: 'right' }), true);
+  assert.strictEqual(panelShownNow({}, { bottomPanelHeight: 0, rightPanelWidth: 300, panelPosition: 'bottom' }), false, 'right axis alone does not light a bottom dock');
+  assert.strictEqual(panelShownNow({}, undefined), false, 'no api + no layout → honestly not shown');
+});
+
+/* ------- v0.6.13 (S9/DD-3a): the recall in-flight guard ------- */
+
+const recall = await import('../dist/recall.mjs');
+
+check('recall guard: last-started-wins — the A-then-B overlap scenario (DD-3a)', () => {
+  const { shouldApplyRecall } = recall;
+  // i1 (token 1) and i2 (token 2) both start; i1's fetch resolves LAST.
+  // i1 is absorbed: it touches NOTHING — no teardown, no assign, no ack
+  // (it never created a mount; the winner acks for itself on BOTH exit
+  // paths — mount and honest fallback).
+  assert.strictEqual(recall.shouldApplyRecall(1, 2), false, 'i1 absorbed by i2');
+  assert.strictEqual(recall.shouldApplyRecall(2, 2), true, 'i2 (the winner) applies');
+  // no overlap: the only invocation always applies.
+  assert.strictEqual(recall.shouldApplyRecall(1, 1), true, 'a lone invocation applies');
+  // a triple overlap: only the LAST token holder applies.
+  assert.strictEqual(recall.shouldApplyRecall(2, 3), false, 'middle invocation absorbed');
+  assert.strictEqual(recall.shouldApplyRecall(1, 3), false, 'oldest invocation absorbed');
+  assert.strictEqual(recall.shouldApplyRecall(3, 3), true, 'newest invocation applies');
+});
+
+check('applyRecallScroll (S9/DD-17a): frozen surface verbatim, legacy translated by the live scroll, absent/malformed → untouched', () => {
+  const { applyRecallScroll } = recall;
+  const mk = () => ({ scrollLeft: 0, scrollTop: 0 });
+  // frozen surface: the stored children carry capture-time rects inline, so
+  // the stored container scroll applies VERBATIM (the live scroll is
+  // irrelevant — the translation would double-apply the freeze-time window
+  // scroll the clone's top already encodes).
+  const c1 = mk();
+  assert.strictEqual(applyRecallScroll({ surface: 'frozen', scroll: { x: 12, y: 340 } }, c1, { x: 500, y: 900 }), true);
+  assert.deepStrictEqual(c1, { scrollLeft: 12, scrollTop: 340 }, 'frozen: verbatim');
+  // legacy story-root shape: the holder sits at the live root's TODAY-rect,
+  // so the captured WINDOW scroll is translated by the live window's
+  // current scroll (exact when the layout matches; clamped ≥ 0).
+  const c2 = mk();
+  assert.strictEqual(applyRecallScroll({ scroll: { x: 0, y: 500 } }, c2, { x: 0, y: 180 }), true);
+  assert.deepStrictEqual(c2, { scrollLeft: 0, scrollTop: 320 }, 'legacy: captured 500 − live 180');
+  const c3 = mk();
+  assert.strictEqual(applyRecallScroll({ scroll: { x: 0, y: 90 } }, c3, { x: 0, y: 400 }), true);
+  assert.deepStrictEqual(c3, { scrollLeft: 0, scrollTop: 0 }, 'legacy: live scroll past the capture clamps to top');
+  // absent (every pre-0.6.13 snapshot) / malformed → false, untouched
+  // (today's behavior: top + the flash effect's pin centering).
+  const c4 = mk();
+  assert.strictEqual(applyRecallScroll({}, c4, { x: 0, y: 0 }), false, 'no scroll field');
+  assert.strictEqual(applyRecallScroll(null, c4, { x: 0, y: 0 }), false, 'null snap');
+  assert.strictEqual(applyRecallScroll({ scroll: { x: 'nope', y: 2 } }, c4, { x: 0, y: 0 }), false, 'malformed scroll');
+  assert.deepStrictEqual(c4, { scrollLeft: 0, scrollTop: 0 }, 'untouched on every refusal path');
+});
+
+/* ------- v0.6.13 (S9/DD-3b/3c): the recall sanitizer's frame neutralization ------- */
+
+const snapshotMod = await import('../dist/snapshot.mjs');
+
+check('sanitizer: every iframe gets sandbox="" FORCED, srcdoc KEPT (DD-3b/3c)', () => {
+  const srcdocFrame = new FakeElement({ tagName: 'IFRAME', attrs: { srcdoc: '<p>embedded story</p><script>alert(1)</' + 'script>' } });
+  const srcFrame = new FakeElement({ tagName: 'IFRAME', attrs: { src: 'https://example.test/frame' } });
+  // a pre-existing sandbox value must be forced EMPTY — allow-same-origin
+  // would defeat the whole point (the frame re-joins the parent origin).
+  const alreadySandboxed = new FakeElement({ tagName: 'IFRAME', attrs: { srcdoc: '<b>x</b>', sandbox: 'allow-same-origin' } });
+  const btn = new FakeElement({ tagName: 'BUTTON', attrs: { type: 'button' } });
+  const container = new FakeElement({ children: [srcdocFrame, srcFrame, alreadySandboxed, btn] });
+  snapshotMod.sanitizeMountedView(container);
+  assert.strictEqual(srcdocFrame.getAttribute('sandbox'), '', 'srcdoc iframe sandboxed');
+  assert.strictEqual(srcdocFrame.getAttribute('srcdoc'), '<p>embedded story</p><script>alert(1)</' + 'script>', 'srcdoc survives (visual parity — a sandboxed srcdoc still renders, scripts dead)');
+  assert.strictEqual(srcFrame.getAttribute('sandbox'), '', 'plain-src iframe sandboxed');
+  assert.strictEqual(srcFrame.getAttribute('src'), 'https://example.test/frame', 'src untouched (loads still fetch — the documented no-CSP residual)');
+  assert.strictEqual(alreadySandboxed.getAttribute('sandbox'), '', 'a pre-existing sandbox value is forced empty');
+  // siblings untouched by the frame pass
+  assert.ok(container.children.includes(btn));
+});
+
+check('sanitizer: embed/object → placeholder comments, nothing left live (DD-3b)', () => {
+  const embed = new FakeElement({ tagName: 'EMBED', attrs: { src: 'https://example.test/e.swf' } });
+  const object = new FakeElement({ tagName: 'OBJECT', attrs: { data: 'https://example.test/o.pdf' } });
+  const container = new FakeElement({ children: [embed, object] });
+  snapshotMod.sanitizeMountedView(container);
+  assert.ok(!container.children.includes(embed), 'embed gone');
+  assert.ok(!container.children.includes(object), 'object gone');
+  const comments = container.children.filter((c) => c.isComment);
+  assert.strictEqual(comments.length, 2, 'both replaced by comment placeholders');
+  assert.ok(comments.every((c) => /annotakit: <(embed|object)> removed at recall/.test(c.text)), 'honest placeholder text');
+  // comment nodes are invisible to later element walks (querySelectorAll)
+  assert.strictEqual(container.querySelectorAll('embed, object').length, 0);
+});
+
+check('sanitizer: the pre-existing neutralization passes stay intact (overlay/script/on*/javascript:/secrets/inert)', () => {
+  const ghost = new FakeElement({ attrs: { 'data-annota-overlay': '1' }, children: [new FakeElement({})] });
+  const script = new FakeElement({ tagName: 'SCRIPT' });
+  const link = new FakeElement({ tagName: 'A', attrs: { href: 'javascript:alert(1)' } });
+  const safeLink = new FakeElement({ tagName: 'A', attrs: { href: 'https://example.test/ok' } });
+  const pw = new FakeElement({ tagName: 'INPUT', attrs: { type: 'password', value: 'hunter2-super-secret' } });
+  const hidden = new FakeElement({ tagName: 'INPUT', attrs: { type: 'hidden', value: 'csrf-secret' } });
+  const inerted = new FakeElement({ attrs: { inert: '' } });
+  const onBtn = new FakeElement({ tagName: 'BUTTON', attrs: { onclick: 'alert(1)', id: 'keep-me' } });
+  const container = new FakeElement({ children: [ghost, script, link, safeLink, pw, hidden, inerted, onBtn] });
+  snapshotMod.sanitizeMountedView(container);
+  assert.ok(!container.children.includes(ghost), 'ghost overlay removed');
+  assert.ok(!container.children.includes(script), 'script removed');
+  assert.strictEqual(link.getAttribute('href'), '#', 'javascript: href neutralized');
+  assert.strictEqual(safeLink.getAttribute('href'), 'https://example.test/ok', 'a normal href is untouched');
+  assert.strictEqual(pw.getAttribute('value'), null, 'password value attr stripped (the input itself stays)');
+  assert.strictEqual(pw.getAttribute('type'), 'password');
+  assert.strictEqual(hidden.getAttribute('value'), null, 'hidden value attr stripped');
+  assert.strictEqual(inerted.hasAttribute('inert'), false, 'inert lifted');
+  assert.strictEqual(onBtn.getAttribute('onclick'), null, 'on* handler attr stripped');
+  assert.strictEqual(onBtn.getAttribute('id'), 'keep-me', 'benign attrs untouched');
+});
+
+/* ------- v0.6.13 (S9/DD-18b, 33-e P2-2): the pin containment rule ------- */
+
+check('isPinnableTarget: a strict descendant of the hit scope — never <body>, never the scope itself', () => {
+  const btn = new FakeElement({ tagName: 'BUTTON' });
+  const wrap = new FakeElement({ children: [btn] });
+  const sibling = new FakeElement({ tagName: 'ASIDE' });
+  const root = withRoot([wrap, sibling]);
+  const body = new FakeElement({ tagName: 'BODY' });
+  new FakeElement({ tagName: 'HTML', children: [body, root] }); // body/root siblings under html
+  assert.strictEqual(isPinnableTarget(btn, root), true, 'story content is pinnable');
+  assert.strictEqual(isPinnableTarget(wrap, root), true, 'a wrapper inside the scope is pinnable');
+  assert.strictEqual(isPinnableTarget(sibling, root), true, 'any in-scope element is pinnable');
+  assert.strictEqual(isPinnableTarget(body, root), false, '<body> padding is NOT a pin target (not a descendant of the story root)');
+  assert.strictEqual(isPinnableTarget(root, root), false, 'the scope itself (the frozen container on its exposed background) is NOT a pin target');
+  assert.strictEqual(isPinnableTarget(null, root), false, 'no hit → not pinnable');
+});
+
+/* ------- v0.6.13 (S9/DD-18c, 33-e P2-3): the textQuote gate ------- */
+
+const anchorMod = await import('../dist/anchor.mjs');
+
+check('textQuoteGate: same-viewport bbox agreement, cross-viewport text-alone (the portal-steal shape)', () => {
+  const { textQuoteGate, iou } = anchorMod;
+  const then = { x: 10, y: 20, w: 100, h: 40 }; // the portal pin's stored box (container-relative)
+  const samePlace = { x: 12, y: 22, w: 96, h: 38 }; // a plausible re-render at the same spot
+  const elsewhere = { x: 500, y: 400, w: 100, h: 40 }; // the story clone's same-text button — the steal
+  // same capture viewport width (within the 2px tolerance) → IoU must clear 0.3
+  assert.strictEqual(textQuoteGate(samePlace, then, 1280, 1280), true, 'in-place text match passes');
+  assert.strictEqual(textQuoteGate(elsewhere, then, 1280, 1280), false, 'an out-of-place text match is rejected (the portal pin must not jump to the clone\'s copy)');
+  assert.strictEqual(textQuoteGate(elsewhere, then, 1280, 1281), false, '1px width drift keeps the gate armed');
+  // a different viewport width (responsive relayout moved every box) → the
+  // text evidence alone carries it — today's behavior, unchanged there.
+  assert.strictEqual(textQuoteGate(elsewhere, then, 1280, 720), true, 'relayout: text alone');
+  assert.strictEqual(textQuoteGate(elsewhere, then, 720, 1280), true, 'relayout either direction');
+  // the IoU math the gate rides on, cross-checked
+  assert.ok(iou(samePlace, then) >= 0.3);
+  assert.ok(iou(elsewhere, then) < 0.3);
+  assert.strictEqual(iou(elsewhere, then), 0, 'disjoint boxes → exactly 0');
 });
 
 /* ------------------------------ total ------------------------------ */

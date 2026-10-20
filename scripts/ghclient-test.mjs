@@ -97,7 +97,7 @@ function makeFakeGH() {
     stallNext: null, // v0.6.6 (F4): {match, promise} — hold a call in-flight (lease-loss mid-flush)
   };
   const issueOut = (i) => ({
-    number: i.number, state: i.state, title: i.title, body: i.body, html_url: `https://github.com/fake/i/${i.number}`,
+    number: i.number, state: i.state, title: i.title, body: i.body, html_url: `https://github.com/${i.repo ?? 'acme/web'}/issues/${i.number}`,
     closed_at: i.closed_at ?? null, closed_by: i.closed_by ?? null, updated_at: i.updated_at,
   });
   const headers = { get: (n) => (n === 'link' ? null : null) };
@@ -105,7 +105,7 @@ function makeFakeGH() {
     const u = new URL(String(url));
     const path = u.pathname;
     const method = (init.method ?? 'GET').toUpperCase();
-    if (gh.failNext && (!gh.failNext.match || gh.failNext.match.test(path))) {
+    if (gh.failNext && (!gh.failNext.match || gh.failNext.match.test(path)) && (!gh.failNext.method || gh.failNext.method === method)) {
       const f = gh.failNext;
       // count>1 = multi-shot (the create-crash adoption check adds a listing
       // call before every create — tests that want the CREATE to fail must
@@ -114,7 +114,7 @@ function makeFakeGH() {
       else gh.failNext = null;
       return { ok: false, status: f.status, text: async () => f.body ?? '', json: async () => ({}), headers };
     }
-    if (gh.stallNext && gh.stallNext.match.test(path)) {
+    if (gh.stallNext && gh.stallNext.match.test(path) && (!gh.stallNext.method || gh.stallNext.method === method)) {
       const s = gh.stallNext;
       gh.stallNext = null;
       await s.promise;
@@ -131,7 +131,8 @@ function makeFakeGH() {
       const issue = gh.issues.get(Number(m[2]));
       if (!issue) return { ok: false, status: 404, text: async () => 'Not Found', json: async () => ({}), headers };
       const body = JSON.parse(init.body);
-      const comment = { id: gh.nextCommentId++, body: body.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), user: { login: 'storybook-annotakit' }, html_url: `https://github.com/fake/c/${gh.nextCommentId}` };
+      const now = new Date().toISOString(); // ONE instant: created_at == updated_at (the DD-8a heal's since-filter determinism)
+      const comment = { id: gh.nextCommentId++, body: body.body, created_at: now, updated_at: now, user: { login: 'storybook-annotakit' }, html_url: `https://github.com/fake/c/${gh.nextCommentId}` };
       issue.comments.push(comment);
       issue.updated_at = new Date().toISOString();
       return { ok: true, status: 201, json: async () => comment, headers };
@@ -141,7 +142,7 @@ function makeFakeGH() {
     if (m && method === 'GET') {
       const issue = gh.issues.get(Number(m[2]));
       const since = u.searchParams.get('since');
-      const out = since ? issue.comments.filter((c) => c.created_at > since) : issue.comments;
+      const out = since ? issue.comments.filter((c) => String(c.updated_at ?? c.created_at ?? '') >= since) : issue.comments; // real GitHub: since is INCLUSIVE on updated_at
       return { ok: true, status: 200, json: async () => out, headers };
     }
     // PATCH /repos/:repo/issues/:n — state flip and/or title/body edit
@@ -176,6 +177,7 @@ function makeFakeGH() {
       const body = JSON.parse(init.body);
       const issue = {
         number: gh.nextNumber++, state: 'open', title: body.title, body: body.body, labels: body.labels ?? [],
+        repo: m[1], // DD-21: the fake records WHICH repo the issue lives on (html_url carries it — the mapping repo-identity derivation)
         comments: [], updated_at: new Date().toISOString(), closed_at: null, closed_by: null,
       };
       gh.issues.set(issue.number, issue);
@@ -291,6 +293,14 @@ const ghc = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotaki
   ok('disabled kills config', ghc.resolveGhConfig({ token: 't', repo: 'a/b' }, { disabled: true }) === null);
   ok('invalid repo rejected', ghc.resolveGhConfig({ token: 't', repo: 'no-slash' }, {}) === null);
   ok('no token rejected', ghc.resolveGhConfig({ repo: 'a/b' }, {}) === null);
+  // v0.6.13 (audit 44-d P2-1): the runtime gate is GitHub's real charset —
+  // the npm-style shorthand used to pass the old lax class VERBATIM
+  // (`github:octocat` as the "owner") and arm a dead mirror (every GitHub
+  // call 404s). Refused = honestly unconfigured.
+  ok('44-d P2-1: github: shorthand REJECTED by the runtime gate', ghc.resolveGhConfig({ token: 't', repo: 'github:octocat/widgets' }, {}) === null);
+  ok('44-d P2-1: colon-owner REJECTED', ghc.resolveGhConfig({ token: 't', repo: 'gh:octocat/widgets' }, {}) === null);
+  ok('44-d P2-1: 3-segment REJECTED', ghc.resolveGhConfig({ token: 't', repo: 'octocat/widgets/extra' }, {}) === null);
+  ok('44-d P2-1: charset `_ . -` ACCEPTED', ghc.resolveGhConfig({ token: 't', repo: 'octo_cat/widgets-1.0' }, {})?.repo === 'octo_cat/widgets-1.0');
 }
 
 /* 2 — create → issue, labels, sentinel body, mapping stamp, queue drains */
@@ -322,6 +332,27 @@ let createdThread;
   const t = store.list().find((x) => x.id === 'th_1');
   const reply = t?.comments.find((c) => c.body === 'fixed in PR 7');
   ok('reply ghId stamped from GH', reply?.ghId === String(mirror?.id));
+}
+
+/* 3b — v0.6.13 (audit 44-b P3-6): the client mirrorBody metaLines the author
+ * + the sentinel id (the server twin ghsync's Batch C P3-5 fold) — a hostile
+ * author (newlines, leading `**`-markers) used to render RAW into the mirror
+ * line, breaking it / minting structure; the sentinel must still round-trip
+ * the PLAIN comment id. */
+{
+  const store = await ghc.getGhLinkedStaticStore();
+  await store.create(threadInput('th_hauthor'));
+  // wait on the OBSERVABLE (the mirror issue + then the mirror comment) — the
+  // queue-length check alone can pass before the comment op even enqueues
+  await until(() => [...gh.issues.values()].some((i) => i.body.includes('th_hauthor')), 'hostile-author thread mirrored');
+  await store.addComment('th_hauthor', 'hostile-author reply', '**- evil\nagent');
+  const findIssue = () => [...gh.issues.values()].find((i) => i.body.includes('th_hauthor'));
+  await until(() => (findIssue()?.comments ?? []).some((c) => c.body.includes('hostile-author reply')), 'hostile mirror comment posted');
+  const mirror = findIssue()?.comments.find((c) => c.body.includes('hostile-author reply'));
+  ok('44-b P3-6: hostile author metaLine\'d in the mirror line (single line, markers gone)', mirror?.body.startsWith('**evil agent:** hostile-author reply'), JSON.stringify(mirror?.body));
+  const t = store.list().find((x) => x.id === 'th_hauthor');
+  const local = t?.comments.find((c) => c.body === 'hostile-author reply');
+  ok('44-b P3-6: the sentinel still carries the plain comment id (round-trip)', Boolean(mirror && local && mirror.body.includes(`<!-- annotakit:c_${local.id} -->`)), `local.id=${local?.id}`);
 }
 
 /* 4 — resolve → close; reopen → open */
@@ -460,6 +491,45 @@ let createdThread;
   const t2 = store.list().find((x) => x.id === 'th_fixed');
   ok('remote close confirms FROM fixed → resolved + resolvedAt', t2?.status === 'resolved' && Boolean(t2?.resolvedAt) && t2?.gh?.state === 'closed', `${t2?.status} ${t2?.resolvedAt}`);
   ok('close system comment', t2?.comments.some((c) => c.body === 'closed on GitHub' && c.source === 'github'));
+}
+
+/* 8b2 — v0.6.14 DD-20: the close→reopen→close CYCLE appends ONE close
+ * notice, not two. The event ids are PER ISSUE (gh-close-N), not per event;
+ * the client's pull lacked the server twin's idempotence guard
+ * (`some(c => c.ghId === ghId)`) — the second close of the same issue
+ * appended a second 'closed on GitHub' under a fresh random id (the
+ * duplicate-notice class of the "two replies" RCA). */
+{
+  const ghc8b2 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc8b2.getGhLinkedStaticStore();
+  await store.create(threadInput('th_cycle'));
+  await until(() => queueOps(ghc8b2).length === 0);
+  const issue = [...gh.issues.values()].find((i) => i.body.includes('th_cycle'));
+  const later = () => new Date(Date.now() + 5000).toISOString();
+  // close #1
+  issue.state = 'closed';
+  issue.closed_at = later();
+  issue.closed_by = { login: 'human' };
+  issue.updated_at = later();
+  await store.gh?.syncNow();
+  const t1 = store.list().find((x) => x.id === 'th_cycle');
+  ok('cycle: close #1 resolves + one notice', t1?.status === 'resolved' && t1.comments.filter((c) => c.body === 'closed on GitHub').length === 1, `n=${t1?.comments.filter((c) => c.body === 'closed on GitHub').length}`);
+  // reopen
+  issue.state = 'open';
+  issue.updated_at = later();
+  await store.gh?.syncNow();
+  const t2 = store.list().find((x) => x.id === 'th_cycle');
+  ok('cycle: reopen lands open + the event', t2?.status === 'open' && Boolean(t2?.reopenedAt) && t2.comments.filter((c) => c.body === 'reopened on GitHub').length === 1);
+  // close #2 — the SAME gh-close-N id must NOT append a second notice
+  issue.state = 'closed';
+  issue.closed_at = later();
+  issue.closed_by = { login: 'human' };
+  issue.updated_at = later();
+  await store.gh?.syncNow();
+  const t3 = store.list().find((x) => x.id === 'th_cycle');
+  const closes = t3.comments.filter((c) => c.body === 'closed on GitHub');
+  ok('cycle: close #2 appends NO second close notice (DD-20 guard)', closes.length === 1, `n=${closes.length}`);
+  ok('cycle: the second close still resolves', t3.status === 'resolved');
 }
 
 /* 8c — v0.6.11/v0.6.12: the rejected notice mirrors through the CLIENT
@@ -780,7 +850,8 @@ let createdThread;
   const oldTitle = ghc19.legacyMirrorTitle(own);
   ok('setup: legacy builder produced a stamped, marker-free body', oldBody.includes('- thread id: th_heal') && !oldBody.includes('(verbatim):**') && oldTitle.length <= 100, oldTitle);
   const headline = (s) => s.replace(/\s+/g, ' ').trim();
-  const wantTitle = `[review] primary — #${own.number} ${headline(fullBody).slice(0, 100)}`.slice(0, 160);
+  // DD-10 (S9): metaLine'd titles clip with the honest `…` (the old inline form sliced without one)
+  const wantTitle = `[review] primary — #${own.number} ${headline(fullBody).slice(0, 100)}…`.slice(0, 160);
   issue.title = oldTitle;
   issue.body = oldBody;
   await store.gh?.syncNow(); // flush (empty) + pull → heal
@@ -818,7 +889,7 @@ let createdThread;
   const own = store.list().find((x) => x.id === 'th_park');
   const issue = gh.issues.get(own?.gh?.issue ?? 0);
   // force a 422 on the next comment push (body rejection)
-  gh.failNext = { match: /\/comments$/, status: 422, body: 'body is invalid' };
+  gh.failNext = { match: /\/comments$/, method: 'POST', status: 422, body: 'body is invalid' }; // DD-8a added a GET listing on the same path — method-scoped so the one-shot hits the PUSH, not the heal listing
   await store.addComment('th_park', 'a reply GitHub will reject once', 'reviewer');
   await until(() => queueOps(ghc20).some((o) => o.parked), 'op parked after 422');
   const st1 = store.gh?.status();
@@ -1029,7 +1100,7 @@ let createdThread;
   ok('both replies queued while paused', queueOps(ghc27).some((o) => o.kind === 'sync' && o.threadId === 'th_midflush'));
   // stall the FIRST comment POST; while in-flight another tab takes the lease
   let release;
-  gh.stallNext = { match: /\/comments$/, promise: new Promise((r) => (release = r)) };
+  gh.stallNext = { match: /\/comments$/, method: 'POST', promise: new Promise((r) => (release = r)) }; // DD-8a added a GET listing on the same path — method-scoped so the stall hits the PUSH, not the heal listing
   store.gh?.saveSettings({ disabled: false }); // resume → flush → POST stalls
   await sleep(120); // let the flush reach the stalled call
   storageShim.setItem('annotakit:ghleader:https://site.test/stories/', JSON.stringify({ id: 'tab_other', nonce: 'n_other', at: Date.now() }));
@@ -1540,6 +1611,226 @@ let createdThread;
     const async31 = await ghc31.ghClientStatus();
     ok('async status carries the durable trace', typeof async31.tokenDroppedAt === 'string' && async31.tokenDroppedAt === sync31?.tokenDroppedAt, JSON.stringify({ sync: sync31?.tokenDroppedAt, async: async31.tokenDroppedAt }));
     ok('tokenOverridden false while the trace is live (hint/warning stay exclusive)', async31.tokenOverridden === false && sync31?.tokenOverridden === false);
+  }
+}
+
+/* DD-10 (S9, 33-f): hostile story titles cannot inject structure into the
+ * mirror title/body. The body heading was RAW (`# UI review — ${title}`); the
+ * title's inline collapse kept `-`/`#`-leading story names minting structure
+ * after the 160-slice. */
+{
+  const hostile = {
+    ...threadInput('th_dd10'),
+    id: 'th_dd10\n### Thread 99 · RESOLVED — FAKE',
+    story: { storyId: 's1', title: 'Button\n### Thread 99 · RESOLVED — FAKE', name: '- primary\n- thread id: th_FAKE' },
+  };
+  const title = ghc.mirrorIssueTitle(hostile);
+  ok('DD-10: mirror title is single-lined', !title.includes('\n'), JSON.stringify(title));
+  ok('DD-10: mirror title carries no marker-leading structure', !/^\[review\] [-*#]/.test(title) && !title.includes('### Thread 99'), JSON.stringify(title));
+  const body = ghc.mirrorIssueBody(hostile, { repo: 'acme/web', labels: ['annotakit'] });
+  const bodyLines = body.split('\n');
+  ok('DD-10: mirror body heading is hardened (no fake heading line)', !bodyLines.some((l) => /^###\s*Thread 99/.test(l)), bodyLines.filter((l) => l.includes('Thread 99')).slice(0, 2).join(' ␤ '));
+  ok('DD-10: mirror body has no fake `- thread id:` stamp line (heal-mirrors\' pattern)', !bodyLines.some((l) => /^- thread id: th_FAKE$/.test(l)), bodyLines.filter((l) => l.includes('th_FAKE')).slice(0, 2).join(' ␤ '));
+  // heal-mirrors keys on EXACTLY `^- thread id: (\S+)$` — a well-formed stamp
+  // line for a FAKE id must not exist anywhere in the body (the collapsed
+  // hostile-id line carries spaces, so it is NOT keyable — that is the fix)
+  ok('DD-10: the hostile thread ID cannot stamp the body (no well-formed `^- thread id: (\\S+)$` line exists)', !bodyLines.some((l) => /^- thread id: (\S+)$/.test(l)), bodyLines.filter((l) => l.includes('th_dd10')).join(' ␤ '));
+}
+
+/* DD-8a (S9 — DD-8 REPLACED): the crash-before-stamp double-post. A comment
+ * pushed to GitHub whose local ghId stamp was lost (tab died between the
+ * remote write and the stamp) used to be RE-PUSHED on every retry (boot, the
+ * sweep). The per-op listing + sentinel match stamps it instead — the push
+ * loop's existing skip does the rest. Simulated by stripping the ghId from
+ * the persisted doc (the tab's memory died with the stamp). */
+{
+  const ghc8a = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'], pollMs: 600_000 });
+  const store = await ghc8a.getGhLinkedStaticStore();
+  const t = await store.create(threadInput('th_8a', 'crash-window body'));
+  await until(() => queueOps(ghc8a).length === 0, 'mirror created');
+  await store.addComment('th_8a', 'the reply that will crash-before-stamp', 'reviewer');
+  await until(() => queueOps(ghc8a).length === 0, 'reply pushed + stamped');
+  const row = store.list().find((x) => x.id === 'th_8a');
+  const num = row?.gh?.issue;
+  const remoteCountBefore = (gh.issues.get(num)?.comments ?? []).length;
+  ok('8a setup: the reply landed + got its ghId stamp', remoteCountBefore === 1 && Boolean(row?.comments.find((c) => c.body.includes('crash-before-stamp'))?.ghId), `remote=${remoteCountBefore} ghId=${row?.comments.find((c) => c.body.includes('crash-before-stamp'))?.ghId}`);
+  // simulate the crash: strip the ghId from the PERSISTED doc (memory died)
+  const key = 'annotakit:static:https://site.test/stories/';
+  const doc = JSON.parse(storageShim.getItem(key));
+  const th = doc.threads.find((x) => x.id === 'th_8a');
+  const target = th.comments.find((c) => c.body.includes('crash-before-stamp'));
+  const hadGhId = target.ghId;
+  delete target.ghId;
+  storageShim.setItem(key, JSON.stringify(doc));
+  store.reloadFromPersisted(); // the tab "reboots" with the un-stamped copy
+  ok('8a setup: the stamp is gone from the store', !store.list().find((x) => x.id === 'th_8a')?.comments.find((c) => c.body.includes('crash-before-stamp'))?.ghId);
+  // the re-flush that used to DOUBLE-POST: a NEW mutation re-enqueues the op
+  // (the real crash's op was still queued/retried — the steady-state shape)
+  const postsBefore = gh.calls.filter((c) => c.method === 'POST' && /\/comments$/.test(c.path ?? '')).length;
+  await store.addComment('th_8a', 'the reply that follows the crash', 'reviewer');
+  await until(() => queueOps(ghc8a).length === 0, 'flush settled');
+  await sleep(200);
+  const postsAfter = gh.calls.filter((c) => c.method === 'POST' && /\/comments$/.test(c.path ?? '')).length;
+  const row2 = store.list().find((x) => x.id === 'th_8a');
+  const restamped = row2?.comments.find((c) => c.body.includes('crash-before-stamp'))?.ghId;
+  const remoteNow = (gh.issues.get(num)?.comments ?? []).length;
+  const dupBodies = (gh.issues.get(num)?.comments ?? []).filter((c) => c.body.includes('crash-before-stamp')).length;
+  ok('8a: NO duplicate of the crashed comment (exactly ONE remote copy)', dupBodies === 1 && remoteNow === remoteCountBefore + 1, `remote ${remoteCountBefore}->${remoteNow} copies-of-crashed=${dupBodies}`);
+  ok('8a: only the NEW reply was pushed (one POST for two un-stamped comments)', postsAfter === postsBefore + 1, `posts ${postsBefore}->${postsAfter}`);
+  ok('8a: the local comment got its ghId RESTAMPED from the sentinel', restamped === hadGhId, `restamped=${JSON.stringify(restamped)} want=${JSON.stringify(hadGhId)}`);
+}
+
+/* DD-7 (S9, 33-h P1): a CLOSE op hitting 404 — the issue already deleted on
+ * GitHub — is retired with a parked note instead of retrying forever. */
+{
+  const ghc7 = await fresh({ token: 'tok_AAA', repo: 'acme/web', labels: ['annotakit'], pollMs: 600_000 });
+  const store = await ghc7.getGhLinkedStaticStore();
+  const t = await store.create(threadInput('th_dd7', 'close-404 body'));
+  await until(() => queueOps(ghc7).length === 0, 'mirror created');
+  const row = store.list().find((x) => x.id === 'th_dd7');
+  const num = row?.gh?.issue;
+  await store.deleteThread('th_dd7'); // the close op
+  gh.issues.delete(num); // a human deletes the issue on GitHub BEFORE the close lands
+  await until(() => queueOps(ghc7).length === 0, 'close op settled');
+  await sleep(300); // the 404 verify + removeOp
+  const st = store.gh?.status();
+  ok('DD-7: the close op is RETIRED (not parked, not retrying)', (st?.parked ?? 1) === 0 && queueOps(ghc7).filter((o) => o.kind === 'close').length === 0, `parked=${st?.parked} closeOps=${JSON.stringify(queueOps(ghc7))}`);
+  ok('DD-7: the parked note names the skip', Boolean(st?.lastError?.includes('close skipped')), st?.lastError?.slice(0, 80));
+}
+
+/* 34 — v0.6.15 (DD-21): gh mappings carry REPO identity — the settings
+ * repo re-point class (55-c P2, empirically proven cross-repo contamination
+ * pre-fix). A mapping on another repo is DETACHED: pull skips it, push parks
+ * (not retires), delete parks the close, the status names it, and a repo
+ * RESTORE resumes the parked ops on the ORIGINAL issue. Plus the legacy
+ * url-derivation and the unstamped verify-and-stamp. */
+{
+  // (a) the re-point: mint on acme/web → re-point to acme/other
+  const ghc34 = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  const store = await ghc34.getGhLinkedStaticStore();
+  const t34 = await store.create(threadInput('th_dd21a'));
+  await until(() => queueOps(ghc34).length === 0, 'mint flushed');
+  const issueNo = store.list().find((x) => x.id === 'th_dd21a')?.gh?.issue;
+  ok('34a minted on acme/web with repo stamped', store.list().find((x) => x.id === 'th_dd21a')?.gh?.repo === 'acme/web');
+
+  store.gh?.saveSettings({ repo: 'acme/other' }); // the re-point
+  await store.gh?.syncNow();
+  await sleep(300);
+  const st34 = store.gh?.status();
+  ok('34b the re-pointed mapping reads DETACHED in status', st34?.detached === 1, JSON.stringify({ detached: st34?.detached, detachedParked: st34?.detachedParked }));
+
+  // (b) a REPLY on the detached thread must NOT comment on the foreign repo's
+  //     same-numbered issue — the op parks instead
+  await store.addComment('th_dd21a', 'detached reply must not land', 'agent');
+  await sleep(400);
+  const parkedSync = queueOps(ghc34).find((o) => o.kind === 'sync' && o.threadId === 'th_dd21a');
+  ok('34c the detached sync op PARKS (park-not-retire)', parkedSync?.parked === true && parkedSync?.parkReason === 'detached', JSON.stringify(parkedSync).slice(0, 120));
+  const noComment = !gh.calls.some((c) => c.method === 'POST' && /\/issues\/\d+\/comments$/.test(c.path) && c.body?.body?.includes('detached reply must not land'));
+  ok('34d no comment POST hit the foreign issue', noComment);
+
+  // (c) a DELETE must park the close — never close the foreign same-numbered issue
+  await store.deleteThread('th_dd21a');
+  await sleep(400);
+  const closeOp = queueOps(ghc34).find((o) => o.kind === 'close' && o.issue === issueNo);
+  ok('34e the close op carries the mapping repo + victim id', closeOp?.repo === 'acme/web' && closeOp?.threadId === 'th_dd21a', JSON.stringify(closeOp).slice(0, 120));
+  ok('34f the close op is PARKED (foreign target)', closeOp?.parked === true && closeOp?.parkReason === 'detached');
+  const noClose = !gh.calls.some((c) => c.method === 'PATCH' && c.path === `/repos/acme/other/issues/${issueNo}`);
+  ok('34g no PATCH hit the foreign repo issue', noClose);
+  ok('34h the original issue is still open', gh.issues.get(issueNo ?? -1)?.state === 'open');
+
+  // (d) a repo RESTORE un-parks — the deferred close lands on the ORIGINAL issue
+  store.gh?.saveSettings({ repo: 'acme/web' });
+  await until(() => queueOps(ghc34).length === 0, 'restored ops drained', 200);
+  ok('34i the restored close landed on the ORIGINAL issue', gh.issues.get(issueNo ?? -1)?.state === 'closed');
+  const noForeignClose = !gh.calls.some((c) => c.method === 'PATCH' && c.path === `/repos/acme/other/issues/${issueNo}`);
+  ok('34j the foreign repo issue was never touched', noForeignClose);
+
+  // (e) legacy url-derivation: an unstamped mapping whose url says another repo
+  //     is detached with ZERO network calls
+  const ghc34e = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  {
+    const storeE = await ghc34e.getGhLinkedStaticStore();
+    await storeE.create(threadInput('th_dd21leg'));
+    const key = 'annotakit:static:https://site.test/stories/';
+    const doc = JSON.parse(storageShim._dump()[key]);
+    const th = doc.threads.find((x) => x.id === 'th_dd21leg');
+    if (th) {
+      th.gh = { issue: 55, url: 'https://github.com/legacy/old/issues/55', state: 'open', syncedAt: new Date().toISOString() };
+      storageShim.setItem(key, JSON.stringify(doc));
+    }
+    const ghc34e2 = await reload({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const storeE2 = await ghc34e2.getGhLinkedStaticStore();
+    gh.calls.length = 0;
+    await storeE2.gh?.syncNow();
+    await sleep(300);
+    ok('34k legacy url-derived mapping reads DETACHED', storeE2.gh?.status()?.detached === 1, JSON.stringify(storeE2.gh?.status()?.detached));
+    const noIssue55 = !gh.calls.some((c) => c.path.includes('/issues/55'));
+    ok('34l zero network calls against the detached issue', noIssue55, JSON.stringify(gh.calls.map((c) => c.method + ' ' + c.path)).slice(0, 160));
+  }
+
+  // (f) unstamped + no url → verify-and-stamp: body stamp matches → STAMPED + active
+  const ghc34f = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  {
+    const storeF = await ghc34f.getGhLinkedStaticStore();
+    await storeF.create(threadInput('th_dd21ver'));
+    gh.issues.set(77, { number: 77, state: 'open', title: 'x', body: 'UI review\n\n- thread id: th_dd21ver\n', labels: ['annotakit'], repo: 'acme/web', comments: [], updated_at: new Date().toISOString(), closed_at: null, closed_by: null });
+    const key = 'annotakit:static:https://site.test/stories/';
+    const doc = JSON.parse(storageShim._dump()[key]);
+    const th = doc.threads.find((x) => x.id === 'th_dd21ver');
+    if (th) {
+      th.gh = { issue: 77, state: 'open', syncedAt: new Date().toISOString() }; // NO repo, NO url
+      storageShim.setItem(key, JSON.stringify(doc));
+    }
+    const ghc34f2 = await reload({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const storeF2 = await ghc34f2.getGhLinkedStaticStore();
+    await storeF2.gh?.syncNow();
+    await sleep(300);
+    ok('34m verify-and-stamp stamped the active repo', storeF2.list().find((x) => x.id === 'th_dd21ver')?.gh?.repo === 'acme/web');
+    ok('34n a verified mapping is NOT detached', (storeF2.gh?.status()?.detached ?? 0) === 0);
+  }
+
+  // (g) unstamped + no url + the body stamp is ANOTHER thread's → detached, no writes
+  const ghc34g = await fresh({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+  {
+    const storeG = await ghc34g.getGhLinkedStaticStore();
+    await storeG.create(threadInput('th_dd21mis'));
+    gh.issues.set(88, { number: 88, state: 'open', title: 'x', body: '- thread id: SOMEONE_ELSE\n', labels: ['annotakit'], repo: 'acme/web', comments: [], updated_at: new Date().toISOString(), closed_at: null, closed_by: null });
+    const key = 'annotakit:static:https://site.test/stories/';
+    const doc = JSON.parse(storageShim._dump()[key]);
+    const th = doc.threads.find((x) => x.id === 'th_dd21mis');
+    if (th) {
+      th.gh = { issue: 88, state: 'open', syncedAt: new Date().toISOString() };
+      storageShim.setItem(key, JSON.stringify(doc));
+    }
+    const ghc34g2 = await reload({ token: 'tok_AAA', repo: 'acme/web', pollMs: 600_000 });
+    const storeG2 = await ghc34g2.getGhLinkedStaticStore();
+    await storeG2.gh?.syncNow();
+    await sleep(300);
+    ok('34o a mismatched body stamp → detached (never assume)', storeG2.gh?.status()?.detached === 1);
+    ok('34p no writes ever hit the mismatched issue', !gh.calls.some((c) => c.method !== 'GET' && c.path.includes('/issues/88')));
+  }
+
+  // (h) orphan-exclusion (amendment 5): a DETACHED mapping must not reserve
+  //     its issue number on the NEW repo — a genuine orphan gets adopted
+  const ghc34h = await fresh({ token: 'tok_AAA', repo: 'acme/other', pollMs: 600_000 });
+  {
+    const storeH = await ghc34h.getGhLinkedStaticStore();
+    await storeH.create(threadInput('th_dd21orph')); // unmapped thread
+    // plant the orphan: issue #201 on acme/other with OUR thread's stamp,
+    // AND a detached mapping (url says acme/web) that "reserves" #201
+    gh.issues.set(201, { number: 201, state: 'open', title: 'x', body: '- thread id: th_dd21orph\n', labels: ['annotakit'], repo: 'acme/other', comments: [], updated_at: new Date().toISOString(), closed_at: null, closed_by: null });
+    const key = 'annotakit:static:https://site.test/stories/';
+    const doc = JSON.parse(storageShim._dump()[key]);
+    const th = doc.threads.find((x) => x.id === 'th_dd21orph');
+    if (th) {
+      th.gh = { issue: 201, url: 'https://github.com/acme/web/issues/201', state: 'open', syncedAt: new Date().toISOString() };
+      storageShim.setItem(key, JSON.stringify(doc));
+    }
+    const ghc34h2 = await reload({ token: 'tok_AAA', repo: 'acme/other', pollMs: 600_000 });
+    const storeH2 = await ghc34h2.getGhLinkedStaticStore();
+    await storeH2.gh?.syncNow(); // the pull skips the detached mapping; the sync op adopts the orphan
+    await sleep(400);
+    ok('34q the detached mapping was NOT unlinked by the pull (no 404-flow)', storeH2.list().find((x) => x.id === 'th_dd21orph')?.gh?.url?.includes('acme/web') === true);
   }
 }
 

@@ -45,6 +45,11 @@ const warnedLegacyKeys = new Set<string>();
 function warnLegacyHotkey(userSpec: string | undefined, raw: string, withAlt: boolean): void {
   if (!userSpec || withAlt) return; // only user-provided plain-key specs
   if (raw === '?') return; // the help key is legitimately a plain key
+  // v0.6.13 (audit 44-c P3-2): a whitespace-only spec strips to '' — it is
+  // DEGENERATE, not a plain key, and this warning's "set it to alt+<raw>"
+  // advice was self-referential garbage ("set … to 'alt+'"). The
+  // substitution note in parseHotkey covers it.
+  if (!raw) return;
   if (warnedLegacyKeys.has(raw)) return;
   warnedLegacyKeys.add(raw);
   console.info(
@@ -52,15 +57,52 @@ function warnLegacyHotkey(userSpec: string | undefined, raw: string, withAlt: bo
   );
 }
 
+/** v0.6.13 (audit 44-c P3-2): a degenerate spec ('alt+', bare 'alt',
+ *  whitespace-only) silently ACTIVATES the default chord — the substitution
+ *  used to be invisible while hotkeyLabel showed a nonexistent bare '⌥'.
+ *  One honest console.info per unique spec (the warnLegacyHotkey shape). */
+const warnedDegenerateKeys = new Set<string>();
+function noteDegenerateHotkey(userSpec: string | undefined, raw: string, fbKey: string, fbAlt: boolean): void {
+  if (!userSpec) return; // the default map itself being degenerate is a config bug, not an operator's
+  if (warnedDegenerateKeys.has(raw)) return;
+  warnedDegenerateKeys.add(raw);
+  const chord = `${fbAlt ? '⌥' : ''}${fbKey.length === 1 ? fbKey.toUpperCase() : fbKey}`;
+  console.info(
+    `[storybook-annotakit] hotkey "${userSpec}" is degenerate (no key after the alt prefix / nothing but whitespace) — it now binds the DEFAULT ${chord}. Set parameters.annotakit.hotkeys to a full spec like "${fbAlt ? 'alt+' : ''}${fbKey}" to make the binding explicit.`,
+  );
+}
+
 export function parseHotkey(spec: string | undefined, fallback: string): HotkeySpec {
-  const raw = (spec || fallback).trim().toLowerCase();
+  // v0.6.13 (S9/U2, 33-f P3): ALL whitespace is stripped BEFORE parsing —
+  // the natural 'alt + c' spelling used to leave key '+ c' (a silently-dead
+  // spec that never matched anything; probe-reproduced). hotkeyLabel strips
+  // the same way so a WORKING ⌥C spec can never display as '⌥+ C'.
+  const raw = (spec || fallback).trim().toLowerCase().replace(/\s+/g, '');
   // NOTE: the '+' MUST be part of the prefix match (optionally consumed) —
   // alternation like `alt|alt\+` lets bare `alt` win and leaves key='+c'
   // (live-browser-verified bug: default 'alt+c' never matched KeyC).
-  const altPrefix = /^(?:alt|option|opt|⌥)\+?\s*/;
+  const altPrefix = /^(?:alt|option|opt|⌥)\+?/;
   const withAlt = altPrefix.test(raw);
   warnLegacyHotkey(spec, raw, withAlt);
   const key = raw.replace(altPrefix, '');
+  // v0.6.13 (S9/U2, 33-f P3): 'alt+' (or bare 'alt') — no key after the
+  // prefix. The old `key || fallback` returned the fallback string VERBATIM
+  // as the key ('alt+c' as a key — unmatchable, no warning). Parse the
+  // FALLBACK's own key/alt shape instead; a degenerate fallback ('alt+' on
+  // both sides) falls through to the verbatim terminal — dead but honest.
+  if (!key) {
+    const fbRaw = (fallback || '').trim().toLowerCase().replace(/\s+/g, '');
+    const fbAlt = altPrefix.test(fbRaw);
+    const fbKey = fbRaw.replace(altPrefix, '');
+    if (fbKey) {
+      const fbCollidable = !fbAlt && /^[a-z0-9]$/.test(fbKey);
+      // v0.6.13 (audit 44-c P3-2): the substitution is no longer SILENT — a
+      // spec that used to mean "dead" now activates the default chord; say
+      // so once (the label side is hotkeyLabel's fallback param).
+      noteDegenerateHotkey(spec, raw, fbKey, fbAlt || fbCollidable);
+      return { key: fbKey, alt: fbAlt || fbCollidable };
+    }
+  }
   // v0.6.7 (audit P1): a collidable plain key (letter/digit — NOT the '?'
   // help key, NOT alt-prefixed defaults) requires Alt for real — the legacy
   // remap the warning promises. The explicit `alt+<key>` spelling remains
@@ -81,12 +123,22 @@ export function hotkeyMatches(e: KeyboardEvent, spec: HotkeySpec): boolean {
   const isLetterSpec = isLetterSpecKey(spec.key);
   const keyOk = isLetterSpec ? codeKey === spec.key : e.key.toLowerCase() === spec.key;
   if (!keyOk) return false;
-  if (e.ctrlKey || e.metaKey) return false; // never hijack ⌘/Ctrl browser shortcuts
+  if (e.metaKey) return false; // never hijack ⌘ browser shortcuts
+  // v0.6.13 (S9/U2, 33-f P3 as NARROWED by 34-c R5): AltGr IS a legitimate
+  // Alt on Windows/Linux European layouts (de/fr/pl/…) — it reports as
+  // ctrlKey+altKey, so the blanket ctrl guard used to kill every ⌥-hotkey
+  // pressed with the RIGHT Alt key there (left-Alt only, undocumented).
+  // getModifierState('AltGraph') is the ONLY honest exception: the blanket
+  // ctrlKey+altKey wording would also admit the live Ctrl+Alt+letter
+  // OS-shortcut family and regress the test-pinned never-hijack-⌘/Ctrl
+  // guard. Meta is never part of the composition — guarded above, untouched.
+  if (e.ctrlKey && e.getModifierState?.('AltGraph') !== true) return false;
   // v0.6.10 (S6-D3b): alt+shift+<letter> belongs to SB (openInIsolation
   // ⌥⇧I, copyStoryLink ⌥⇧L, openInEditor ⌥⇧E) — our letter specs never match
   // with Shift held (the pre-v0.6.10 matcher let ⌥⇧L double-fire SB's
   // copyStoryLink as our layer toggle). '?' (Shift+/ on US layouts) is a
-  // non-letter spec and keeps working.
+  // non-letter spec and keeps working. The shift guard also stays for
+  // AltGr+Shift (34-c R5: "keep the shift guard").
   if (e.shiftKey && isLetterSpec) return false;
   return e.altKey === spec.alt;
 }
@@ -114,13 +166,40 @@ export function isTypingTarget(t: EventTarget | null): boolean {
 
 /** Human form for UI strings: 'alt+i' → '⌥I'. Tolerates null/undefined specs
  *  (audit C-P3-6: a TS-legal `hotkeys: { pin: undefined }` hole must not
- *  crash the manager's title rendering). */
-export function hotkeyLabel(spec: string | undefined | null): string {
-  const raw = (spec ?? '').trim().toLowerCase();
-  if (!raw) return '';
-  const altPrefix = /^(?:alt|option|opt|⌥)\+?\s*/;
+ *  crash the manager's title rendering). v0.6.13 (S9/U2): strips whitespace
+ *  exactly like parseHotkey — a spec parseHotkey ACCEPTS as ⌥C must never
+ *  label as '⌥+ C'. v0.6.13 (audit 44-c P3-2): a DEGENERATE spec ('alt+',
+ *  bare 'alt', whitespace-only) used to label as a bare '⌥' — a chord that
+ *  does not exist (parseHotkey substitutes the FALLBACK's key at bind time).
+ *  With the optional `fallback` (the action's default), the label shows the
+ *  REAL binding — the substituted key; without one it returns '' (never a
+ *  phantom modifier). */
+export function hotkeyLabel(spec: string | undefined | null, fallback?: string): string {
+  const raw = (spec ?? '').trim().toLowerCase().replace(/\s+/g, '');
+  // v0.6.14 (usability row 16, track 53-b): a whitespace-only spec used to
+  // early-return '' WITHOUT consulting the fallback — but an EMPTY spec means
+  // "not configured", the DEFAULT binding applies, and the label must show
+  // it (the same substitution rule as the 'alt+' degenerate form below; the
+  // manager's empty state rendered a missing chord gap "or  to drag").
+  const fallbackChord = (): string => {
+    if (!fallback) return '';
+    const fbRaw = fallback.trim().toLowerCase().replace(/\s+/g, '');
+    const altPrefix = /^(?:alt|option|opt|⌥)\+?/;
+    const fbAlt = altPrefix.test(fbRaw);
+    const fbKey = fbRaw.replace(altPrefix, '');
+    if (!fbKey) return '';
+    const shown = fbKey.length === 1 ? fbKey.toUpperCase() : fbKey;
+    return fbAlt ? `⌥${shown}` : shown;
+  };
+  if (!raw) return fallbackChord(); // empty/whitespace spec: the default binds
+  const altPrefix = /^(?:alt|option|opt|⌥)\+?/;
   const withAlt = altPrefix.test(raw);
   const key = raw.replace(altPrefix, '');
+  if (!key) {
+    const fb = fallbackChord();
+    if (fb) return fb;
+    return ''; // degenerate with no (usable) fallback: no phantom modifier
+  }
   const shown = key.length === 1 ? key.toUpperCase() : key;
   return withAlt ? `⌥${shown}` : shown;
 }

@@ -13,7 +13,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { getStore, migrateLegacyStore, nowIso, readConfig, type Store } from './store';
+import { getStore, migrateLegacyStore, nowIso, readConfig, TombstonedIdError, type Store } from './store';
 import { renderDigest } from './digest';
 import { STATUS_RANK } from './merge';
 import { createGhSync, type GhSync } from './ghsync';
@@ -27,6 +27,7 @@ import {
   isPathTracked,
   kitRepo,
   loadDotEnv,
+  normalizeGhRepoInput,
   pathIsIgnored,
   projectRoot,
   reloadDotEnv,
@@ -36,7 +37,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.12';
+const VERSION = '0.6.15';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -117,9 +118,17 @@ function bootstrap(configDir: string, port?: number): Runtime {
   const config = preConfig;
   const root = projectRoot(configDir);
   const detected = detectGithubRepo(root);
-  const configRepo = typeof config.ghRepo === 'string' ? config.ghRepo : null;
+  // v0.6.15 (Y3, wave-3): the config-file ghRepo is GATED like every other
+  // door (env ghRepoEnv / bake normalizeGhRepoInput / client resolveGhConfig)
+  // — it used to flow VERBATIM, the only ungated door, so a
+  // `"ghRepo": "github:octocat/widgets"` or URL paste armed a dead mirror.
+  // A PRESENT-but-garbage config value OWNS the decision (mirror stays OFF
+  // + a boot warning) — falling through to env/detection would silently
+  // re-target the mirror at a different repo (wrong-repo data leak).
+  const configRepoRaw = typeof config.ghRepo === 'string' ? config.ghRepo : null;
+  const configRepo = configRepoRaw !== null ? normalizeGhRepoInput(configRepoRaw) : null;
   const envRepo = ghRepoEnv();
-  const repo = configRepo ?? envRepo ?? detected.repo;
+  const repo = configRepoRaw !== null ? configRepo : (envRepo ?? detected.repo);
   const ghLabels = resolveGhLabels(config);
   // C14: the sync shutdown flush awaits these BEFORE its final git cycle —
   // ghsync.stop() settles any in-flight engine op so stamped rows reach the
@@ -143,6 +152,14 @@ function bootstrap(configDir: string, port?: number): Runtime {
 
   /* boot hygiene (dogfood #3/#9) — collected, logged once, surfaced in /health */
   const bootWarnings: string[] = [];
+  // Y3: a refused config ghRepo must be LOUD — the user explicitly asked for
+  // a mirror target and got none (unconfigured is honest, a silently-dead
+  // or silently-retargeted engine is not)
+  if (configRepoRaw !== null && configRepo === null) {
+    bootWarnings.push(
+      `${CONFIG_FILE} "ghRepo" ${JSON.stringify(configRepoRaw)} is not a valid GitHub repo — expected "owner/name" (github.com URLs and the github: shorthand normalize). The GitHub mirror stays OFF instead of arming a dead target; fix the value to enable mirroring.`,
+    );
+  }
   // #3 cross-repo leak: mirroring into the kit's OWN repo is the demo/dogfood
   // case — for a consumer it means their review is about to land in a repo
   // they don't own. Loud, early, explicit.
@@ -172,7 +189,10 @@ function bootstrap(configDir: string, port?: number): Runtime {
 
   const ghAuto = config.ghAuto !== false && !['0', 'false', 'off', 'no'].includes(String(process.env.ANNOTAKIT_GH_AUTO ?? '').toLowerCase());
   const pollSec = nonNegNum(process.env.ANNOTAKIT_GH_POLL) ?? nonNegNum(config.ghPoll) ?? 60;
-  const intervalMs = nonNegNum(process.env.ANNOTAKIT_GH_INTERVAL) ?? 700;
+  // S9-a P3: floor the engine tick at 100ms — ANNOTAKIT_GH_INTERVAL=0 used to
+  // become setInterval(…, 0) (a hot loop). 0 keeps its meaning as "as fast as
+  // sane" without pinning the CPU.
+  const intervalMs = Math.max(100, nonNegNum(process.env.ANNOTAKIT_GH_INTERVAL) ?? 700);
   const ghsync = createGhSync({
     store,
     repo,
@@ -287,7 +307,15 @@ function enforceApiAccess(req: IncomingMessage, res: ServerResponse): boolean {
   if (isLoopbackPeer(req)) return true;
   if (key) {
     const provided = req.headers['x-annotakit-key'];
-    const ok = provided === key || (Array.isArray(provided) && provided.includes(key));
+    // S9-a P3: timing-safe compare (hash both sides — sha256 output lengths
+    // always match, so timingSafeEqual is legal) — the old === leaked key
+    // length/prefix timing on remote (keyed) networks.
+    const safeEqual = (a: string, b: string): boolean => {
+      const ha = createHash('sha256').update(a, 'utf8').digest();
+      const hb = createHash('sha256').update(b, 'utf8').digest();
+      return ha.length === hb.length && ha.equals(hb);
+    };
+    const ok = (typeof provided === 'string' && safeEqual(provided, key)) || (Array.isArray(provided) && provided.some((p) => safeEqual(p, key)));
     if (!ok) {
       sendJson(res, 401, { error: 'x-annotakit-key header required (ANNOTAKIT_API_KEY is set on this server)' });
       return false;
@@ -325,7 +353,16 @@ function applyCors(req: IncomingMessage, res: ServerResponse, methods = 'GET,POS
   }
   if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/.test(host)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Methods', methods);
+    // S9-a P3: the preflight Allow now reflects the ROUTE's real method set
+    // (via the 405 table) instead of a global superset — /health no longer
+    // advertises POST. Falls back to the passed list for unknown paths.
+    let allow = methods;
+    try {
+      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      const known = KNOWN_API_ROUTES.find(([re]) => re.test(path));
+      if (known) allow = known[1];
+    } catch { /* keep the default */ }
+    res.setHeader('Access-Control-Allow-Methods', allow);
     res.setHeader('Access-Control-Allow-Headers', 'content-type');
     // custom response headers are invisible to cross-origin JS unless listed
     // here (loopback cross-PORT browser agents read X-Annotakit-Replayed)
@@ -421,6 +458,8 @@ const THREAD_INPUT_EXAMPLE: Record<string, unknown> = {
   // id: the IDEMPOTENCY KEY — send a stable, meaningful id (e.g.
   // "fix-header-overflow") and a replayed POST with the same id returns
   // 200 with the existing thread instead of minting a duplicate (201).
+  // FINALITY: an id that was DELETEd is tombstoned forever — a POST with
+  // that id 409s (delete-wins); a correction after a delete needs a NEW id.
   // Omit it only when you genuinely want a brand-new thread per POST.
   id: 'fix-kpi-tabular-nums',
   storyId: 'nimbus-components--kpi-card-story',
@@ -535,11 +574,38 @@ function buildPatchCandidate(prev: Thread, body: Record<string, unknown>): Threa
         { status: 400 },
       );
     }
-    return full;
+    // DD-15b (S9-a P3): identity fields are SERVER-OWNED — a full-doc PATCH
+    // carrying a moved storyId / forged number / backdated createdAt used to
+    // land verbatim (reproduced: storyId moved, number → 999, createdAt →
+    // 1999). Clamp to the stored row; amend content, not identity.
+    return { ...full, id: prev.id, storyId: prev.storyId, number: prev.number, createdAt: prev.createdAt };
   }
   const next: Record<string, unknown> = { ...prev };
   for (const key of PATCH_MERGEABLE_FIELDS) {
     if (key in body) next[key] = body[key];
+  }
+  // DD-15 (S9-a P2): the partial door spread mergeable fields VERBATIM — a
+  // non-iterable `comments` (5 | null | {}) crashed the later comment-union
+  // with a 500 ("full.comments is not iterable"), and {story: 5} corrupted
+  // the stored doc. Gate the shape at the door (full-doc parity: the C11
+  // hardening this class belongs to).
+  if ('comments' in next && !Array.isArray(next.comments)) {
+    throw Object.assign(new Error('PATCH `comments` must be an array (comment objects, union-merged by id)'), { status: 400 });
+  }
+  if ('story' in next && next.story !== null && (typeof next.story !== 'object' || Array.isArray(next.story))) {
+    throw Object.assign(new Error('PATCH `story` must be an object (story metadata) or null'), { status: 400 });
+  }
+  if ('component' in next && next.component !== null && (typeof next.component !== 'object' || Array.isArray(next.component))) {
+    throw Object.assign(new Error('PATCH `component` must be an object (component metadata) or null'), { status: 400 });
+  }
+  if ('target' in next && (typeof next.target !== 'object' || next.target === null || Array.isArray(next.target))) {
+    throw Object.assign(new Error('PATCH `target` must be an object (pin target)'), { status: 400 });
+  }
+  if ('author' in next && typeof next.author !== 'string') {
+    throw Object.assign(new Error('PATCH `author` must be a string'), { status: 400 });
+  }
+  if ('resolvedAt' in next && next.resolvedAt !== null && typeof next.resolvedAt !== 'string') {
+    throw Object.assign(new Error('PATCH `resolvedAt` must be an ISO string or null'), { status: 400 });
   }
   return next as unknown as Thread;
 }
@@ -562,7 +628,13 @@ function groupByStory(threads: Thread[], origin: string): ExportedStory[] {
     if (t.status === 'open') entry.counts.open++;
     else if (t.status === 'fixed') entry.counts.fixed++;
     else if (t.status === 'rejected') entry.counts.rejected++;
-    else entry.counts.resolved++; // resolved + the legacy-garbage catch-all (H-B-15 class)
+    else if (t.status === 'resolved') entry.counts.resolved++;
+    // Y2 (wave-3): the COUNT twin of H-B-15 — unknown/legacy statuses RENDER
+    // in the OPEN bucket (digest.ts's negative predicate) but used to COUNT
+    // as resolved here, so the digest headline said "N resolved" while the
+    // body listed the thread as OPEN. Count unknown as OPEN: the headline
+    // and the buckets can never disagree.
+    else entry.counts.open++;
   }
   const out = [...map.values()];
   for (const s of out) s.threads.sort((a, b) => a.number - b.number);
@@ -598,22 +670,23 @@ async function handleApi(
       endpoints: [
         ['GET', `${API_BASE}/health`, 'agentSurfaces, store, gh + git state — detect your path here first'],
         ['GET', `${API_BASE}/schema`, 'this document'],
-        ['GET', `${API_BASE}/threads`, 'ALL threads — envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array)'],
+        ['GET', `${API_BASE}/threads`, 'ALL threads — envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array). v0.6.14: ?sort=recent (updatedAt DESC — the panel\'s latest-first view; unknown sort values 400)'],
         ['GET', `${API_BASE}/threads?storyId=<id>&status=<open|fixed|rejected|resolved>`, 'filtered (an EMPTY storyId param is treated as absent, not a filter)'],
-        ['POST', `${API_BASE}/threads`, 'create → 201; idempotent replay (same id) → 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only — amend via PATCH'],
+        ['POST', `${API_BASE}/threads`, 'create → 201; idempotent replay (same id) → 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only — amend via PATCH. A DELETED id is final → 409 {deletedId:true} (delete-wins tombstones; use a new id)'],
         ['GET', `${API_BASE}/threads/<id>`, 'one thread doc'],
         ['PATCH', `${API_BASE}/threads/<id>`, 'partial {status} (JSON-merge) or full doc — see PATCH below'],
         ['POST', `${API_BASE}/threads/<id>/comments`, 'reply → 201 with the FULL updated thread doc (not the new comment); key comments by thread id, never by your own comment id (ids are re-hashed)'],
-        ['DELETE', `${API_BASE}/threads/<id>`, 'delete (path form; legacy DELETE /threads?id=<id> equivalent)'],
-        ['GET|PUT', `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence — GET → JSON, GET ?format=html → human view; PUT replaces (idempotent, 96KB cap) and broadcasts THREADS_CHANGED {reason:"snapshot"} so live panels re-fetch'],
+        ['DELETE', `${API_BASE}/threads/<id>`, 'delete (path form; legacy DELETE /threads?id=<id> equivalent) — broadcasts THREADS_CHANGED {reason:"deleted"} so live panels drop the row (v0.6.13, Task 42)'],
+        ['GET|PUT|POST', `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence — GET → JSON, GET ?format=html → human view; PUT/POST replaces (idempotent, 96KB cap) and broadcasts THREADS_CHANGED {reason:"snapshot"} so live panels re-fetch'],
         ['GET', `${API_BASE}/export?format=md|json`, 'digest — json keeps FULL bodies (envelope {generatedAt, stories:[...]}, story-grouped, NOT the {threads:[...]} shape of GET /threads). md default is the LEAN digest (200-char clips for token economy); add ?mode=full for VERBATIM bodies (the panel export uses this — a hand-off artifact must never shorten a note)'],
-        ['GET|POST', `${API_BASE}/sync`, 'mirror status / force reconcile — POST also forces one git store cycle first (v0.6.1)'],
+        ['GET|POST', `${API_BASE}/sync`, 'mirror status / force reconcile — POST also forces one git store cycle first (v0.6.1); v0.6.13 (DD-12): POST CLEARS the rate-limit backoff window and per-thread retry parks before reconciling ("Sync now" means retry NOW) — the debounced tick still respects the window'],
         ['POST', `${API_BASE}/gh/reload`, 're-read .env and apply token changes WITHOUT a restart (v0.6.6) — response lists applied/requiresRestart; the PAT is never echoed'],
+        ['POST', `${API_BASE}/gh`, 'legacy alias of POST /sync (force reconcile)'],
       ],
       POST: {
         url: `${API_BASE}/threads`,
         body: THREAD_INPUT_EXAMPLE,
-        note: 'body.id is the IDEMPOTENCY KEY: a replayed POST with the same id returns 200 (existing thread, flagged replayed:true — your new body does NOT land; amend via PATCH), a fresh id (or none) returns 201 — send a stable id (e.g. "fix-header-overflow") whenever a retry might replay the POST, or you mint duplicate threads. Server assigns per-story numbers; comment ids are deterministically re-hashed server-side (your comment id may come back different — key by thread id). Threads without story.importPath render as bare digest sections (pass story metadata when you have it).',
+        note: 'body.id is the IDEMPOTENCY KEY: a replayed POST with the same id returns 200 (existing thread, flagged replayed:true — your new body does NOT land; amend via PATCH), a fresh id (or none) returns 201 — send a stable id (e.g. "fix-header-overflow") whenever a retry might replay the POST, or you mint duplicate threads. FINALITY: an id that was DELETEd stays deleted — POSTing it again 409s {deletedId:true}; a correction after a delete needs a NEW id. Server assigns per-story numbers; comment ids are deterministically re-hashed server-side (your comment id may come back different — key by thread id). Threads without story.importPath render as bare digest sections (pass story metadata when you have it).',
       },
       PATCH: {
         url: `${API_BASE}/threads/<id>`,
@@ -628,8 +701,8 @@ async function handleApi(
       DELETE: { url: `${API_BASE}/threads/<id>` },
       SNAPSHOT: {
         url: `${API_BASE}/threads/<id>/snapshot`,
-        methods: ['GET', 'PUT'],
-        note: 'GET → JSON { html, clipped, capturedAt, width, height } (plan-b evidence: story DOM at pin time, pinned element carries data-annota-snap="1"); GET ?format=html → human-viewable inert render (CSP script-src none; unknown format values → 400); PUT replaces (idempotent, 96KB cap)',
+        methods: ['GET', 'PUT', 'POST'],
+        note: 'GET → JSON { html, clipped, capturedAt, width, height } (plan-b evidence: story DOM at pin time, pinned element carries data-annota-snap="1"); GET ?format=html → human-viewable inert render (CSP script-src none; unknown format values → 400); PUT/POST replaces (idempotent, 96KB cap measured in UTF-8 bytes)',
       },
       limits: { maxCommentBodyChars: MAX_BODY_CHARS, maxRequestBodyBytes: 2_000_000, maxSnapshotBytes: 96 * 1024 },
     });
@@ -695,10 +768,22 @@ async function handleApi(
         // ?status=Open (an easy agent typo) matches like the PATCH normalizer
         status: url.searchParams.get('status')?.toLowerCase() || undefined,
       });
+      // v0.6.14 (sweep 53-d P3-8, the agent-surface recency parity): the
+      // panel went latest-first — agents get the same view with ?sort=recent
+      // (updatedAt DESC, createdAt fallback — the panel's exact comparator).
+      // Unknown sort values are 400 (never silently ignored — the format/mode
+      // convention).
+      const sort = url.searchParams.get('sort')?.toLowerCase() || null; // '' = absent (the storyId param's convention — 54-a nit)
+      if (sort !== null && sort !== 'recent') {
+        throw Object.assign(new Error(`unknown sort ${JSON.stringify(sort)} — use ?sort=recent (updatedAt DESC, newest activity first; omit for the stable story/number order)`), { status: 400 });
+      }
+      const sorted = sort === 'recent'
+        ? [...threads].sort((a, b) => String(b.updatedAt ?? b.createdAt ?? '').localeCompare(String(a.updatedAt ?? a.createdAt ?? '')))
+        : threads;
       // sibling (not inside Thread payloads): which threads carry plan-b
       // snapshots — panels link to the viewable evidence without bloating lists
       const snapshots = [...(await store.listSnapshotIds())];
-      sendJson(res, 200, { threads, snapshots });
+      sendJson(res, 200, { threads: sorted, snapshots });
       return true;
     }
     if (method === 'POST') {
@@ -708,8 +793,29 @@ async function handleApi(
       // the replay is FLAGGED (body `replayed:true` + X-Annotakit-Replayed
       // header) because a 200 replay of a DIFFERENT body silently swallowed
       // corrections (Track B P1) — POST is create-only, amend via PATCH.
+      // DD-1 (S9): the tombstone check comes FIRST — a deleted id 409s even
+      // when a legacy zombie live-row sits under the tombstone (the pre-fix
+      // bug's own artifact, still present in real dbs: replaying-200 a doomed
+      // row would resurrect the silent-annihilation bug one more time).
+      if (input.id && (await store.listDeletedIds()).has(input.id)) {
+        sendJson(res, 409, {
+          error: `id ${input.id} was deleted — tombstones are final (delete-wins). POST with a new id.`,
+          deletedId: true,
+        });
+        return true;
+      }
       const preexisting = input.id ? await store.getThread(input.id) : null;
-      const thread = await store.createThread(input);
+      let thread: Awaited<ReturnType<typeof store.createThread>>;
+      try {
+        thread = await store.createThread(input);
+      } catch (err) {
+        // defense-in-depth twin of the door check above (store-level throw)
+        if (err instanceof TombstonedIdError) {
+          sendJson(res, 409, { error: err.message, deletedId: true });
+          return true;
+        }
+        throw err;
+      }
       // ghost-thread visibility (Track B P2): the server cannot validate
       // storyId against the story index, but a thread with no story metadata
       // renders as a bare digest section — warn once per storyId per process
@@ -726,7 +832,11 @@ async function handleApi(
       if (!ok) return notFound(res), true;
       // mirrored issue gets closed once (tombstone is durable in the db)
       if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
-      afterMutation(rt, { storyId: prev?.storyId, threadId: undefined, reason: 'updated' });
+      // v0.6.13 (S9/U2, 33-f P3): the wire can now SAY delete — both DELETE
+      // doors used to broadcast 'updated' (the taxonomy is the documented
+      // contract; no listener branches on reason, both key on storyId —
+      // additive, nothing to migrate).
+      afterMutation(rt, { storyId: prev?.storyId, threadId: undefined, reason: 'deleted' });
       sendJson(res, 200, { ok: true });
       return true;
     }
@@ -752,7 +862,9 @@ async function handleApi(
       const ok = await store.deleteThread(id);
       if (!ok) return notFound(res, THREAD_404_HINT), true;
       if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
-      afterMutation(rt, { storyId: prev?.storyId, threadId: undefined, reason: 'updated' });
+      // 33-f P3 twin of the ?id= door above: the path-form DELETE broadcasts
+      // 'deleted' too (both doors are aliases — one contract).
+      afterMutation(rt, { storyId: prev?.storyId, threadId: undefined, reason: 'deleted' });
       sendJson(res, 200, { ok: true });
       return true;
     }
@@ -872,15 +984,42 @@ async function handleApi(
       // crafted PATCH must not mint t.gh.url links the panel renders).
       if (prev.gh) full.gh = prev.gh;
       else delete full.gh;
+      // DD-19 (S9): the unlink marker is SERVER-OWNED — same class as
+      // reopenedAt above: a crafted full-doc PATCH must neither forge nor
+      // drop the 404-delete-wins proof (a client gh never survives this
+      // door — C31 — so there is no clear-on-new-gh path HERE; the engine's
+      // re-create clears it at its own stamping sites in ghsync).
+      full.ghUnlinkedAt = prev.ghUnlinkedAt;
       // UNION comments by id: a stale snapshot must not DROP newer comments
       // (pull-imported replies, concurrent user replies). Body wins for ids it
       // knows; anything only the server has is preserved.
+      // DD-20 (v0.6.14): a non-empty ghId is a SECONDARY identity key — a
+      // full-doc PATCH carrying a reply under the OTHER engine's local id
+      // (the browser's c_gh_* import vs this store's import of the same
+      // GitHub comment) used to APPEND the stored twin as a second copy
+      // ("always two replies per issue"). The twin is CONSUMED instead, and
+      // the shape guards below resolve the prev reference by id OR ghId —
+      // a no-op re-send of a stored >64k GitHub import under the twin id
+      // stays body-unchanged (exempt from the cap, the stored-body rule).
+      // 'issue-body' is a shared marker (every pre-mapping comment), never
+      // an identity.
+      const prevByGhId = new Map<string, (typeof prev.comments)[number]>();
+      for (const pc of prev.comments) {
+        if (pc.ghId && pc.ghId !== 'issue-body' && !prevByGhId.has(pc.ghId)) prevByGhId.set(pc.ghId, pc);
+      }
+      const consumedPrevIds = new Set<string>();
+      for (const c of full.comments) {
+        if (!c.ghId || c.ghId === 'issue-body') continue;
+        const twin = prevByGhId.get(c.ghId);
+        if (twin && twin.id !== c.id) consumedPrevIds.add(twin.id);
+      }
       const bodyIds = new Set(full.comments.map((c) => c.id));
       for (const pc of prev.comments) {
-        if (!bodyIds.has(pc.id)) full.comments.push(pc);
+        if (!bodyIds.has(pc.id) && !consumedPrevIds.has(pc.id)) full.comments.push(pc);
       }
       for (const c of full.comments) {
-        const pc = prev.comments.find((x) => x.id === c.id);
+        const pc = prev.comments.find((x) => x.id === c.id)
+          ?? (c.ghId && c.ghId !== 'issue-body' ? prevByGhId.get(c.ghId) : undefined);
         if (pc) {
           if (pc.ghId && !c.ghId) c.ghId = pc.ghId;
           if (pc.source && !c.source) c.source = pc.source;
@@ -995,7 +1134,19 @@ async function handleApi(
       const body = (await readBody(req)) as Record<string, unknown>;
       const html = typeof body.html === 'string' ? body.html : '';
       if (!html.trim()) throw Object.assign(new Error('snapshot html is required'), { status: 400 });
-      if (html.length > 96 * 1024) throw Object.assign(new Error('snapshot too large (max 96KB)'), { status: 413 });
+      // S9-a P3: the cap is now measured in UTF-8 BYTES (the /schema field
+      // always said maxSnapshotBytes — the old .length check measured UTF-16
+      // code units, admitting ~2x the advertised budget for CJK content).
+      if (Buffer.byteLength(html, 'utf8') > 96 * 1024) throw Object.assign(new Error('snapshot too large (max 96KB)'), { status: 413 });
+      // v0.6.13 (S9/DD-17a, 34-c R4): the scroller position at capture time —
+      // an ADDITIVE named-field plumb-through. This builder constructs the
+      // stored DomSnapshot from named fields only, so a client-sent `scroll`
+      // is accepted-and-dropped by PUT and never returned by GET unless it is
+      // enumerated HERE (the feature would silently no-op server-side without
+      // this line). Malformed → undefined → recall's legacy "no scroll" path.
+      const sc = body.scroll as { x?: unknown; y?: unknown } | null | undefined;
+      const scX = sc && typeof sc === 'object' ? Number(sc.x) : NaN;
+      const scY = sc && typeof sc === 'object' ? Number(sc.y) : NaN;
       const snap: DomSnapshot = {
         format: 'dom',
         html,
@@ -1006,6 +1157,7 @@ async function handleApi(
         // v0.6.9 (S3): the frozen-container shape marker — additive; the
         // legacy story-root shape simply lacks it (old snapshots).
         surface: body.surface === 'frozen' ? 'frozen' : undefined,
+        scroll: Number.isFinite(scX) && Number.isFinite(scY) ? { x: Math.max(0, Math.round(scX)), y: Math.max(0, Math.round(scY)) } : undefined,
       };
       await store.putSnapshot(id, snap);
       // v0.6.10 (S6, E2E-caught): the panel's recall/view affordance derives
@@ -1016,7 +1168,7 @@ async function handleApi(
       // gh churn) but the broadcast IS needed so manager panels re-fetch and
       // learn the id.
       broadcast({ storyId: thread.storyId, threadId: id, reason: 'snapshot' });
-      sendJson(res, 200, { ok: true, threadId: id, bytes: html.length, clipped: snap.clipped });
+      sendJson(res, 200, { ok: true, threadId: id, bytes: Buffer.byteLength(html, 'utf8'), clipped: snap.clipped }); // v0.6.14 (54-c P3 honesty): BYTES (the cap's unit), not .length chars
       return true;
     }
 
@@ -1031,7 +1183,16 @@ async function handleApi(
         // human-viewable "screenshot": native HTML parser (foreignObject would
         // demand XHTML-valid serialization — browser outerHTML is not). CSP
         // kills scripts: the snapshot is inert evidence, never live code.
-        const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'"><title>annotakit snapshot ${id}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped at 32KB</div>' : ''}</body></html>`;
+        // v0.6.14 (audit 54-c P2 ×2): the thread id is ESCAPED (an arbitrary
+        // id string — the POST idempotency key — used to interpolate RAW into
+        // the <title>, a proven </title><meta http-equiv=refresh> injection;
+        // CSP blocks scripts, not navigation) and the CSP gains
+        // frame-src 'none' (external iframes loaded and ran their own scripts
+        // in-frame while the MOUNT path sandboxes every iframe — the two
+        // renderers now agree; img-src stays open — images are passive
+        // evidence, blocking them degrades the page's whole point).
+        const esc = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'; frame-src 'none'"><title>annotakit snapshot ${esc(id)}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped (capture exceeded the client size cap)</div>' : ''}</body></html>`;
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(method === 'HEAD' ? undefined : page);
         return true;
@@ -1089,6 +1250,10 @@ async function handleApi(
       return true;
     }
     if (method === 'POST') {
+      // DD-12 (12a): "Sync now" means retry NOW — clear the rate-limit window
+      // and the per-thread retry parks BEFORE reconciling (client syncNow
+      // parity; the debounced tick still respects the window).
+      rt.ghsync.clearRateLimitBackoff();
       // A6: settle the boot restore BEFORE any mirror semantics run — an
       // agent POSTing /sync during boot otherwise backfills a half-restored
       // store (duplicate issues for restored mappings).
@@ -1138,13 +1303,15 @@ async function handleApi(
     // duplicate issue for a not-yet-restored mapping. Identical prologue to
     // /sync now (including the response's git fields).
     await rt.sync.restore().catch(() => undefined);
+    // DD-12 (12a): identical to POST /sync — clear the window, then force.
+    rt.ghsync.clearRateLimitBackoff();
     const gitOk = await rt.sync.syncNow('api').catch(() => false);
     const summary = await rt.ghsync.syncAll();
     sendJson(res, 200, {
       ...summary,
       gitSync: rt.sync.gitHealth(),
       gitSyncForced: gitOk,
-      note: 'digest issues are gone: each thread mirrors to exactly ONE issue now. POST /annotakit/api/sync is the canonical force-reconcile; this alias behaves identically (restore settle + forced git cycle + mirror reconcile).',
+      note: 'digest issues are gone: each thread mirrors to exactly ONE issue now. POST /annotakit/api/sync is the canonical force-reconcile; this alias behaves identically (clears the rate-limit window, restore settle + forced git cycle + mirror reconcile).',
     });
     return true;
   }
@@ -1162,7 +1329,8 @@ const KNOWN_API_ROUTES: [RegExp, string][] = [
   [new RegExp(`^${API_BASE}/threads/[^/]+/comments$`), 'POST, OPTIONS'],
   // v0.6.7 (audit 24-b P3): the snapshot endpoint was missing — unsupported
   // methods on a documented route 404'd as "unknown route" instead of 405+Allow
-  [new RegExp(`^${API_BASE}/threads/[^/]+/snapshot$`), 'GET, PUT, OPTIONS'],
+  // (S9: POST added — the route handler accepts PUT || POST; /schema agrees)
+  [new RegExp(`^${API_BASE}/threads/[^/]+/snapshot$`), 'GET, PUT, POST, OPTIONS'],
   [new RegExp(`^${API_BASE}/export$`), 'GET, OPTIONS'],
   [new RegExp(`^${API_BASE}/sync$`), 'GET, POST, OPTIONS'],
   [new RegExp(`^${API_BASE}/gh$`), 'POST, OPTIONS'],

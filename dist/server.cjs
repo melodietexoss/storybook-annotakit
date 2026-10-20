@@ -18,6 +18,13 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
   throw Error('Dynamic require of "' + x + '" is not supported');
 });
 var fsSync = __require("fs");
+var TombstonedIdError = class extends Error {
+  deletedId = true;
+  constructor(id) {
+    super(`id ${id} was deleted \u2014 tombstones are final (delete-wins). POST with a new id.`);
+    this.name = "TombstonedIdError";
+  }
+};
 function readStoreFile(filePath) {
   if (!fsSync.existsSync(filePath)) return null;
   if (filePath.endsWith(".json")) {
@@ -115,6 +122,8 @@ function sqliteStore(db, storePath) {
   };
   const createThread = async (input) => {
     const id = input.id ?? newId();
+    const tombstoned = db.prepare("SELECT 1 AS x FROM deleted_threads WHERE id = ?").get(id);
+    if (tombstoned) throw new TombstonedIdError(id);
     const existing = db.prepare("SELECT payload FROM threads WHERE id = ?").get(id);
     if (existing) return rowToThread(existing);
     const ts = nowIso();
@@ -158,7 +167,9 @@ function sqliteStore(db, storePath) {
     const row = db.prepare("SELECT payload FROM threads WHERE id = ?").get(id);
     if (!row) return null;
     const t = rowToThread(row);
+    const before = JSON.stringify(t);
     const out = fn(t) ?? t;
+    if (JSON.stringify(out) === before) return null;
     const next = { ...out, updatedAt: nowIso() };
     db.prepare("UPDATE threads SET number = ?, story_id = ?, status = ?, updated_at = ?, payload = ? WHERE id = ?").run(
       next.number,
@@ -363,6 +374,7 @@ function jsonStore(storePath) {
     },
     createThread: (input) => mutate(async () => {
       const id = input.id ?? newId();
+      if (doc.deleted.includes(id)) throw new TombstonedIdError(id);
       const existing = doc.threads.find((t) => t.id === id);
       if (existing) return existing;
       const ts = nowIso();
@@ -397,7 +409,9 @@ function jsonStore(storePath) {
       const idx = doc.threads.findIndex((t2) => t2.id === id);
       if (idx < 0) return null;
       const t = JSON.parse(JSON.stringify(doc.threads[idx]));
+      const before = JSON.stringify(t);
       const out = fn(t) ?? t;
+      if (JSON.stringify(out) === before) return null;
       const next = { ...out, updatedAt: nowIso() };
       doc.threads[idx] = next;
       return next;
@@ -573,6 +587,13 @@ function elementSummary(ctx) {
   if (text) parts.push(` "${clip(text.replace(/\s+/g, " "), 48)}"`);
   return `<${parts.join("")}>`;
 }
+
+// src/shared/metaline.ts
+function metaLine(value, cap = 300) {
+  let line = String(value ?? "").replace(/\s+/g, " ").trim();
+  line = line.replace(/^(?:(?:#+|[-*]+)\s*)+/, "");
+  return line.length > cap ? line.slice(0, cap) + "\u2026" : line;
+}
 var ENV_KEYS = ["ANNOTAKIT_GH_TOKEN", "ANNOTAKIT_GH_API", "ANNOTAKIT_GH_AUTO", "ANNOTAKIT_GH_POLL", "ANNOTAKIT_GH_INTERVAL", "ANNOTAKIT_GH_REPO", "ANNOTAKIT_GH_LABELS", "ANNOTAKIT_ENV_TRACKED_OK", "ANNOTAKIT_API_KEY"];
 function projectRoot(configDir) {
   const abs = path2__default.default.isAbsolute(configDir) ? configDir : path2__default.default.resolve(process.cwd(), configDir);
@@ -590,6 +611,10 @@ function parseDotEnv(text) {
     let value = cleaned.slice(eq + 1).trim();
     const m = value.match(/^(["'])([\s\S]*)\1$/);
     if (m) value = m[2] ?? "";
+    else {
+      const hash = value.search(/\s#/);
+      if (hash >= 0) value = value.slice(0, hash).trim();
+    }
     if (key) out[key] = value;
   }
   return out;
@@ -611,11 +636,11 @@ function loadDotEnv(configDir) {
     const applied = [];
     for (const key of ENV_KEYS) {
       const v = parsed[key];
-      if (v && !process.env[key]) {
+      if (v !== void 0 && !process.env[key]) {
         process.env[key] = v;
-        applied.push(key);
         bootAppliedKeys.push(key);
         envFileCache = file;
+        if (v) applied.push(key);
       }
     }
     if (applied.length) {
@@ -671,9 +696,17 @@ function reloadDotEnv(configDir) {
   }
   return out;
 }
+var GH_OWNER_NAME_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+function normalizeGhRepoInput(v) {
+  const t = v.trim();
+  if (!t) return null;
+  if (GH_OWNER_NAME_RE.test(t)) return t;
+  const parsed = parseGithubRepo(t);
+  return parsed && GH_OWNER_NAME_RE.test(parsed) ? parsed : null;
+}
 function ghRepoEnv() {
   const v = process.env.ANNOTAKIT_GH_REPO;
-  return v && /^[^/\s]+\/[^/\s]+$/.test(v) ? v : null;
+  return v ? normalizeGhRepoInput(v) : null;
 }
 function ghLabelsEnv() {
   const v = process.env.ANNOTAKIT_GH_LABELS;
@@ -705,7 +738,7 @@ function git(root, args) {
   }
 }
 function parseGithubRepo(url) {
-  const m = url.match(/github\.com[/:]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?(?:[/\s?#].*)?$/i) ?? url.match(/^github:([^/\s]+)\/([^/\s]+)$/i);
+  const m = url.match(/github\.com(?::\d+)?[/:]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?(?:[/\s?#].*)?$/i) ?? url.match(/^github:([^/\s]+)\/([^/\s]+)$/i);
   if (!m) return null;
   const [, owner, name] = m;
   if (!owner || !name) return null;
@@ -802,10 +835,6 @@ function fmtDate(iso) {
 function oneLine(body) {
   return body.replace(/\s+/g, " ").trim();
 }
-function metaLine(value, cap = 300) {
-  const line = oneLine(String(value ?? ""));
-  return line.length > cap ? line.slice(0, cap) + "\u2026" : line;
-}
 function firstLine(body, n = 80) {
   const line = oneLine(body.split("\n")[0] ?? "");
   return line.length > n ? line.slice(0, n) + "\u2026" : line;
@@ -825,7 +854,7 @@ function threadBlock(t, snapshotUrl, full) {
     const ip = repoRelPath(t.story.importPath) ?? t.story.importPath;
     if (t.story.importPath) out.push(`- story: ${metaLine(`${t.story.title ?? ""}/${t.story.name ?? ""} (${ip})`)}`);
   }
-  out.push(`- thread id: ${t.id}`);
+  out.push(`- thread id: ${metaLine(t.id)}`);
   const comp = t.component;
   if (comp) {
     if (comp.name) out.push(`- component: ${metaLine(comp.name + (comp.key ? ` (key="${comp.key}")` : ""))}`);
@@ -893,8 +922,8 @@ function renderDigest(stories, opts) {
     out.push(`## ${metaLine(storyTitle, 160)}`);
     out.push("");
     out.push(`story id: \`${metaLine(st.storyId, 200)}\``);
-    if (st.importPath) out.push(`story file: ${repoRelPath(st.importPath) ?? st.importPath}`);
-    if (st.componentPath) out.push(`component file: ${repoRelPath(st.componentPath) ?? st.componentPath}`);
+    if (st.importPath) out.push(`story file: ${metaLine(repoRelPath(st.importPath) ?? st.importPath)}`);
+    if (st.componentPath) out.push(`component file: ${metaLine(repoRelPath(st.componentPath) ?? st.componentPath)}`);
     if (st.url) out.push(`open: ${metaLine(st.url, 300)}`);
     out.push("");
     if (s.threads.length === 0) {
@@ -948,14 +977,65 @@ function later(a, b) {
   if (bOk) return b;
   return a;
 }
+function fresherOf(hi, lo) {
+  const h = Date.parse(hi ?? "");
+  const l = Date.parse(lo ?? "");
+  if (Number.isFinite(h) && Number.isFinite(l)) return l > h ? lo : hi;
+  if (Number.isFinite(l)) return lo;
+  return hi;
+}
+function instantMaxUpdatedAt(newer, older) {
+  const nT = Date.parse(newer.updatedAt ?? "");
+  const oT = Date.parse(older.updatedAt ?? "");
+  if (Number.isFinite(nT) && Number.isFinite(oT)) return nT >= oT ? newer.updatedAt : older.updatedAt;
+  if (Number.isFinite(nT)) return newer.updatedAt;
+  if (Number.isFinite(oT)) return older.updatedAt;
+  return String(newer.updatedAt ?? "") >= String(older.updatedAt ?? "") ? newer.updatedAt : older.updatedAt;
+}
+function instantMinCreatedAt(newer, older) {
+  const nT = Date.parse(newer.createdAt ?? "");
+  const oT = Date.parse(older.createdAt ?? "");
+  if (Number.isFinite(nT) && Number.isFinite(oT)) return nT <= oT ? newer.createdAt : older.createdAt;
+  if (Number.isFinite(nT)) return newer.createdAt;
+  if (Number.isFinite(oT)) return older.createdAt;
+  return older.createdAt ?? newer.createdAt;
+}
+function collapseCommentTwins(comments) {
+  const seenGhIds = /* @__PURE__ */ new Map();
+  const out = [];
+  for (const c of comments) {
+    const ghId = typeof c.ghId === "string" && c.ghId && c.ghId !== "issue-body" ? c.ghId : null;
+    const twin = ghId ? seenGhIds.get(ghId) : void 0;
+    if (twin) {
+      if (!twin.body && c.body) twin.body = c.body;
+      if (!twin.ghId && c.ghId) twin.ghId = c.ghId;
+      if (!twin.source && c.source) twin.source = c.source;
+      continue;
+    }
+    const clone = { ...c };
+    if (ghId) seenGhIds.set(ghId, clone);
+    out.push(clone);
+  }
+  return out;
+}
+function healThreadTwins(t) {
+  const healed = collapseCommentTwins(t.comments);
+  if (healed.length === t.comments.length) return t;
+  return { ...t, comments: healed };
+}
 function unionComments(a, b) {
-  const out = a.comments.map((c) => ({ ...c }));
+  const out = collapseCommentTwins(a.comments);
   const byId = new Map(out.map((c) => [c.id, c]));
+  const byGhId = /* @__PURE__ */ new Map();
+  for (const c of out) {
+    if (c.ghId && c.ghId !== "issue-body" && !byGhId.has(c.ghId)) byGhId.set(c.ghId, c);
+  }
   for (const rc of b.comments) {
-    const existing = byId.get(rc.id);
+    const existing = byId.get(rc.id) ?? (rc.ghId && rc.ghId !== "issue-body" ? byGhId.get(rc.ghId) : void 0);
     if (!existing) {
       out.push({ ...rc });
       byId.set(rc.id, rc);
+      if (rc.ghId && rc.ghId !== "issue-body" && !byGhId.has(rc.ghId)) byGhId.set(rc.ghId, rc);
     } else {
       if (!existing.body && rc.body) existing.body = rc.body;
       if (!existing.ghId && rc.ghId) existing.ghId = rc.ghId;
@@ -967,8 +1047,8 @@ function unionComments(a, b) {
 }
 var STATUS_RANK = { open: 0, fixed: 1, rejected: 2, resolved: 3 };
 function mergeThread(local, remote) {
-  if (!local) return remote ? cloneThread(remote) : null;
-  if (!remote) return cloneThread(local);
+  if (!local) return remote ? healThreadTwins(cloneThread(remote)) : null;
+  if (!remote) return healThreadTwins(cloneThread(local));
   const newer = later(local, remote);
   const older = newer === local ? remote : local;
   const merged = cloneThread(newer);
@@ -977,10 +1057,10 @@ function mergeThread(local, remote) {
   const hi = rankL >= rankR ? local : remote;
   const lo = rankL >= rankR ? remote : local;
   const hiT = Date.parse(hi.updatedAt ?? "");
-  const eventFresh = !Number.isFinite(hiT) || Date.parse(lo.reopenedAt ?? "") > hiT;
+  const eventFresh = !Number.isFinite(hiT) || Date.parse(lo.reopenedAt ?? "") >= hiT;
   const downgradeProven = lo.reopenedAt != null && later(lo, hi) === lo && eventFresh;
   merged.status = downgradeProven ? lo.status : hi.status;
-  merged.reopenedAt = downgradeProven ? lo.reopenedAt : rankL === rankR && merged.status !== "resolved" ? hi.reopenedAt ?? lo.reopenedAt : hi.reopenedAt;
+  merged.reopenedAt = downgradeProven ? lo.reopenedAt : rankL === rankR && merged.status !== "resolved" ? fresherOf(hi.reopenedAt, lo.reopenedAt) : hi.reopenedAt;
   if (merged.status === "resolved") {
     if (!merged.resolvedAt) merged.resolvedAt = local.resolvedAt ?? remote.resolvedAt;
   } else {
@@ -990,9 +1070,20 @@ function mergeThread(local, remote) {
     const gh = local.gh?.issue ? local.gh : remote.gh?.issue ? remote.gh : null;
     if (gh) merged.gh = { ...gh };
   }
+  if (local.ghUnlinkedAt != null || remote.ghUnlinkedAt != null) {
+    const markerAt = Date.parse(fresherOf(local.ghUnlinkedAt, remote.ghUnlinkedAt) ?? "");
+    const ghSide = local.gh?.issue ? local : remote.gh?.issue ? remote : null;
+    const reCreated = ghSide != null && Number.isFinite(markerAt) && Date.parse(ghSide.updatedAt ?? "") > markerAt;
+    if (reCreated) {
+      delete merged.ghUnlinkedAt;
+    } else {
+      delete merged.gh;
+      merged.ghUnlinkedAt = fresherOf(local.ghUnlinkedAt, remote.ghUnlinkedAt);
+    }
+  }
   merged.comments = unionComments(newer, older);
-  merged.updatedAt = String(newer.updatedAt ?? "") >= String(older.updatedAt ?? "") ? newer.updatedAt : older.updatedAt;
-  merged.createdAt = older.createdAt ?? newer.createdAt;
+  merged.updatedAt = instantMaxUpdatedAt(newer, older);
+  merged.createdAt = instantMinCreatedAt(newer, older);
   return merged;
 }
 function logicalMerge(local, remote) {
@@ -1018,7 +1109,12 @@ var DEFAULT_API = "https://api.github.com";
 var FETCH_TIMEOUT_MS = 15e3;
 var GH_SENTINEL = "<!-- annotakit -->";
 function ghApiBase() {
-  return process.env.ANNOTAKIT_GH_API || DEFAULT_API;
+  const raw = (process.env.ANNOTAKIT_GH_API || "").trim().replace(/\/+$/, "");
+  const base = raw || DEFAULT_API;
+  if (!/^https?:\/\/[^/\s]+(\/[^\s]*)?$/i.test(base)) {
+    throw new Error(`ANNOTAKIT_GH_API must be an http(s) origin like https://github.example.com/api/v3 (got ${JSON.stringify(process.env.ANNOTAKIT_GH_API)})`);
+  }
+  return base;
 }
 function missingTokenMessage(configPath) {
   return [
@@ -1151,15 +1247,17 @@ async function ghJsonPaged(token, pathname, maxPages = 10) {
     } else {
       try {
         url = new URL(next[1]).origin === new URL(ghApiBase()).origin ? next[1] : null;
-        if (!url) truncated = false;
+        if (!url) truncated = true;
       } catch {
         url = null;
-        truncated = false;
+        truncated = true;
       }
     }
   }
-  if (truncated && url) {
-    console.warn(`[storybook-annotakit] \u26A0 GitHub pagination cap hit (${maxPages} pages) on ${pathname} \u2014 results truncated; raise the cap if this repo really has more data`);
+  if (truncated) {
+    console.warn(
+      truncated && url ? `[storybook-annotakit] \u26A0 GitHub pagination cap hit (${maxPages} pages) on ${pathname} \u2014 results truncated; raise the cap if this repo really has more data` : `[storybook-annotakit] \u26A0 GitHub pagination stopped early on ${pathname} (cross-origin/malformed next link) \u2014 results truncated`
+    );
   }
   return out;
 }
@@ -1323,13 +1421,30 @@ function decideMirrorHeal(args) {
   }
   return Object.keys(fields).length ? fields : null;
 }
+`n_${Math.random().toString(36).slice(2, 10)}`;
+function ghMappingRepo(ref) {
+  if (!ref) return null;
+  if (typeof ref.repo === "string" && ref.repo) return ref.repo;
+  if (typeof ref.url === "string" && ref.url) {
+    try {
+      const segs = new URL(ref.url).pathname.split("/").filter(Boolean);
+      const owner = segs[segs.length - 4];
+      const name = segs[segs.length - 3];
+      if (segs[segs.length - 2] === "issues" && /^[A-Za-z0-9_.-]+$/.test(owner ?? "") && /^[A-Za-z0-9_.-]+$/.test(name ?? "")) {
+        return `${owner}/${name}`;
+      }
+    } catch {
+    }
+  }
+  return null;
+}
 
 // src/server/ghsync.ts
 var RETRY_LIMIT = 4;
 var RETRY_MAX_DELAY_MS = 3e4;
 var STALLED_SWEEP_MS = 10 * 6e4;
-var PULL_401_BACKOFF_MS = 5 * 6e4;
-var SKEW_REPAIR_MS = 5 * 6e4;
+var PULL_401_BACKOFF_MS2 = 5 * 6e4;
+var SKEW_REPAIR_MS2 = 5 * 6e4;
 function createGhSync(opts) {
   const { store, repo, token, configPath } = opts;
   const intervalMs = opts.intervalMs ?? 700;
@@ -1403,15 +1518,18 @@ function createGhSync(opts) {
     console.warn(`[storybook-annotakit] gh-sync: ${lastError}`);
   };
   function issueTitle(t) {
-    const storyLabel = String(t.story?.name ?? t.story?.title ?? t.storyId).replace(/\s+/g, " ").trim();
-    const headline = (t.comments[0]?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
+    const storyLabel = metaLine(t.story?.name ?? t.story?.title ?? t.storyId, 120);
+    const headline = metaLine(t.comments[0]?.body ?? "", 100);
     return `[review] ${storyLabel} \u2014 #${t.number} ${headline || "(no text)"}`.slice(0, 160);
   }
   function issueBody(t) {
     const origin = opts.origin();
     const storyUrl = t.story?.url ?? `${origin}/?path=/story/${t.storyId}`;
     const body = renderDigest(
-      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status === "open" ? 1 : 0, fixed: t.status === "fixed" ? 1 : 0, rejected: t.status === "rejected" ? 1 : 0, resolved: t.status === "resolved" ? 1 : 0 }, threads: [t] }],
+      // v0.6.15 (55-c P3-4, the THIRD counts builder): unknown → open (the
+      // H-B-15 count twin — a mirror issue body must not say "0 open / 0
+      // resolved" while its own thread block renders the thread OPEN)
+      [{ story: { ...t.story, url: storyUrl }, counts: { open: t.status !== "fixed" && t.status !== "rejected" && t.status !== "resolved" ? 1 : 0, fixed: t.status === "fixed" ? 1 : 0, rejected: t.status === "rejected" ? 1 : 0, resolved: t.status === "resolved" ? 1 : 0 }, threads: [t] }],
       { origin, mirror: true, fullText: true }
     );
     if (body.length > ISSUE_BODY_LIMIT) {
@@ -1422,8 +1540,8 @@ function createGhSync(opts) {
     return body;
   }
   const SENTINEL_RE = /<!--\s*annotakit:c_(\S+?)\s*-->/;
-  const mirrorBody = (c) => `**${c.author}:** ${c.body}
-<!-- annotakit:c_${c.id} -->`;
+  const mirrorBody = (c) => `**${metaLine(c.author, 60)}:** ${c.body}
+<!-- annotakit:c_${metaLine(c.id)} -->`;
   const parseSentinel = (body) => {
     const m = body.match(SENTINEL_RE);
     return m ? m[1] : null;
@@ -1439,7 +1557,11 @@ function createGhSync(opts) {
     });
   }
   function orphanIndexOf(issues, threads) {
-    const mapped = new Set(threads.filter((t) => t.gh).map((t) => t.gh?.issue));
+    const cfgNow = configured();
+    const activeRepo = cfgNow.error ? null : cfgNow.repo;
+    const mapped = new Set(
+      threads.filter((t) => t.gh && (activeRepo === null || !isDetached(t.gh, activeRepo))).map((t) => t.gh?.issue)
+    );
     const unmappedById = new Map(threads.filter((t) => !t.gh).map((t) => [t.id, t]));
     const out = /* @__PURE__ */ new Map();
     for (const issue of issues) {
@@ -1452,12 +1574,48 @@ function createGhSync(opts) {
     }
     return out;
   }
+  function isDetached(ref, activeRepo) {
+    const r = ghMappingRepo(ref);
+    return r !== null && r !== activeRepo;
+  }
+  async function verifyMappingRepo(id, t, rp, body) {
+    const m = body !== null ? body.match(/^- thread id: (.+)$/m) : null;
+    if (m?.[1]?.trim() !== t.id) return false;
+    const after = await store.mutateThread(id, (cur) => {
+      if (cur.gh && !cur.gh.repo) cur.gh.repo = rp;
+    });
+    if (after) opts.onEngineMutation(after, "updated");
+    return true;
+  }
+  let warnedDetached = false;
   async function syncThread(id, orphanIndex) {
     const cfg = configured();
     if (cfg.error) throw Object.assign(new Error(cfg.error), { status: 400 });
     const t = await store.getThread(id);
     if (!t) return "noop";
     const { token: tk, repo: rp } = cfg;
+    if (t.gh) {
+      const mapRepo = ghMappingRepo(t.gh);
+      if (mapRepo === null) {
+        let body = null;
+        try {
+          const issue = await getIssue(tk, rp, t.gh.issue);
+          body = typeof issue.body === "string" ? issue.body : null;
+        } catch {
+          body = null;
+        }
+        if (!await verifyMappingRepo(id, t, rp, body)) {
+          console.warn(`[storybook-annotakit] gh-sync: issue #${t.gh.issue} (thread ${id.slice(0, 12)}\u2026) is not this thread's mirror on ${rp} \u2014 mapping DETACHED, push skipped (restore the repo config or unlink the thread to re-mirror)`);
+          return "noop";
+        }
+      } else if (mapRepo !== rp) {
+        if (!warnedDetached) {
+          warnedDetached = true;
+          console.warn(`[storybook-annotakit] gh-sync: mappings exist for issues on ${mapRepo} but the mirror targets ${rp} \u2014 those threads are DETACHED (frozen, not synced); restore the repo config or unlink them to re-mirror`);
+        }
+        return "noop";
+      }
+    }
     if (!t.gh) {
       let orphan = orphanIndex?.get(id);
       if (!orphan && orphanIndex === void 0) {
@@ -1469,23 +1627,29 @@ function createGhSync(opts) {
       if (orphan) {
         const adopted = await store.mutateThread(id, (cur) => {
           if (cur.gh) return;
-          cur.gh = { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: orphan.updated_at ?? nowIso() };
+          cur.gh = { issue: orphan.number, url: orphan.html_url, repo: rp, state: orphan.state, syncedAt: orphan.updated_at ?? nowIso() };
+          delete cur.ghUnlinkedAt;
+          adoptOrphanState(cur, orphan);
         });
         if (adopted) {
           opts.onEngineMutation(adopted, "updated");
           lastPushAt = nowIso();
+          enqueue(adopted.id);
           console.warn(`[storybook-annotakit] gh-sync: adopted orphaned mirror issue #${orphan.number} for thread ${id.slice(0, 12)}\u2026 (create-crash recovery)`);
           return "pushed";
         }
+        if ((await store.getThread(id))?.gh) return "pushed";
       }
       const created = await createIssue(tk, rp, { title: issueTitle(t), body: issueBody(t), labels: labelsOf() });
       const still = await store.mutateThread(id, (cur) => {
-        cur.gh = { issue: created.number, url: created.html_url, state: "open", syncedAt: created.updated_at ?? nowIso() };
+        if (cur.gh) return;
+        cur.gh = { issue: created.number, url: created.html_url, repo: rp, state: "open", syncedAt: created.updated_at ?? nowIso() };
+        delete cur.ghUnlinkedAt;
         for (const c of cur.comments) {
           if (!c.ghId && c.source !== "github") c.ghId = "issue-body";
         }
       });
-      if (!still) {
+      if (!still || still.gh?.issue !== created.number) {
         await addIssueComment(tk, rp, created.number, `${GH_SENTINEL}
 thread deleted in Storybook \u2014 closing.`);
         await setIssueState(tk, rp, created.number, "closed");
@@ -1548,9 +1712,14 @@ resolved in Storybook \u2014 thread #${t.number} (by ${who}${t.resolvedAt ? `, $
 reopened in Storybook \u2014 thread #${t.number}.`;
   }
   async function drainQueue() {
+    if (Date.now() < backoffUntil) return;
     let hadFailure = false;
     let guard = 0;
     while (queue.length && guard++ < 1e4) {
+      if (Date.now() < backoffUntil) {
+        queue.unshift();
+        break;
+      }
       const id = queue.shift();
       const nb = notBefore.get(id);
       if (nb && Date.now() < nb) {
@@ -1582,18 +1751,29 @@ reopened in Storybook \u2014 thread #${t.number}.`;
     if (!hadFailure && queue.length === 0 && Date.now() >= backoffUntil) lastError = null;
   }
   const tick = () => {
-    if (queue.length === 0) return;
+    if (queue.length === 0 || Date.now() < backoffUntil) return;
     void run(() => drainQueue()).catch(() => void 0);
   };
   function systemComment(t, ghId, author, body) {
     if (t.comments.some((c) => c.ghId === ghId)) return;
     t.comments.push({ id: newId().replace(/^th_/, "c_"), author, body, createdAt: nowIso(), ghId, source: "github" });
   }
+  function adoptOrphanState(cur, issue) {
+    if (String(issue.state) === "closed" && cur.status !== "resolved") {
+      cur.status = "resolved";
+      cur.resolvedAt = issue.closed_at ?? nowIso();
+      delete cur.reopenedAt;
+      systemComment(cur, `gh-close-${issue.number}`, issue.closed_by?.login ?? "github", "closed on GitHub");
+    }
+  }
   async function stalledThreads() {
     if (!opts.enabled || configured().error) return [];
     const threads = await store.listThreads();
+    const cfgNow = configured();
+    const activeRepo = cfgNow.error ? null : cfgNow.repo;
     return threads.filter((t) => {
       if (queued.has(t.id) || inflight.has(t.id)) return false;
+      if (t.gh && activeRepo !== null && isDetached(t.gh, activeRepo)) return false;
       const unmirrored = t.comments.some((c) => !c.ghId && c.source !== "github");
       const stateDrift = t.gh ? t.gh.state !== mirrorStateOf(t.status) : true;
       return unmirrored || stateDrift;
@@ -1615,6 +1795,26 @@ reopened in Storybook \u2014 thread #${t.number}.`;
       if (!t.gh) continue;
       if (queued.has(t.id) || inflight.has(t.id)) continue;
       const mir = t.gh;
+      {
+        const mapRepo = ghMappingRepo(mir);
+        if (mapRepo === null) {
+          const listed = remote.get(mir.issue);
+          let body = listed && typeof listed.body === "string" ? listed.body : null;
+          if (body === null) {
+            try {
+              const got = await getIssue(tk, rp, mir.issue);
+              body = typeof got.body === "string" ? got.body : null;
+            } catch {
+              body = null;
+            }
+          }
+          if (!await verifyMappingRepo(t.id, t, rp, body)) {
+            continue;
+          }
+        } else if (mapRepo !== rp) {
+          continue;
+        }
+      }
       let issue = remote.get(mir.issue);
       if (!issue) {
         try {
@@ -1623,13 +1823,18 @@ reopened in Storybook \u2014 thread #${t.number}.`;
           if (err?.status === 404) {
             const after = await store.mutateThread(t.id, (cur) => {
               delete cur.gh;
-              cur.comments.push({
-                id: newId().replace(/^th_/, "c_"),
-                author: "annotakit",
-                body: "GitHub issue deleted remotely \u2014 the mirror will be re-created on the next sync.",
-                createdAt: nowIso(),
-                source: "local"
-              });
+              cur.ghUnlinkedAt = nowIso();
+              const noteId = `gh-deleted-${mir.issue}`;
+              if (!cur.comments.some((c) => c.ghId === noteId)) {
+                cur.comments.push({
+                  id: newId().replace(/^th_/, "c_"),
+                  author: "annotakit",
+                  body: "GitHub issue deleted remotely \u2014 the mirror will be re-created on the next sync.",
+                  createdAt: nowIso(),
+                  ghId: noteId,
+                  source: "local"
+                });
+              }
             });
             if (after) {
               opts.onEngineMutation(after, "updated");
@@ -1662,7 +1867,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
       if (issue.state === "closed" && t.status !== "resolved") statusChange = "resolved";
       else if (issue.state === "open" && t.status === "resolved") statusChange = "reopen";
       const since = mir.syncedAt;
-      const futureStamp = Boolean(since) && Date.parse(String(since)) > Date.now() + SKEW_REPAIR_MS;
+      const futureStamp = Boolean(since) && Date.parse(String(since)) > Date.now() + SKEW_REPAIR_MS2;
       const issueActive = futureStamp || !since || !issue.updated_at || issue.updated_at > since;
       let fresh = [];
       if (issueActive) {
@@ -1674,7 +1879,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
             malformed++;
             continue;
           }
-          if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
+          if (!known.has(String(c.id)) && !String(c.body ?? "").trimStart().startsWith(GH_SENTINEL)) fresh.push(c);
         }
         if (malformed > 0) {
           console.warn(`[storybook-annotakit] pull: skipped ${malformed} malformed remote comment(s) on issue #${mir.issue} (non-string body/created_at) \u2014 treated as untrusted input, not imported`);
@@ -1728,7 +1933,7 @@ reopened in Storybook \u2014 thread #${t.number}.`;
         }
       }
     }
-    const mappedIssues = new Set(threads.filter((t) => t.gh).map((t) => t.gh?.issue));
+    const mappedIssues = new Set(threads.filter((t) => t.gh && !isDetached(t.gh, rp)).map((t) => t.gh?.issue));
     const unmappedById = new Map(threads.filter((t) => !t.gh).map((t) => [t.id, t]));
     for (const issue of remote.values()) {
       if (mappedIssues.has(issue.number)) continue;
@@ -1739,7 +1944,9 @@ reopened in Storybook \u2014 thread #${t.number}.`;
       if (!victim || queued.has(victim.id) || inflight.has(victim.id)) continue;
       const after = await store.mutateThread(victim.id, (cur) => {
         if (cur.gh) return;
-        cur.gh = { issue: issue.number, url: issue.html_url, state: issue.state, syncedAt: issue.updated_at ?? pullStartedAt };
+        cur.gh = { issue: issue.number, url: issue.html_url, repo: rp, state: issue.state, syncedAt: issue.updated_at ?? pullStartedAt };
+        delete cur.ghUnlinkedAt;
+        adoptOrphanState(cur, issue);
       });
       if (after) {
         opts.onEngineMutation(after, "updated");
@@ -1750,8 +1957,22 @@ reopened in Storybook \u2014 thread #${t.number}.`;
         );
       }
     }
+    const deletedIds = await store.listDeletedIds();
     for (const issueNumber of await store.listOpenTombstones()) {
       try {
+        let bodyStamp = null;
+        try {
+          const target = await getIssue(tk, rp, issueNumber);
+          const m = typeof target.body === "string" ? target.body.match(/^- thread id: (.+)$/m) : null;
+          bodyStamp = m?.[1]?.trim() ?? null;
+        } catch {
+          bodyStamp = null;
+        }
+        if (bodyStamp !== null && !deletedIds.has(bodyStamp)) {
+          console.warn(`[storybook-annotakit] gh-sync: tombstone close of issue #${issueNumber} SKIPPED \u2014 its body stamp (${bodyStamp.slice(0, 24)}\u2026) is not one of our deleted threads on ${rp} (foreign issue after a repo change?)`);
+          await store.tombstoneDone(issueNumber);
+          continue;
+        }
         if (remote.get(issueNumber)?.state !== "closed") {
           await addIssueComment(tk, rp, issueNumber, `${GH_SENTINEL}
 thread deleted in Storybook \u2014 closing.`);
@@ -1817,15 +2038,18 @@ thread deleted in Storybook \u2014 closing.`);
     let created = 0;
     let pushed = 0;
     let pushError = null;
-    for (const t of threadsNow) {
-      try {
-        const r = await syncThread(t.id, orphanIndex);
-        if (r === "created") created++;
-        if (r === "pushed") pushed++;
-      } catch (err) {
-        pushError = err instanceof Error ? err.message : String(err);
-        const e = err;
-        if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
+    if (Date.now() >= backoffUntil) {
+      for (const t of threadsNow) {
+        if (Date.now() < backoffUntil) break;
+        try {
+          const r = await syncThread(t.id, orphanIndex);
+          if (r === "created") created++;
+          if (r === "pushed") pushed++;
+        } catch (err) {
+          pushError = err instanceof Error ? err.message : String(err);
+          const e = err;
+          if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
+        }
       }
     }
     let pulled = 0;
@@ -1841,12 +2065,12 @@ thread deleted in Storybook \u2014 closing.`);
       const e = err;
       if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
       noteAuthFailure(err);
-      if (e.status === 401) backoffUntil = Math.max(backoffUntil, Date.now() + PULL_401_BACKOFF_MS);
+      if (e.status === 401) backoffUntil = Math.max(backoffUntil, Date.now() + PULL_401_BACKOFF_MS2);
       lastError = err instanceof Error ? err.message : String(err);
     }
     if (pushError) lastError = pushError;
     const stalled = (await stalledThreads()).length;
-    return { ok: true, created, pushed, pulled, healed, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled };
+    return { ok: true, created, pushed, pulled, healed, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled, backoffActive: Date.now() < backoffUntil };
   };
   const syncAll = async () => {
     const cfg = configured();
@@ -1864,11 +2088,14 @@ thread deleted in Storybook \u2014 closing.`);
     const mode = !opts.enabled ? "off" : cfg.error ? "unconfigured" : "auto";
     const note = mode === "off" ? "auto-sync disabled (ghAuto:false / ANNOTAKIT_GH_AUTO=0) \u2014 POST /sync still reconciles on demand (when configured)" : mode === "unconfigured" ? `local mode \u2014 reviews work fully on this server (REST + digests); to add the GitHub mirror: ${cfg.error ?? ""}` : `1:1 issue mirror active \u2014 push on every mutation, pull every ${opts.pollSec}s (POST /sync = force reconcile, never duplicates)`;
     const stalled = (await stalledThreads()).length;
+    const activeRepoForDetach = cfg.error ? null : cfg.repo;
+    const detached = mode === "auto" && activeRepoForDetach !== null ? list.filter((t) => t.gh && isDetached(t.gh, activeRepoForDetach)).length : 0;
     return {
       enabled: opts.enabled,
       mode,
       labels: labelsOf(),
       mapped: list.filter((t) => t.gh).length,
+      detached,
       threads: list.length,
       pending: queue.length + inflight.size,
       stalled,
@@ -1912,7 +2139,7 @@ thread deleted in Storybook \u2014 closing.`);
             const e = err;
             if (e.retryMs) backoffUntil = Math.max(backoffUntil, Date.now() + e.retryMs);
             noteAuthFailure(err);
-            if (e.status === 401) backoffUntil = Math.max(backoffUntil, Date.now() + PULL_401_BACKOFF_MS);
+            if (e.status === 401) backoffUntil = Math.max(backoffUntil, Date.now() + PULL_401_BACKOFF_MS2);
             lastError = err instanceof Error ? err.message : String(err);
           });
         },
@@ -1940,7 +2167,11 @@ thread deleted in Storybook \u2014 closing.`);
     } catch {
     }
   };
-  return { enqueue, enqueueDelete, syncAll, pullOnce: () => run(pullOnceRaw), status, start, stop };
+  return { enqueue, enqueueDelete, syncAll, pullOnce: () => run(pullOnceRaw), status, start, stop, clearRateLimitBackoff };
+  function clearRateLimitBackoff() {
+    backoffUntil = 0;
+    for (const k of notBefore.keys()) notBefore.delete(k);
+  }
 }
 var DEBOUNCE_MS = 6e3;
 var BOOT_MS = Date.now();
@@ -2030,28 +2261,34 @@ function gitAsync(root, args, timeoutMs, opts) {
     });
   });
 }
-function gitAsyncBuffer(root, args, timeoutMs) {
+function gitBlobToFile(root, args, dest, timeoutMs) {
   return new Promise((resolve) => {
-    const chunks = [];
     let out = "";
     let settled = false;
+    let fd;
+    try {
+      fd = fs.openSync(dest, "w");
+    } catch {
+      resolve({ ok: false, out: "open dest failed" });
+      return;
+    }
     const finish = (ok) => {
       if (settled) return;
       settled = true;
-      resolve({ ok, buf: Buffer.concat(chunks), out: redact(out).slice(0, 200) });
+      try {
+        fs.closeSync(fd);
+      } catch {
+      }
+      resolve({ ok, out: redact(out).slice(0, 200) });
     };
     const child = child_process.spawn("git", ["--no-optional-locks", "-C", root, ...args], {
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", fd, "pipe"]
     });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       finish(false);
     }, timeoutMs);
-    child.stdout.on("data", (d) => {
-      if (chunks.length < 64) chunks.push(d);
-      else finish(false);
-    });
-    child.stderr.on("data", (d) => out += d.toString());
+    child.stderr?.on("data", (d) => out += d.toString());
     child.on("error", () => {
       clearTimeout(timer);
       finish(false);
@@ -2210,15 +2447,21 @@ function createAutoSync(opts) {
   };
   const readRemoteDoc = async (commitSha) => {
     let sha = commitSha;
+    let sawBlob = false;
     for (let hop = 0; hop < 4; hop++) {
-      const show = await gitAsyncBuffer(root, ["show", `${sha}:threads.db`], 8e3);
-      if (show.ok && show.buf.length > 0) {
+      const exists = await gitAsync(root, ["cat-file", "-e", `${sha}:threads.db`], 5e3);
+      if (exists.ok) {
+        sawBlob = true;
         const tmpDir = fs.mkdtempSync(path2__default.default.join(os__default.default.tmpdir(), "annotakit-restore-"));
         const tmp = path2__default.default.join(tmpDir, "threads.db");
         try {
-          fs.writeFileSync(tmp, show.buf);
-          const doc = readStoreFile(tmp);
-          if (doc && doc.threads.length >= 0) return { threads: doc.threads, deletedIds: doc.deletedIds };
+          const show = await gitBlobToFile(root, ["show", `${sha}:threads.db`], tmp, 15e3);
+          if (show.ok) {
+            const doc = readStoreFile(tmp);
+            if (doc && doc.threads.length >= 0) return { kind: "doc", doc: { threads: doc.threads, deletedIds: doc.deletedIds } };
+          } else {
+            logOnce(`remote db blob read failed at ${sha.slice(0, 8)} (${show.out})`);
+          }
         } finally {
           try {
             fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -2227,10 +2470,10 @@ function createAutoSync(opts) {
         }
       }
       const parent = await gitAsync(root, ["rev-parse", "--verify", "--quiet", `${sha}^`], 5e3);
-      if (!parent.ok || !SHA_RE.test(parent.out.trim())) return null;
+      if (!parent.ok || !SHA_RE.test(parent.out.trim())) return sawBlob ? { kind: "unreadable" } : { kind: "absent" };
       sha = parent.out.trim();
     }
-    return null;
+    return sawBlob ? { kind: "unreadable" } : { kind: "absent" };
   };
   const importDoc = async (doc) => {
     await opts.store.importTombstones(doc.deletedIds);
@@ -2262,7 +2505,7 @@ function createAutoSync(opts) {
         trace(`restore: fetched=${fetched ? fetched.slice(0, 8) : "none"}`);
         if (fetched) remote = { sha: fetched, ref: REMOTE_CACHE_REF };
         if (!remote) {
-          state = `no remote store yet (${branch}) \u2014 first snapshot will create it`;
+          state = repo ? `no remote store yet (${branch}) \u2014 first snapshot will create it` : `local orphan branch only (${branch}) \u2014 no GitHub repo configured; set ANNOTAKIT_GH_REPO for cross-machine durability`;
           return;
         }
         let kind = await refReadmeKind(remote.ref);
@@ -2286,12 +2529,13 @@ function createAutoSync(opts) {
             return;
           }
         }
-        const remoteDoc = await readRemoteDoc(remote.sha);
+        const remoteRead = await readRemoteDoc(remote.sha);
         const localCount = await opts.countThreads();
-        if (!remoteDoc) {
-          state = `remote store unreadable (walked parents) \u2014 local data safe (${localCount} threads)`;
+        if (remoteRead.kind !== "doc") {
+          state = remoteRead.kind === "unreadable" ? `remote store unreadable (walked parents) \u2014 local data safe (${localCount} threads)` : `remote ${branch} carries no store blob (README-only) \u2014 local data safe (${localCount} threads)`;
           return;
         }
+        const remoteDoc = remoteRead.doc;
         if (localCount === 0 && (remoteDoc.threads.length > 0 || remoteDoc.deletedIds.size > 0)) {
           const n = await importDoc(remoteDoc);
           state = `restored ${n} threads from ${branch} (boot)`;
@@ -2308,7 +2552,11 @@ function createAutoSync(opts) {
           });
           if (changed) {
             const n = await importDoc(merged);
-            state = `merged remote ${branch} \u2192 ${n} threads (boot)`;
+            const droppedIds = [
+              ...local.threads.filter((t) => merged.deletedIds.has(t.id)).map((t) => t.id),
+              ...remoteDoc.threads.filter((t) => merged.deletedIds.has(t.id)).map((t) => t.id)
+            ].filter((id, i, a) => a.indexOf(id) === i);
+            state = `merged remote ${branch} \u2192 ${n} threads (boot)` + (droppedIds.length > 0 ? ` \u2014 delete-wins dropped: ${droppedIds.slice(0, 10).join(", ")}${droppedIds.length > 10 ? ` (+${droppedIds.length - 10} more)` : ""}` : "");
             console.warn(`[storybook-annotakit] store restore: ${state}`);
             void syncOnce(9e3, "boot-merge");
           } else {
@@ -2351,8 +2599,21 @@ function createAutoSync(opts) {
           }
         }
         if (parent) {
-          const remoteDoc = await readRemoteDoc(parent);
-          if (remoteDoc) {
+          const remoteRead = await readRemoteDoc(parent);
+          if (remoteRead.kind === "unreadable") {
+            logOnce(
+              `remote ${branch} store unreadable at ${parent.slice(0, 8)} \u2014 REFUSING to push an uncomputed union (it would wholesale-replace remote content)`
+            );
+            state = "refusing to push \u2014 remote store unreadable (union uncomputed); local data safe";
+            if (repo) {
+              consecutivePushFailures += 1;
+              lastPushError = "remote store unreadable \u2014 push refused (union uncomputed)";
+              lastSyncAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
+            }
+            return false;
+          }
+          if (remoteRead.kind === "doc") {
+            const remoteDoc = remoteRead.doc;
             const local = { threads: await opts.store.listThreads(), deletedIds: await opts.store.listDeletedIds() };
             const merged = logicalMerge(local, { threads: remoteDoc.threads, deletedIds: remoteDoc.deletedIds });
             const changed = merged.threads.length !== local.threads.length || merged.deletedIds.size !== local.deletedIds.size || merged.threads.some((mt) => {
@@ -2373,6 +2634,11 @@ function createAutoSync(opts) {
         const tree = await buildTree(timeoutMs);
         if (!tree) {
           state = "error: git tree";
+          if (repo) {
+            consecutivePushFailures += 1;
+            lastPushError = "git tree build failed (pre-push cycle failure)";
+            lastSyncAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
+          }
           return false;
         }
         const commit = await commitTree(
@@ -2383,22 +2649,37 @@ function createAutoSync(opts) {
         );
         if (!commit) {
           state = "error: git commit-tree";
+          if (repo) {
+            consecutivePushFailures += 1;
+            lastPushError = "git commit-tree failed (pre-push cycle failure)";
+            lastSyncAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
+          }
           return false;
         }
         let push = await pushCommit(commit, timeoutMs);
+        let pushedSha = commit;
+        let pushedParent = parent;
         trace(`syncOnce(${reason}): push1=${push.ok} ${push.out.slice(0, 80)}`);
         if (!push.ok && (/non-fast-forward|fetch first|rejected|failed to push|atomic/i.test(push.out) || /cannot lock ref|cannot lock/i.test(push.out))) {
           const freshHead = await fetchRemote(timeoutMs);
           if (freshHead && await refHasOurReadme(REMOTE_CACHE_REF)) {
-            const remoteDoc = await readRemoteDoc(freshHead);
-            if (remoteDoc) {
-              const local = { threads: await opts.store.listThreads(), deletedIds: await opts.store.listDeletedIds() };
-              const merged = logicalMerge(local, { threads: remoteDoc.threads, deletedIds: remoteDoc.deletedIds });
-              await importDoc(merged);
-              opts.checkpoint();
+            const freshRead = await readRemoteDoc(freshHead);
+            if (freshRead.kind === "unreadable") {
+              logOnce("diverged and the fresh remote store is unreadable \u2014 REFUSING the merge push (union uncomputed); will retry next mutation");
+            } else {
+              if (freshRead.kind === "doc") {
+                const local = { threads: await opts.store.listThreads(), deletedIds: await opts.store.listDeletedIds() };
+                const merged = logicalMerge(local, { threads: freshRead.doc.threads, deletedIds: freshRead.doc.deletedIds });
+                await importDoc(merged);
+                opts.checkpoint();
+              }
               const tree2 = await buildTree(timeoutMs);
               const commit2 = tree2 ? await commitTree(tree2, freshHead, `annotakit store merge (${reason})`, timeoutMs) : null;
-              if (commit2) push = await pushCommit(commit2, timeoutMs);
+              if (commit2) {
+                pushedSha = commit2;
+                pushedParent = freshHead;
+                push = await pushCommit(commit2, timeoutMs);
+              }
             }
           } else {
             logOnce("diverged but remote head unavailable/foreign \u2014 will retry next mutation");
@@ -2426,12 +2707,12 @@ function createAutoSync(opts) {
         lastPushError = null;
         lastSyncAt = (/* @__PURE__ */ new Date()).toISOString();
         lastSyncAttemptAt = lastSyncAt;
-        if (remoteHead) {
-          await gitAsync(root, ["update-ref", REMOTE_CACHE_REF, commit, remoteHead], timeoutMs);
-          await gitAsync(root, ["update-ref", `refs/heads/${branch}`, commit, remoteHead], timeoutMs);
+        if (pushedParent) {
+          await gitAsync(root, ["update-ref", REMOTE_CACHE_REF, pushedSha, pushedParent], timeoutMs);
+          await gitAsync(root, ["update-ref", `refs/heads/${branch}`, pushedSha, pushedParent], timeoutMs);
         } else {
-          await gitAsync(root, ["update-ref", REMOTE_CACHE_REF, commit], timeoutMs);
-          await gitAsync(root, ["update-ref", `refs/heads/${branch}`, commit], timeoutMs);
+          await gitAsync(root, ["update-ref", REMOTE_CACHE_REF, pushedSha], timeoutMs);
+          await gitAsync(root, ["update-ref", `refs/heads/${branch}`, pushedSha], timeoutMs);
         }
         state = `pushed ${branch} \u2192 ${repo} (${reason})`;
         return true;
@@ -2572,7 +2853,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.12";
+var VERSION = "0.6.15";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2605,9 +2886,10 @@ function bootstrap(configDir, port) {
   const config = preConfig;
   const root = projectRoot(configDir);
   const detected = detectGithubRepo(root);
-  const configRepo = typeof config.ghRepo === "string" ? config.ghRepo : null;
+  const configRepoRaw = typeof config.ghRepo === "string" ? config.ghRepo : null;
+  const configRepo = configRepoRaw !== null ? normalizeGhRepoInput(configRepoRaw) : null;
   const envRepo = ghRepoEnv();
-  const repo = configRepo ?? envRepo ?? detected.repo;
+  const repo = configRepoRaw !== null ? configRepo : envRepo ?? detected.repo;
   const ghLabels = resolveGhLabels(config);
   const shutdownHooks = [];
   const sync = createAutoSync({
@@ -2626,6 +2908,11 @@ function bootstrap(configDir, port) {
   const repoSource = configRepo ? `${CONFIG_FILE} ghRepo` : envRepo ? "ANNOTAKIT_GH_REPO env" : detected.source;
   const configToken = typeof config.ghToken === "string" ? config.ghToken : void 0;
   const bootWarnings = [];
+  if (configRepoRaw !== null && configRepo === null) {
+    bootWarnings.push(
+      `${CONFIG_FILE} "ghRepo" ${JSON.stringify(configRepoRaw)} is not a valid GitHub repo \u2014 expected "owner/name" (github.com URLs and the github: shorthand normalize). The GitHub mirror stays OFF instead of arming a dead target; fix the value to enable mirroring.`
+    );
+  }
   const kit = kitRepo();
   if (repo && kit && repo === kit) {
     bootWarnings.push(
@@ -2645,7 +2932,7 @@ function bootstrap(configDir, port) {
   for (const w of bootWarnings) console.warn(`[storybook-annotakit] \u26A0 ${w}`);
   const ghAuto = config.ghAuto !== false && !["0", "false", "off", "no"].includes(String(process.env.ANNOTAKIT_GH_AUTO ?? "").toLowerCase());
   const pollSec = nonNegNum(process.env.ANNOTAKIT_GH_POLL) ?? nonNegNum(config.ghPoll) ?? 60;
-  const intervalMs = nonNegNum(process.env.ANNOTAKIT_GH_INTERVAL) ?? 700;
+  const intervalMs = Math.max(100, nonNegNum(process.env.ANNOTAKIT_GH_INTERVAL) ?? 700);
   const ghsync = createGhSync({
     store,
     repo,
@@ -2720,7 +3007,12 @@ function enforceApiAccess(req, res) {
   if (isLoopbackPeer(req)) return true;
   if (key) {
     const provided = req.headers["x-annotakit-key"];
-    const ok = provided === key || Array.isArray(provided) && provided.includes(key);
+    const safeEqual = (a, b) => {
+      const ha = crypto.createHash("sha256").update(a, "utf8").digest();
+      const hb = crypto.createHash("sha256").update(b, "utf8").digest();
+      return ha.length === hb.length && ha.equals(hb);
+    };
+    const ok = typeof provided === "string" && safeEqual(provided, key) || Array.isArray(provided) && provided.some((p) => safeEqual(p, key));
     if (!ok) {
       sendJson(res, 401, { error: "x-annotakit-key header required (ANNOTAKIT_API_KEY is set on this server)" });
       return false;
@@ -2749,7 +3041,14 @@ function applyCors(req, res, methods = "GET,POST,PATCH,DELETE,OPTIONS") {
   }
   if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/.test(host)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Methods", methods);
+    let allow = methods;
+    try {
+      const path4 = new URL(req.url ?? "/", "http://localhost").pathname;
+      const known = KNOWN_API_ROUTES.find(([re]) => re.test(path4));
+      if (known) allow = known[1];
+    } catch {
+    }
+    res.setHeader("Access-Control-Allow-Methods", allow);
     res.setHeader("Access-Control-Allow-Headers", "content-type");
     res.setHeader("Access-Control-Expose-Headers", "X-Annotakit-Replayed, X-Annotakit-Mirror");
     res.setHeader("Vary", "Origin");
@@ -2820,6 +3119,8 @@ var THREAD_INPUT_EXAMPLE = {
   // id: the IDEMPOTENCY KEY — send a stable, meaningful id (e.g.
   // "fix-header-overflow") and a replayed POST with the same id returns
   // 200 with the existing thread instead of minting a duplicate (201).
+  // FINALITY: an id that was DELETEd is tombstoned forever — a POST with
+  // that id 409s (delete-wins); a correction after a delete needs a NEW id.
   // Omit it only when you genuinely want a brand-new thread per POST.
   id: "fix-kpi-tabular-nums",
   storyId: "nimbus-components--kpi-card-story",
@@ -2905,11 +3206,29 @@ function buildPatchCandidate(prev, body) {
         { status: 400 }
       );
     }
-    return full;
+    return { ...full, id: prev.id, storyId: prev.storyId, number: prev.number, createdAt: prev.createdAt };
   }
   const next = { ...prev };
   for (const key of PATCH_MERGEABLE_FIELDS) {
     if (key in body) next[key] = body[key];
+  }
+  if ("comments" in next && !Array.isArray(next.comments)) {
+    throw Object.assign(new Error("PATCH `comments` must be an array (comment objects, union-merged by id)"), { status: 400 });
+  }
+  if ("story" in next && next.story !== null && (typeof next.story !== "object" || Array.isArray(next.story))) {
+    throw Object.assign(new Error("PATCH `story` must be an object (story metadata) or null"), { status: 400 });
+  }
+  if ("component" in next && next.component !== null && (typeof next.component !== "object" || Array.isArray(next.component))) {
+    throw Object.assign(new Error("PATCH `component` must be an object (component metadata) or null"), { status: 400 });
+  }
+  if ("target" in next && (typeof next.target !== "object" || next.target === null || Array.isArray(next.target))) {
+    throw Object.assign(new Error("PATCH `target` must be an object (pin target)"), { status: 400 });
+  }
+  if ("author" in next && typeof next.author !== "string") {
+    throw Object.assign(new Error("PATCH `author` must be a string"), { status: 400 });
+  }
+  if ("resolvedAt" in next && next.resolvedAt !== null && typeof next.resolvedAt !== "string") {
+    throw Object.assign(new Error("PATCH `resolvedAt` must be an ISO string or null"), { status: 400 });
   }
   return next;
 }
@@ -2929,7 +3248,8 @@ function groupByStory(threads, origin) {
     if (t.status === "open") entry.counts.open++;
     else if (t.status === "fixed") entry.counts.fixed++;
     else if (t.status === "rejected") entry.counts.rejected++;
-    else entry.counts.resolved++;
+    else if (t.status === "resolved") entry.counts.resolved++;
+    else entry.counts.open++;
   }
   const out = [...map.values()];
   for (const s of out) s.threads.sort((a, b) => a.number - b.number);
@@ -2954,22 +3274,23 @@ async function handleApi(req, res, url, configDir, origin) {
       endpoints: [
         ["GET", `${API_BASE}/health`, "agentSurfaces, store, gh + git state \u2014 detect your path here first"],
         ["GET", `${API_BASE}/schema`, "this document"],
-        ["GET", `${API_BASE}/threads`, "ALL threads \u2014 envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array)"],
+        ["GET", `${API_BASE}/threads`, "ALL threads \u2014 envelope {threads: [...], snapshots: [ids]}; UNWRAP .threads (it is not a bare array). v0.6.14: ?sort=recent (updatedAt DESC \u2014 the panel's latest-first view; unknown sort values 400)"],
         ["GET", `${API_BASE}/threads?storyId=<id>&status=<open|fixed|rejected|resolved>`, "filtered (an EMPTY storyId param is treated as absent, not a filter)"],
-        ["POST", `${API_BASE}/threads`, "create \u2192 201; idempotent replay (same id) \u2192 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only \u2014 amend via PATCH"],
+        ["POST", `${API_BASE}/threads`, "create \u2192 201; idempotent replay (same id) \u2192 200 with body.replayed=true + X-Annotakit-Replayed header. POST is create-only \u2014 amend via PATCH. A DELETED id is final \u2192 409 {deletedId:true} (delete-wins tombstones; use a new id)"],
         ["GET", `${API_BASE}/threads/<id>`, "one thread doc"],
         ["PATCH", `${API_BASE}/threads/<id>`, "partial {status} (JSON-merge) or full doc \u2014 see PATCH below"],
         ["POST", `${API_BASE}/threads/<id>/comments`, "reply \u2192 201 with the FULL updated thread doc (not the new comment); key comments by thread id, never by your own comment id (ids are re-hashed)"],
-        ["DELETE", `${API_BASE}/threads/<id>`, "delete (path form; legacy DELETE /threads?id=<id> equivalent)"],
-        ["GET|PUT", `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence \u2014 GET \u2192 JSON, GET ?format=html \u2192 human view; PUT replaces (idempotent, 96KB cap) and broadcasts THREADS_CHANGED {reason:"snapshot"} so live panels re-fetch'],
+        ["DELETE", `${API_BASE}/threads/<id>`, 'delete (path form; legacy DELETE /threads?id=<id> equivalent) \u2014 broadcasts THREADS_CHANGED {reason:"deleted"} so live panels drop the row (v0.6.13, Task 42)'],
+        ["GET|PUT|POST", `${API_BASE}/threads/<id>/snapshot`, 'plan-b DOM evidence \u2014 GET \u2192 JSON, GET ?format=html \u2192 human view; PUT/POST replaces (idempotent, 96KB cap) and broadcasts THREADS_CHANGED {reason:"snapshot"} so live panels re-fetch'],
         ["GET", `${API_BASE}/export?format=md|json`, "digest \u2014 json keeps FULL bodies (envelope {generatedAt, stories:[...]}, story-grouped, NOT the {threads:[...]} shape of GET /threads). md default is the LEAN digest (200-char clips for token economy); add ?mode=full for VERBATIM bodies (the panel export uses this \u2014 a hand-off artifact must never shorten a note)"],
-        ["GET|POST", `${API_BASE}/sync`, "mirror status / force reconcile \u2014 POST also forces one git store cycle first (v0.6.1)"],
-        ["POST", `${API_BASE}/gh/reload`, "re-read .env and apply token changes WITHOUT a restart (v0.6.6) \u2014 response lists applied/requiresRestart; the PAT is never echoed"]
+        ["GET|POST", `${API_BASE}/sync`, 'mirror status / force reconcile \u2014 POST also forces one git store cycle first (v0.6.1); v0.6.13 (DD-12): POST CLEARS the rate-limit backoff window and per-thread retry parks before reconciling ("Sync now" means retry NOW) \u2014 the debounced tick still respects the window'],
+        ["POST", `${API_BASE}/gh/reload`, "re-read .env and apply token changes WITHOUT a restart (v0.6.6) \u2014 response lists applied/requiresRestart; the PAT is never echoed"],
+        ["POST", `${API_BASE}/gh`, "legacy alias of POST /sync (force reconcile)"]
       ],
       POST: {
         url: `${API_BASE}/threads`,
         body: THREAD_INPUT_EXAMPLE,
-        note: 'body.id is the IDEMPOTENCY KEY: a replayed POST with the same id returns 200 (existing thread, flagged replayed:true \u2014 your new body does NOT land; amend via PATCH), a fresh id (or none) returns 201 \u2014 send a stable id (e.g. "fix-header-overflow") whenever a retry might replay the POST, or you mint duplicate threads. Server assigns per-story numbers; comment ids are deterministically re-hashed server-side (your comment id may come back different \u2014 key by thread id). Threads without story.importPath render as bare digest sections (pass story metadata when you have it).'
+        note: 'body.id is the IDEMPOTENCY KEY: a replayed POST with the same id returns 200 (existing thread, flagged replayed:true \u2014 your new body does NOT land; amend via PATCH), a fresh id (or none) returns 201 \u2014 send a stable id (e.g. "fix-header-overflow") whenever a retry might replay the POST, or you mint duplicate threads. FINALITY: an id that was DELETEd stays deleted \u2014 POSTing it again 409s {deletedId:true}; a correction after a delete needs a NEW id. Server assigns per-story numbers; comment ids are deterministically re-hashed server-side (your comment id may come back different \u2014 key by thread id). Threads without story.importPath render as bare digest sections (pass story metadata when you have it).'
       },
       PATCH: {
         url: `${API_BASE}/threads/<id>`,
@@ -2984,8 +3305,8 @@ async function handleApi(req, res, url, configDir, origin) {
       DELETE: { url: `${API_BASE}/threads/<id>` },
       SNAPSHOT: {
         url: `${API_BASE}/threads/<id>/snapshot`,
-        methods: ["GET", "PUT"],
-        note: 'GET \u2192 JSON { html, clipped, capturedAt, width, height } (plan-b evidence: story DOM at pin time, pinned element carries data-annota-snap="1"); GET ?format=html \u2192 human-viewable inert render (CSP script-src none; unknown format values \u2192 400); PUT replaces (idempotent, 96KB cap)'
+        methods: ["GET", "PUT", "POST"],
+        note: 'GET \u2192 JSON { html, clipped, capturedAt, width, height } (plan-b evidence: story DOM at pin time, pinned element carries data-annota-snap="1"); GET ?format=html \u2192 human-viewable inert render (CSP script-src none; unknown format values \u2192 400); PUT/POST replaces (idempotent, 96KB cap measured in UTF-8 bytes)'
       },
       limits: { maxCommentBodyChars: MAX_BODY_CHARS, maxRequestBodyBytes: 2e6, maxSnapshotBytes: 96 * 1024 }
     });
@@ -3045,14 +3366,35 @@ async function handleApi(req, res, url, configDir, origin) {
         // ?status=Open (an easy agent typo) matches like the PATCH normalizer
         status: url.searchParams.get("status")?.toLowerCase() || void 0
       });
+      const sort = url.searchParams.get("sort")?.toLowerCase() || null;
+      if (sort !== null && sort !== "recent") {
+        throw Object.assign(new Error(`unknown sort ${JSON.stringify(sort)} \u2014 use ?sort=recent (updatedAt DESC, newest activity first; omit for the stable story/number order)`), { status: 400 });
+      }
+      const sorted = sort === "recent" ? [...threads].sort((a, b) => String(b.updatedAt ?? b.createdAt ?? "").localeCompare(String(a.updatedAt ?? a.createdAt ?? ""))) : threads;
       const snapshots = [...await store.listSnapshotIds()];
-      sendJson(res, 200, { threads, snapshots });
+      sendJson(res, 200, { threads: sorted, snapshots });
       return true;
     }
     if (method === "POST") {
       const input = validateThreadInput(await readBody(req));
+      if (input.id && (await store.listDeletedIds()).has(input.id)) {
+        sendJson(res, 409, {
+          error: `id ${input.id} was deleted \u2014 tombstones are final (delete-wins). POST with a new id.`,
+          deletedId: true
+        });
+        return true;
+      }
       const preexisting = input.id ? await store.getThread(input.id) : null;
-      const thread = await store.createThread(input);
+      let thread;
+      try {
+        thread = await store.createThread(input);
+      } catch (err) {
+        if (err instanceof TombstonedIdError) {
+          sendJson(res, 409, { error: err.message, deletedId: true });
+          return true;
+        }
+        throw err;
+      }
       warnUnknownStory(input.storyId, Boolean(input.story?.importPath));
       afterMutation(rt, { storyId: thread.storyId, threadId: thread.id, reason: "created" });
       await sendMutationJson(rt, res, preexisting ? 200 : 201, thread, { replayed: Boolean(preexisting) });
@@ -3065,7 +3407,7 @@ async function handleApi(req, res, url, configDir, origin) {
       const ok = await store.deleteThread(id);
       if (!ok) return notFound(res), true;
       if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
-      afterMutation(rt, { storyId: prev?.storyId, threadId: void 0, reason: "updated" });
+      afterMutation(rt, { storyId: prev?.storyId, threadId: void 0, reason: "deleted" });
       sendJson(res, 200, { ok: true });
       return true;
     }
@@ -3084,7 +3426,7 @@ async function handleApi(req, res, url, configDir, origin) {
       const ok = await store.deleteThread(id);
       if (!ok) return notFound(res, THREAD_404_HINT), true;
       if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
-      afterMutation(rt, { storyId: prev?.storyId, threadId: void 0, reason: "updated" });
+      afterMutation(rt, { storyId: prev?.storyId, threadId: void 0, reason: "deleted" });
       sendJson(res, 200, { ok: true });
       return true;
     }
@@ -3154,12 +3496,23 @@ async function handleApi(req, res, url, configDir, origin) {
       }
       if (prev.gh) full.gh = prev.gh;
       else delete full.gh;
+      full.ghUnlinkedAt = prev.ghUnlinkedAt;
+      const prevByGhId = /* @__PURE__ */ new Map();
+      for (const pc of prev.comments) {
+        if (pc.ghId && pc.ghId !== "issue-body" && !prevByGhId.has(pc.ghId)) prevByGhId.set(pc.ghId, pc);
+      }
+      const consumedPrevIds = /* @__PURE__ */ new Set();
+      for (const c of full.comments) {
+        if (!c.ghId || c.ghId === "issue-body") continue;
+        const twin = prevByGhId.get(c.ghId);
+        if (twin && twin.id !== c.id) consumedPrevIds.add(twin.id);
+      }
       const bodyIds = new Set(full.comments.map((c) => c.id));
       for (const pc of prev.comments) {
-        if (!bodyIds.has(pc.id)) full.comments.push(pc);
+        if (!bodyIds.has(pc.id) && !consumedPrevIds.has(pc.id)) full.comments.push(pc);
       }
       for (const c of full.comments) {
-        const pc = prev.comments.find((x) => x.id === c.id);
+        const pc = prev.comments.find((x) => x.id === c.id) ?? (c.ghId && c.ghId !== "issue-body" ? prevByGhId.get(c.ghId) : void 0);
         if (pc) {
           if (pc.ghId && !c.ghId) c.ghId = pc.ghId;
           if (pc.source && !c.source) c.source = pc.source;
@@ -3239,7 +3592,10 @@ async function handleApi(req, res, url, configDir, origin) {
       const body = await readBody(req);
       const html = typeof body.html === "string" ? body.html : "";
       if (!html.trim()) throw Object.assign(new Error("snapshot html is required"), { status: 400 });
-      if (html.length > 96 * 1024) throw Object.assign(new Error("snapshot too large (max 96KB)"), { status: 413 });
+      if (Buffer.byteLength(html, "utf8") > 96 * 1024) throw Object.assign(new Error("snapshot too large (max 96KB)"), { status: 413 });
+      const sc = body.scroll;
+      const scX = sc && typeof sc === "object" ? Number(sc.x) : NaN;
+      const scY = sc && typeof sc === "object" ? Number(sc.y) : NaN;
       const snap = {
         format: "dom",
         html,
@@ -3249,11 +3605,12 @@ async function handleApi(req, res, url, configDir, origin) {
         height: Math.round(Number(body.height) || 600),
         // v0.6.9 (S3): the frozen-container shape marker — additive; the
         // legacy story-root shape simply lacks it (old snapshots).
-        surface: body.surface === "frozen" ? "frozen" : void 0
+        surface: body.surface === "frozen" ? "frozen" : void 0,
+        scroll: Number.isFinite(scX) && Number.isFinite(scY) ? { x: Math.max(0, Math.round(scX)), y: Math.max(0, Math.round(scY)) } : void 0
       };
       await store.putSnapshot(id, snap);
       broadcast({ storyId: thread.storyId, threadId: id, reason: "snapshot" });
-      sendJson(res, 200, { ok: true, threadId: id, bytes: html.length, clipped: snap.clipped });
+      sendJson(res, 200, { ok: true, threadId: id, bytes: Buffer.byteLength(html, "utf8"), clipped: snap.clipped });
       return true;
     }
     if (method === "GET" || method === "HEAD") {
@@ -3264,7 +3621,8 @@ async function handleApi(req, res, url, configDir, origin) {
         throw Object.assign(new Error(`unknown format ${JSON.stringify(fmt)} \u2014 use ?format=html (human view) or omit for JSON`), { status: 400 });
       }
       if (fmt === "html") {
-        const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'"><title>annotakit snapshot ${id}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped at 32KB</div>' : ""}</body></html>`;
+        const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+        const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'; frame-src 'none'"><title>annotakit snapshot ${esc(id)}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped (capture exceeded the client size cap)</div>' : ""}</body></html>`;
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
         res.end(method === "HEAD" ? void 0 : page);
         return true;
@@ -3312,6 +3670,7 @@ async function handleApi(req, res, url, configDir, origin) {
       return true;
     }
     if (method === "POST") {
+      rt.ghsync.clearRateLimitBackoff();
       await rt.sync.restore().catch(() => void 0);
       const gitOk = await rt.sync.syncNow("api").catch(() => false);
       const summary = await rt.ghsync.syncAll();
@@ -3338,13 +3697,14 @@ async function handleApi(req, res, url, configDir, origin) {
   }
   if (p === `${API_BASE}/gh` && method === "POST") {
     await rt.sync.restore().catch(() => void 0);
+    rt.ghsync.clearRateLimitBackoff();
     const gitOk = await rt.sync.syncNow("api").catch(() => false);
     const summary = await rt.ghsync.syncAll();
     sendJson(res, 200, {
       ...summary,
       gitSync: rt.sync.gitHealth(),
       gitSyncForced: gitOk,
-      note: "digest issues are gone: each thread mirrors to exactly ONE issue now. POST /annotakit/api/sync is the canonical force-reconcile; this alias behaves identically (restore settle + forced git cycle + mirror reconcile)."
+      note: "digest issues are gone: each thread mirrors to exactly ONE issue now. POST /annotakit/api/sync is the canonical force-reconcile; this alias behaves identically (clears the rate-limit window, restore settle + forced git cycle + mirror reconcile)."
     });
     return true;
   }
@@ -3358,7 +3718,8 @@ var KNOWN_API_ROUTES = [
   [new RegExp(`^${API_BASE}/threads/[^/]+/comments$`), "POST, OPTIONS"],
   // v0.6.7 (audit 24-b P3): the snapshot endpoint was missing — unsupported
   // methods on a documented route 404'd as "unknown route" instead of 405+Allow
-  [new RegExp(`^${API_BASE}/threads/[^/]+/snapshot$`), "GET, PUT, OPTIONS"],
+  // (S9: POST added — the route handler accepts PUT || POST; /schema agrees)
+  [new RegExp(`^${API_BASE}/threads/[^/]+/snapshot$`), "GET, PUT, POST, OPTIONS"],
   [new RegExp(`^${API_BASE}/export$`), "GET, OPTIONS"],
   [new RegExp(`^${API_BASE}/sync$`), "GET, POST, OPTIONS"],
   [new RegExp(`^${API_BASE}/gh$`), "POST, OPTIONS"],

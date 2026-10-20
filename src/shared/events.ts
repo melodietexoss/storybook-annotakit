@@ -93,7 +93,12 @@ export interface ThreadsChangedPayload {
   /** v0.5.0: 'restored' (boot restore / divergence merge imported rows) —
    *  the other values are user/engine mutations. v0.6.3: 'fixed' (agent
    *  addressed, awaiting review). v0.6.11 (S7-A): 'rejected' (reviewer
-   *  rejected a fix — re-work expected; mirrors a system notice comment). */
+   *  rejected a fix — re-work expected; mirrors a system notice comment).
+   *  v0.6.13 (S9/U2, 33-f P3): 'deleted' — both server DELETE doors now
+   *  broadcast it (the wire could previously only say 'updated' for a
+   *  delete). ADDITIVE: no consumer branches on `reason` (audit-verified —
+   *  both listeners key on storyId), so nothing to migrate; the /schema
+   *  THREADS_CHANGED row mentioning it is the docs batch's ledger item. */
   reason:
     | 'created'
     | 'updated'
@@ -103,6 +108,7 @@ export interface ThreadsChangedPayload {
     | 'fixed'
     | 'rejected'
     | 'restored'
+    | 'deleted' // v0.6.13 (S9/U2): a delete is a delete — both DELETE doors send it
     | 'snapshot'; // v0.6.10: snapshot PUT — evidence-only, no gh/git churn, panels re-fetch
 }
 

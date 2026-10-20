@@ -20,6 +20,18 @@ export interface StoreKind {
   storePath: string;
 }
 
+/** DD-1 (S9): thrown when a POST carries an id whose thread was deleted —
+ *  tombstones are final (delete-wins, A1): a re-create under a standing
+ *  tombstone is a local-only zombie that the next boot-restore annihilates
+ *  (and pushes the loss to peers). The routes door maps this to 409. */
+export class TombstonedIdError extends Error {
+  readonly deletedId = true;
+  constructor(id: string) {
+    super(`id ${id} was deleted — tombstones are final (delete-wins). POST with a new id.`);
+    this.name = 'TombstonedIdError';
+  }
+}
+
 /** A store FILE read as data (migration + boot-restore validation, A9/A13):
  *  opening and selecting IS the corruption check — parse failures throw. */
 export interface StoreFileDoc {
@@ -198,6 +210,13 @@ function sqliteStore(db: SqliteDb, storePath: string): Store {
 
   const createThread = async (input: ThreadInput): Promise<Thread> => {
     const id = input.id ?? newId();
+    // DD-1 (S9): a tombstoned id is FINAL — create-after-delete under a
+    // standing tombstone minted a local-only zombie (visible forever, dropped
+    // by every merge, annihilated at the next boot-restore + pushed to peers).
+    // The routes door 409s BEFORE calling us; this is defense-in-depth so no
+    // future caller can mint a zombie either.
+    const tombstoned = db.prepare('SELECT 1 AS x FROM deleted_threads WHERE id = ?').get(id);
+    if (tombstoned) throw new TombstonedIdError(id);
     const existing = db.prepare('SELECT payload FROM threads WHERE id = ?').get(id);
     if (existing) return rowToThread(existing); // idempotent upsert
     const ts = nowIso();
@@ -245,7 +264,12 @@ function sqliteStore(db: SqliteDb, storePath: string): Store {
     const row = db.prepare('SELECT payload FROM threads WHERE id = ?').get(id);
     if (!row) return null;
     const t = rowToThread(row);
+    // P3 (S9): a no-op callback (a raced guard's early return) used to count
+    // as a mutation — false "adopted/remapped" logs and healed counts. The
+    // snapshot MUST be taken BEFORE fn (in-place mutators mutate t itself).
+    const before = JSON.stringify(t);
     const out = fn(t) ?? t; // fn may mutate in place or return a replacement
+    if (JSON.stringify(out) === before) return null; // identical → null, no write (callers treat null as "nothing happened")
     const next = { ...out, updatedAt: nowIso() };
     db.prepare('UPDATE threads SET number = ?, story_id = ?, status = ?, updated_at = ?, payload = ? WHERE id = ?').run(
       next.number,
@@ -514,6 +538,8 @@ function jsonStore(storePath: string): Store {
     createThread: (input) =>
       mutate(async () => {
         const id = input.id ?? newId();
+        // DD-1 (S9): json-twin parity — tombstoned ids are final.
+        if (doc.deleted.includes(id)) throw new TombstonedIdError(id);
         const existing = doc.threads.find((t) => t.id === id);
         if (existing) return existing;
         const ts = nowIso();
@@ -550,7 +576,9 @@ function jsonStore(storePath: string): Store {
         const idx = doc.threads.findIndex((t) => t.id === id);
         if (idx < 0) return null;
         const t = JSON.parse(JSON.stringify(doc.threads[idx])) as Thread; // copy — avoid aliasing
+        const before = JSON.stringify(t); // P3 (S9): snapshot before fn — the no-op/null contract, sqlite twin
         const out = fn(t) ?? t;
+        if (JSON.stringify(out) === before) return null; // identical → null, no write (false adopted/remapped counts)
         const next = { ...out, updatedAt: nowIso() };
         doc.threads[idx] = next;
         return next;

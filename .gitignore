@@ -17,3 +17,12 @@ examples/nimbus/sb-*.log
 examples/nimbus/dist-storybook/
 examples/nimbus/static-*.log
 api-test-boot.log
+# DD-5e (s9 / 33-g P1-2): the dogfood gh.json is BAKE OUTPUT — a dev-server
+# relaunch re-bakes the LIVE token into it (the d021243 flip). Untracked
+# (git rm --cached) + ignored; the bake regenerates it on demand. The tracked
+# examples/nimbus/.env STAYS tracked (git-is-the-disk practice).
+examples/nimbus/.storybook/annotakit-gh.json
+
+# v0.6.13: stray serve-static access logs from ad-hoc ports (the tracked -3000 dogfood log predates the rule and stays tracked)
+examples/nimbus/annotakit-static-*.log
+examples/nimbus/annotakit-static-*.log

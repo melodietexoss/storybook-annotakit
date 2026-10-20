@@ -1,4 +1,14 @@
 import {
+  captureFrozenSnapshot,
+  captureFrozenView,
+  captureSnapshot,
+  mountRecalledView
+} from "./chunk-75MKQES5.mjs";
+import {
+  captureAnchor,
+  resolveAnchor
+} from "./chunk-4YZXNHV2.mjs";
+import {
   API_BASE,
   FOCUS_THREAD,
   LAYER_STATE,
@@ -11,25 +21,31 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-N6VBNK7S.mjs";
+} from "./chunk-JG34ADOS.mjs";
 import {
   getGhLinkedStaticStore
-} from "./chunk-NI2PFIAZ.mjs";
+} from "./chunk-23RNGYKC.mjs";
 import {
   MAX_BODY_CHARS,
   elementSummary
-} from "./chunk-MHG5WIGU.mjs";
+} from "./chunk-DEMUCS72.mjs";
 import {
   DEFAULT_HOTKEYS,
   altMatches,
+  hotkeyLabel,
   hotkeyMatches,
   isTypingTarget,
   parseHotkey
-} from "./chunk-F7IFSFQY.mjs";
+} from "./chunk-RIIVYBJP.mjs";
 import {
   GreyedGate,
-  hitTest
-} from "./chunk-MSQAPIXL.mjs";
+  hitTest,
+  isPinnableTarget
+} from "./chunk-5NAI4TQG.mjs";
+import {
+  applyRecallScroll,
+  shouldApplyRecall
+} from "./chunk-624TCCP6.mjs";
 
 // src/preview/index.ts
 import React2 from "react";
@@ -37,605 +53,6 @@ import React2 from "react";
 // src/preview/layer.tsx
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { addons } from "storybook/preview-api";
-
-// node_modules/@medv/finder/finder.js
-var acceptedAttrNames = /* @__PURE__ */ new Set(["role", "name", "aria-label", "rel", "href"]);
-function attr(name, value) {
-  let nameIsOk = acceptedAttrNames.has(name);
-  nameIsOk ||= name.startsWith("data-") && wordLike(name);
-  let valueIsOk = wordLike(value) && value.length < 100;
-  valueIsOk ||= value.startsWith("#") && wordLike(value.slice(1));
-  return nameIsOk && valueIsOk;
-}
-function idName(name) {
-  return wordLike(name);
-}
-function className(name) {
-  return wordLike(name);
-}
-function tagName(name) {
-  return true;
-}
-function finder(input, options) {
-  if (input.nodeType !== Node.ELEMENT_NODE) {
-    throw new Error(`Can't generate CSS selector for non-element node type.`);
-  }
-  if (input.tagName.toLowerCase() === "html") {
-    return "html";
-  }
-  const defaults = {
-    root: document.body,
-    idName,
-    className,
-    tagName,
-    attr,
-    timeoutMs: 1e3,
-    seedMinLength: 3,
-    optimizedMinLength: 2,
-    maxNumberOfPathChecks: Infinity
-  };
-  const startTime = /* @__PURE__ */ new Date();
-  const config = { ...defaults, ...options };
-  const rootDocument = findRootDocument(config.root, defaults);
-  let foundPath;
-  let count = 0;
-  for (const candidate of search(input, config, rootDocument)) {
-    const elapsedTimeMs = (/* @__PURE__ */ new Date()).getTime() - startTime.getTime();
-    if (elapsedTimeMs > config.timeoutMs || count >= config.maxNumberOfPathChecks) {
-      const fPath = fallback(input, rootDocument);
-      if (!fPath) {
-        throw new Error(`Timeout: Can't find a unique selector after ${config.timeoutMs}ms`);
-      }
-      return selector(fPath);
-    }
-    count++;
-    if (unique(candidate, rootDocument)) {
-      foundPath = candidate;
-      break;
-    }
-  }
-  if (!foundPath) {
-    throw new Error(`Selector was not found.`);
-  }
-  const optimized = [
-    ...optimize(foundPath, input, config, rootDocument, startTime)
-  ];
-  optimized.sort(byPenalty);
-  if (optimized.length > 0) {
-    return selector(optimized[0]);
-  }
-  return selector(foundPath);
-}
-function* search(input, config, rootDocument) {
-  const stack = [];
-  let paths = [];
-  let current = input;
-  let i = 0;
-  while (current && current !== rootDocument) {
-    const level = tie(current, config);
-    for (const node of level) {
-      node.level = i;
-    }
-    stack.push(level);
-    current = current.parentElement;
-    i++;
-    paths.push(...combinations(stack));
-    if (i >= config.seedMinLength) {
-      paths.sort(byPenalty);
-      for (const candidate of paths) {
-        yield candidate;
-      }
-      paths = [];
-    }
-  }
-  paths.sort(byPenalty);
-  for (const candidate of paths) {
-    yield candidate;
-  }
-}
-function wordLike(name) {
-  if (/^[a-z\-]{3,}$/i.test(name)) {
-    const words = name.split(/-|[A-Z]/);
-    for (const word of words) {
-      if (word.length <= 2) {
-        return false;
-      }
-      if (/[^aeiou]{4,}/i.test(word)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  return false;
-}
-function tie(element, config) {
-  const level = [];
-  const elementId = element.getAttribute("id");
-  if (elementId && config.idName(elementId)) {
-    level.push({
-      name: "#" + CSS.escape(elementId),
-      penalty: 0
-    });
-  }
-  for (let i = 0; i < element.classList.length; i++) {
-    const name = element.classList[i];
-    if (config.className(name)) {
-      level.push({
-        name: "." + CSS.escape(name),
-        penalty: 1
-      });
-    }
-  }
-  for (let i = 0; i < element.attributes.length; i++) {
-    const attr2 = element.attributes[i];
-    if (config.attr(attr2.name, attr2.value)) {
-      level.push({
-        name: `[${CSS.escape(attr2.name)}="${CSS.escape(attr2.value)}"]`,
-        penalty: 2
-      });
-    }
-  }
-  const tagName2 = element.tagName.toLowerCase();
-  if (config.tagName(tagName2)) {
-    level.push({
-      name: tagName2,
-      penalty: 5
-    });
-    const index = indexOf(element, tagName2);
-    if (index !== void 0) {
-      level.push({
-        name: nthOfType(tagName2, index),
-        penalty: 10
-      });
-    }
-  }
-  const nth = indexOf(element);
-  if (nth !== void 0) {
-    level.push({
-      name: nthChild(tagName2, nth),
-      penalty: 50
-    });
-  }
-  return level;
-}
-function selector(path) {
-  let node = path[0];
-  let query = node.name;
-  for (let i = 1; i < path.length; i++) {
-    const level = path[i].level || 0;
-    if (node.level === level - 1) {
-      query = `${path[i].name} > ${query}`;
-    } else {
-      query = `${path[i].name} ${query}`;
-    }
-    node = path[i];
-  }
-  return query;
-}
-function penalty(path) {
-  return path.map((node) => node.penalty).reduce((acc, i) => acc + i, 0);
-}
-function byPenalty(a, b) {
-  return penalty(a) - penalty(b);
-}
-function indexOf(input, tagName2) {
-  const parent = input.parentNode;
-  if (!parent) {
-    return void 0;
-  }
-  let child = parent.firstChild;
-  if (!child) {
-    return void 0;
-  }
-  let i = 0;
-  while (child) {
-    if (child.nodeType === Node.ELEMENT_NODE && (tagName2 === void 0 || child.tagName.toLowerCase() === tagName2)) {
-      i++;
-    }
-    if (child === input) {
-      break;
-    }
-    child = child.nextSibling;
-  }
-  return i;
-}
-function fallback(input, rootDocument) {
-  let i = 0;
-  let current = input;
-  const path = [];
-  while (current && current !== rootDocument) {
-    const tagName2 = current.tagName.toLowerCase();
-    const index = indexOf(current, tagName2);
-    if (index === void 0) {
-      return;
-    }
-    path.push({
-      name: nthOfType(tagName2, index),
-      penalty: NaN,
-      level: i
-    });
-    current = current.parentElement;
-    i++;
-  }
-  if (unique(path, rootDocument)) {
-    return path;
-  }
-}
-function nthChild(tagName2, index) {
-  if (tagName2 === "html") {
-    return "html";
-  }
-  return `${tagName2}:nth-child(${index})`;
-}
-function nthOfType(tagName2, index) {
-  if (tagName2 === "html") {
-    return "html";
-  }
-  return `${tagName2}:nth-of-type(${index})`;
-}
-function* combinations(stack, path = []) {
-  if (stack.length > 0) {
-    for (let node of stack[0]) {
-      yield* combinations(stack.slice(1, stack.length), path.concat(node));
-    }
-  } else {
-    yield path;
-  }
-}
-function findRootDocument(rootNode, defaults) {
-  if (rootNode.nodeType === Node.DOCUMENT_NODE) {
-    return rootNode;
-  }
-  if (rootNode === defaults.root) {
-    return rootNode.ownerDocument;
-  }
-  return rootNode;
-}
-function unique(path, rootDocument) {
-  const css = selector(path);
-  switch (rootDocument.querySelectorAll(css).length) {
-    case 0:
-      throw new Error(`Can't select any node with this selector: ${css}`);
-    case 1:
-      return true;
-    default:
-      return false;
-  }
-}
-function* optimize(path, input, config, rootDocument, startTime) {
-  if (path.length > 2 && path.length > config.optimizedMinLength) {
-    for (let i = 1; i < path.length - 1; i++) {
-      const elapsedTimeMs = (/* @__PURE__ */ new Date()).getTime() - startTime.getTime();
-      if (elapsedTimeMs > config.timeoutMs) {
-        return;
-      }
-      const newPath = [...path];
-      newPath.splice(i, 1);
-      if (unique(newPath, rootDocument) && rootDocument.querySelector(selector(newPath)) === input) {
-        yield newPath;
-        yield* optimize(newPath, input, config, rootDocument, startTime);
-      }
-    }
-  }
-}
-
-// src/preview/anchor.ts
-var OVERLAY_ATTR = "data-annota-overlay";
-var FINGERPRINT_ATTRS = [
-  "aria-label",
-  "title",
-  "placeholder",
-  "alt",
-  "name",
-  "type",
-  "href",
-  "data-testid"
-];
-var TEXT_SIM_THRESHOLD = 0.6;
-var IOU_THRESHOLD = 0.3;
-var WIDTH_TOLERANCE = 2;
-function normalizeText(s) {
-  return s.replace(/\s+/g, " ").trim().toLowerCase();
-}
-function clip(s, max) {
-  const t = s.trim();
-  return t.length <= max ? t : `${t.slice(0, max - 1)}\u2026`;
-}
-function tokenJaccard(a, b) {
-  const ta = new Set(normalizeText(a).split(" ").filter(Boolean));
-  const tb = new Set(normalizeText(b).split(" ").filter(Boolean));
-  if (ta.size === 0 && tb.size === 0) return 1;
-  if (ta.size === 0 || tb.size === 0) return 0;
-  let inter = 0;
-  for (const t of ta) if (tb.has(t)) inter++;
-  return inter / (ta.size + tb.size - inter);
-}
-function iou(a, b) {
-  const x1 = Math.max(a.x, b.x);
-  const y1 = Math.max(a.y, b.y);
-  const x2 = Math.min(a.x + a.w, b.x + b.w);
-  const y2 = Math.min(a.y + a.h, b.y + b.h);
-  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-  const union = a.w * a.h + b.w * b.h - inter;
-  return union <= 0 ? 0 : inter / union;
-}
-function isSkippable(node) {
-  if (!(node instanceof HTMLElement)) return false;
-  return node.hasAttribute(OVERLAY_ATTR) || node.closest(`[${OVERLAY_ATTR}]`) != null || ["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"].includes(node.tagName);
-}
-function collectTextNodes(root) {
-  const out = [];
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      const parent = node.parentElement;
-      if (!parent || isSkippable(parent)) return NodeFilter.FILTER_REJECT;
-      return normalizeText(node.data ?? "").length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
-    }
-  });
-  let current = walker.nextNode();
-  while (current) {
-    out.push(current);
-    current = walker.nextNode();
-  }
-  return out;
-}
-function bboxOf(el, root) {
-  const r = el.getBoundingClientRect();
-  const rr = root.getBoundingClientRect();
-  return {
-    x: Math.round((r.left - rr.left) * 10) / 10,
-    y: Math.round((r.top - rr.top) * 10) / 10,
-    w: Math.round(r.width * 10) / 10,
-    h: Math.round(r.height * 10) / 10
-  };
-}
-function rootWidth(root) {
-  return root.getBoundingClientRect().width;
-}
-function cssPath(el, root) {
-  try {
-    return finder(el, {
-      root,
-      idName: () => false,
-      className: (name) => name.length > 3 && !name.startsWith("_") && !/(?:^|[-_])(?:css|scss|module)/.test(name)
-    });
-  } catch {
-    return void 0;
-  }
-}
-function extractTextQuote(el, textNodes) {
-  let own = null;
-  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-  let n = walker.nextNode();
-  while (n) {
-    if (normalizeText(n.data ?? "").length > 0) {
-      own = n;
-      break;
-    }
-    n = walker.nextNode();
-  }
-  if (!own) return void 0;
-  const exact = normalizeText(own.data).slice(0, 80).trim();
-  if (!exact) return void 0;
-  const idx = textNodes.indexOf(own);
-  const quote = { exact };
-  if (idx > 0) quote.prefix = clip(normalizeText(textNodes[idx - 1].data), 24) || void 0;
-  if (idx >= 0 && idx < textNodes.length - 1) {
-    quote.suffix = clip(normalizeText(textNodes[idx + 1].data), 24) || void 0;
-  }
-  let occurrence = 0;
-  for (const t of textNodes) {
-    if (normalizeText(t.data).includes(exact)) {
-      if (t === own) break;
-      occurrence++;
-    }
-  }
-  quote.occurrenceIndex = occurrence;
-  return quote;
-}
-function extractFingerprint(el) {
-  const attrs = [];
-  for (const name of FINGERPRINT_ATTRS) {
-    const v = el.getAttribute(name);
-    if (v && v.trim()) attrs.push({ name, value: clip(v, 80) });
-  }
-  let neighborText;
-  let sib = el.previousElementSibling;
-  while (sib && !neighborText) {
-    neighborText = clip(normalizeText(sib.textContent ?? ""), 60) || void 0;
-    sib = sib.previousElementSibling;
-  }
-  if (!neighborText) {
-    sib = el.nextElementSibling;
-    while (sib && !neighborText) {
-      neighborText = clip(normalizeText(sib.textContent ?? ""), 60) || void 0;
-      sib = sib.nextElementSibling;
-    }
-  }
-  return { tag: el.tagName.toLowerCase(), attrs, neighborText };
-}
-function nthOfTag(el) {
-  const parent = el.parentElement;
-  if (!parent) return void 0;
-  let n = 0;
-  let total = 0;
-  for (const child of parent.children) {
-    if (child.tagName === el.tagName) {
-      total++;
-      if (child === el) n = total;
-    }
-  }
-  return total > 1 ? n : void 0;
-}
-function formValue(el) {
-  const input = el;
-  if (typeof input.value !== "string" || !input.value) return void 0;
-  const v = clip(input.value, 60);
-  return input.type === "password" ? "\u2022".repeat(Math.min(8, input.value.length)) : v;
-}
-function formLabel(el) {
-  const isFormControl = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el instanceof HTMLButtonElement;
-  if (!isFormControl) return void 0;
-  try {
-    if (el.id) {
-      const lab = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      const t = lab?.textContent?.trim();
-      if (t) return clip(t, 60);
-    }
-    const wrap = el.closest("label");
-    const wt = wrap?.textContent?.trim();
-    if (wt && !wt.includes(el.textContent?.trim() ?? "\0")) return clip(wt, 60);
-    const lb = el.getAttribute("aria-labelledby");
-    if (lb) {
-      const t = document.getElementById(lb)?.textContent?.trim();
-      if (t) return clip(t, 60);
-    }
-  } catch {
-  }
-  return void 0;
-}
-function captureAnchor(el, root) {
-  const textNodes = collectTextNodes(root);
-  const bbox = bboxOf(el, root);
-  const classes = el.getAttribute("class");
-  const context = {
-    tag: el.tagName.toLowerCase(),
-    role: el.getAttribute("role") ?? void 0,
-    ariaLabel: el.getAttribute("aria-label") ?? void 0,
-    text: clip(el.innerText ?? "", 120) || void 0,
-    id: el.id || void 0,
-    classes: classes ? clip(classes.replace(/\s+/g, " "), 120) || void 0 : void 0,
-    testid: el.getAttribute("data-testid") ?? el.getAttribute("data-test") ?? el.getAttribute("data-test-id") ?? void 0,
-    nth: nthOfTag(el),
-    name: el.getAttribute("name") ?? void 0,
-    value: formValue(el),
-    placeholder: el.getAttribute("placeholder") ?? void 0,
-    alt: el.getAttribute("alt") ?? void 0,
-    label: formLabel(el),
-    outerHTML: clip(el.outerHTML.replace(/\s+/g, " ").trim(), 200)
-  };
-  return {
-    selector: {
-      cssSelector: cssPath(el, root),
-      textQuote: extractTextQuote(el, textNodes),
-      fragment: { ...bbox }
-    },
-    fingerprint: extractFingerprint(el),
-    context,
-    bbox,
-    captureViewportWidth: Math.round(rootWidth(root))
-  };
-}
-function attrsMatch(cand, fp) {
-  if (!fp.attrs?.length) return false;
-  return fp.attrs.some(({ name, value }) => cand.getAttribute(name) === value);
-}
-function scoreCandidate(cand, ann, root) {
-  const fp = ann.fingerprint;
-  const wantTag = fp?.tag ?? ann.context.tag;
-  if (cand.tagName.toLowerCase() !== wantTag) return false;
-  const textOk = !!ann.context.text && tokenJaccard(cand.innerText ?? "", ann.context.text) >= TEXT_SIM_THRESHOLD;
-  const attrOk = !!fp && attrsMatch(cand, fp);
-  if (!textOk && !attrOk) return false;
-  const widthNow = rootWidth(root);
-  if (Math.abs(widthNow - ann.captureViewportWidth) <= WIDTH_TOLERANCE) {
-    if (iou(bboxOf(cand, root), ann.bbox) < IOU_THRESHOLD) return false;
-  }
-  return true;
-}
-function withinOverlay(el) {
-  return el.closest(`[${OVERLAY_ATTR}]`) != null;
-}
-function findByTextQuote(ann, root) {
-  const q = ann.selector.textQuote;
-  if (!q?.exact) return null;
-  const norm = (s) => normalizeText(s);
-  const all = collectTextNodes(root);
-  const matches = [];
-  for (const t of all) {
-    if (norm(t.data).includes(norm(q.exact))) matches.push(t);
-  }
-  if (matches.length === 0) return null;
-  const pick = typeof q.occurrenceIndex === "number" && q.occurrenceIndex < matches.length ? matches[q.occurrenceIndex] : matches[0];
-  let chosen = pick;
-  if (matches.length > 1 && (q.prefix || q.suffix)) {
-    const i = all.indexOf(pick);
-    const prev = i > 0 ? norm(all[i - 1].data) : "";
-    const next = i >= 0 && i < all.length - 1 ? norm(all[i + 1].data) : "";
-    const prefixOk = !q.prefix || prev.endsWith(norm(q.prefix)) || prev.includes(norm(q.prefix));
-    const suffixOk = !q.suffix || next.startsWith(norm(q.suffix)) || next.includes(norm(q.suffix));
-    if (!prefixOk || !suffixOk) {
-      for (const m of matches) {
-        if (m === pick) continue;
-        const j = all.indexOf(m);
-        const p = j > 0 ? norm(all[j - 1].data) : "";
-        const s = j >= 0 && j < all.length - 1 ? norm(all[j + 1].data) : "";
-        if ((!q.prefix || p.endsWith(norm(q.prefix))) && (!q.suffix || s.startsWith(norm(q.suffix)))) {
-          chosen = m;
-          break;
-        }
-      }
-    }
-  }
-  let el = chosen.parentElement;
-  if (!el || withinOverlay(el)) return null;
-  const wantTag = ann.fingerprint?.tag ?? ann.context.tag;
-  let hops = 0;
-  while (el && el !== root && el.tagName.toLowerCase() !== wantTag && hops < 3) {
-    el = el.parentElement;
-    hops++;
-  }
-  if (!el || el === root || withinOverlay(el)) return null;
-  return el;
-}
-function findByFingerprint(ann, root) {
-  const fp = ann.fingerprint;
-  if (!fp?.attrs?.length) return null;
-  for (const { name, value } of fp.attrs) {
-    if (name === "name" || name === "type" || name === "href" || name === "src") continue;
-    try {
-      const hits = root.querySelectorAll(`[${name}="${CSS.escape(value)}"]`);
-      for (const hit of hits) {
-        if (withinOverlay(hit)) continue;
-        if (hit.tagName.toLowerCase() === fp.tag) return hit;
-      }
-    } catch {
-    }
-  }
-  if (fp.neighborText) {
-    const needle = normalizeText(fp.neighborText);
-    for (const t of collectTextNodes(root)) {
-      if (normalizeText(t.data).includes(needle.slice(0, 24))) {
-        const parent = t.parentElement;
-        if (!parent || withinOverlay(parent)) continue;
-        let el = parent;
-        let hops = 0;
-        while (el && el !== root && el.tagName.toLowerCase() !== fp.tag && hops < 3) {
-          el = el.parentElement;
-          hops++;
-        }
-        if (el && el !== root && !withinOverlay(el)) return el;
-      }
-    }
-  }
-  return null;
-}
-function resolveAnchor(ann, root) {
-  if (ann.selector.cssSelector) {
-    try {
-      const cand = root.querySelector(ann.selector.cssSelector);
-      if (cand && !withinOverlay(cand) && scoreCandidate(cand, ann, root)) {
-        return { element: cand, status: "resolved", strategy: "css" };
-      }
-    } catch {
-    }
-  }
-  const byText = findByTextQuote(ann, root);
-  if (byText) return { element: byText, status: "approx", strategy: "text" };
-  const byAttr = findByFingerprint(ann, root);
-  if (byAttr) return { element: byAttr, status: "approx", strategy: "attr" };
-  return { element: null, status: "orphan", strategy: "none" };
-}
 
 // src/preview/fiber.ts
 var COMPONENT_TAGS = /* @__PURE__ */ new Set([0, 1, 11, 14, 15, 16, 22]);
@@ -1001,350 +418,6 @@ async function getSnapshot(threadId) {
   return await json(await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/snapshot`, { cache: "no-store" }));
 }
 
-// src/preview/snapshot.ts
-var CAP = 32768;
-var MARK = "data-annota-snap";
-function perfMark(name, fn) {
-  const start = `${name}:start`;
-  const end = `${name}:end`;
-  try {
-    performance.mark(start);
-  } catch {
-  }
-  try {
-    fn();
-    try {
-      performance.mark(end);
-      performance.measure(name, start, end);
-    } catch {
-    }
-  } catch (err) {
-    try {
-      performance.mark(`${name}:failed`);
-    } catch {
-    }
-    throw err;
-  }
-}
-function stripSecretValueAttrs(el) {
-  el.querySelectorAll("input[type=password], input[type=hidden]").forEach((n) => n.removeAttribute("value"));
-}
-function captureSnapshot(root, pinned) {
-  const rect = root.getBoundingClientRect();
-  if (pinned) {
-    try {
-      pinned.setAttribute(MARK, "1");
-    } catch {
-    }
-  }
-  const temp = root.cloneNode(true);
-  if (pinned) {
-    try {
-      pinned.removeAttribute(MARK);
-    } catch {
-    }
-  }
-  stripSecretValueAttrs(temp);
-  let html = temp.outerHTML;
-  let clipped = false;
-  if (html.length > CAP) {
-    html = html.replace(/\sstyle="[^"]*"/g, "");
-  }
-  if (html.length > CAP) {
-    html = html.slice(0, CAP);
-    clipped = true;
-  }
-  return {
-    format: "dom",
-    html,
-    clipped,
-    capturedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    width: Math.max(1, Math.round(rect.width)),
-    height: Math.max(1, Math.round(rect.height))
-  };
-}
-var FROZEN_BUDGET = 9e4;
-var PORTAL_SKIP_TAGS = /* @__PURE__ */ new Set(["SCRIPT", "STYLE", "LINK", "META", "TITLE", "NOSCRIPT"]);
-function opaqueBg(el) {
-  const bg = getComputedStyle(el).backgroundColor;
-  return bg && bg !== "transparent" && bg !== "rgba(0, 0, 0, 0)" ? bg : null;
-}
-function frozenBackground(liveRoot) {
-  return opaqueBg(liveRoot) ?? opaqueBg(document.body) ?? opaqueBg(document.documentElement) ?? "#ffffff";
-}
-function stripDangerousAttrs(el) {
-  const jsUrl = /^\s*javascript:/i;
-  for (const attr2 of Array.from(el.attributes)) {
-    if (/^on/i.test(attr2.name)) el.removeAttribute(attr2.name);
-    else if ((attr2.name === "href" || attr2.name === "src") && jsUrl.test(attr2.value)) el.setAttribute(attr2.name, "#");
-  }
-}
-function cleanCloneTree(root) {
-  root.querySelectorAll("[data-annota-overlay]").forEach((n) => n.remove());
-  root.querySelectorAll("[inert]").forEach((n) => n.removeAttribute("inert"));
-  if (root.hasAttribute("inert")) root.removeAttribute("inert");
-  root.querySelectorAll("*").forEach(stripDangerousAttrs);
-  stripDangerousAttrs(root);
-}
-function buildFrozenContainer(liveRoot) {
-  const container = document.createElement("div");
-  container.setAttribute("data-annota-frozen", "1");
-  container.style.cssText = `position:fixed;inset:0;z-index:2147482000;pointer-events:auto;overflow:auto;background:${frozenBackground(liveRoot)};`;
-  const stopDefault = (e) => {
-    e.preventDefault();
-  };
-  container.addEventListener("pointerdown", stopDefault, true);
-  container.addEventListener("mousedown", stopDefault, true);
-  container.addEventListener("click", stopDefault, true);
-  container.addEventListener(
-    "focusin",
-    (e) => {
-      const t = e.target;
-      if (t instanceof HTMLElement) t.blur();
-    },
-    true
-  );
-  return container;
-}
-function captureFrozenView(liveRoot) {
-  let mount;
-  perfMark("annotakit:freeze", () => {
-    mount = captureFrozenViewInner(liveRoot);
-  });
-  return mount;
-}
-function captureFrozenViewInner(liveRoot) {
-  const rect = liveRoot.getBoundingClientRect();
-  const storyClone = liveRoot.cloneNode(true);
-  cleanCloneTree(storyClone);
-  storyClone.setAttribute("data-annota-frozen-story", "1");
-  storyClone.style.position = "absolute";
-  storyClone.style.left = `${rect.left}px`;
-  storyClone.style.top = `${rect.top}px`;
-  storyClone.style.width = `${Math.max(1, rect.width)}px`;
-  storyClone.style.height = `${Math.max(1, rect.height)}px`;
-  storyClone.style.margin = "0";
-  const portalClones = [];
-  const portalPairs = [];
-  for (const child of Array.from(document.body.children)) {
-    if (!(child instanceof HTMLElement)) continue;
-    if (child === liveRoot) continue;
-    if (PORTAL_SKIP_TAGS.has(child.tagName)) continue;
-    if (child.closest("[data-annota-overlay]")) continue;
-    if (child.closest("[data-annota-frozen]")) continue;
-    if (child.hasAttribute("aria-live") || child.hasAttribute("data-sb-error")) continue;
-    if (child.id === "storybook-docs" || child.id === "storybook-highlights-root") continue;
-    if ([...child.classList].some((c) => c.startsWith("sb-"))) continue;
-    const cr = child.getBoundingClientRect();
-    if (cr.width < 1 || cr.height < 1) continue;
-    const pc = child.cloneNode(true);
-    cleanCloneTree(pc);
-    portalClones.push(pc);
-    portalPairs.push([child, pc]);
-  }
-  const container = buildFrozenContainer(liveRoot);
-  container.appendChild(storyClone);
-  for (const pc of portalClones) container.appendChild(pc);
-  document.body.appendChild(container);
-  copyDynamicState(liveRoot, storyClone);
-  for (const [livePortal, pc] of portalPairs) copyDynamicState(livePortal, pc);
-  requestAnimationFrame(() => copyScroll(liveRoot, storyClone));
-  return { container, storyClone, portalClones, teardown: () => container.remove() };
-}
-function copyScroll(liveRoot, cloneRoot) {
-  try {
-    const filter = {
-      acceptNode: (n) => n.closest?.("[data-annota-overlay]") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
-    };
-    const liveWalker = document.createTreeWalker(liveRoot, NodeFilter.SHOW_ELEMENT, filter);
-    const cloneWalker = document.createTreeWalker(cloneRoot, NodeFilter.SHOW_ELEMENT);
-    let a = liveWalker.nextNode();
-    let b = cloneWalker.nextNode();
-    while (a && b) {
-      if (a.scrollTop > 0 || a.scrollLeft > 0) {
-        try {
-          b.scrollTop = a.scrollTop;
-          b.scrollLeft = a.scrollLeft;
-        } catch {
-        }
-      }
-      a = liveWalker.nextNode();
-      b = cloneWalker.nextNode();
-    }
-  } catch {
-  }
-}
-function copyFormState(live, clone) {
-  try {
-    if (live instanceof HTMLTextAreaElement && clone instanceof HTMLTextAreaElement) {
-      clone.value = live.value;
-      clone.textContent = live.value;
-      return;
-    }
-    if (live instanceof HTMLSelectElement && clone instanceof HTMLSelectElement) {
-      for (let i = 0; i < live.options.length && i < clone.options.length; i++) {
-        const lo = live.options[i];
-        const co = clone.options[i];
-        co.selected = lo.selected;
-        if (lo.selected) co.setAttribute("selected", "");
-        else co.removeAttribute("selected");
-      }
-      if (!clone.multiple) clone.selectedIndex = live.selectedIndex;
-      return;
-    }
-    if (live instanceof HTMLInputElement && clone instanceof HTMLInputElement) {
-      if (live.type === "checkbox" || live.type === "radio") {
-        clone.checked = live.checked;
-        if (live.checked) clone.setAttribute("checked", "");
-        else clone.removeAttribute("checked");
-        return;
-      }
-      if (live.type === "file" || live.type === "image") return;
-      clone.value = live.value;
-      if (live.type === "password" || live.type === "hidden") {
-        clone.removeAttribute("value");
-        return;
-      }
-      clone.setAttribute("value", live.value);
-    }
-  } catch {
-  }
-}
-function copyCanvasBitmap(live, clone) {
-  if (!(live instanceof HTMLCanvasElement && clone instanceof HTMLCanvasElement)) return;
-  clone.setAttribute("data-annota-canvas", `${live.width}x${live.height}`);
-  try {
-    const ctx = clone.getContext("2d");
-    if (ctx) ctx.drawImage(live, 0, 0);
-  } catch {
-  }
-}
-function copyShadowRoot(live, clone) {
-  if (!(live instanceof HTMLElement && clone instanceof HTMLElement)) return;
-  const liveShadow = live.shadowRoot;
-  if (!liveShadow || clone.shadowRoot) return;
-  try {
-    const cs = clone.attachShadow({ mode: "open" });
-    for (const child of Array.from(liveShadow.childNodes)) {
-      cs.appendChild(child.cloneNode(true));
-    }
-    cs.querySelectorAll("*").forEach(stripDangerousAttrs);
-  } catch {
-  }
-}
-function copyDynamicState(liveRoot, cloneRoot) {
-  const walk = (liveParent, cloneParent) => {
-    const liveKids = Array.from(liveParent.childNodes).filter(
-      (n2) => !(n2 instanceof Element && n2.closest("[data-annota-overlay]"))
-    );
-    const cloneKids = Array.from(cloneParent.childNodes);
-    const n = Math.min(liveKids.length, cloneKids.length);
-    for (let i = 0; i < n; i++) {
-      const a = liveKids[i];
-      const b = cloneKids[i];
-      if (!(a instanceof Element && b instanceof Element)) continue;
-      copyFormState(a, b);
-      copyCanvasBitmap(a, b);
-      copyShadowRoot(a, b);
-      walk(a, b);
-      if (a.shadowRoot && b.shadowRoot && a.shadowRoot.childNodes.length === b.shadowRoot.childNodes.length) {
-        walk(a.shadowRoot, b.shadowRoot);
-      }
-    }
-  };
-  try {
-    walk(liveRoot, cloneRoot);
-  } catch {
-  }
-}
-function captureFrozenSnapshot(mount, pinned) {
-  let snap;
-  perfMark("annotakit:frozen-snapshot", () => {
-    snap = captureFrozenSnapshotInner(mount, pinned);
-  });
-  return snap;
-}
-function captureFrozenSnapshotInner(mount, pinned) {
-  const rect = mount.storyClone.getBoundingClientRect();
-  let marked = false;
-  if (pinned) {
-    try {
-      pinned.setAttribute(MARK, "1");
-      marked = true;
-    } catch {
-    }
-  }
-  const temp = mount.container.cloneNode(true);
-  if (marked) {
-    try {
-      pinned?.removeAttribute(MARK);
-    } catch {
-    }
-  }
-  let html = temp.outerHTML;
-  if (html.length > FROZEN_BUDGET) {
-    temp.querySelectorAll("[data-annota-frozen-story] *").forEach((n) => {
-      if (n instanceof HTMLElement) n.removeAttribute("style");
-    });
-    html = temp.outerHTML;
-  }
-  if (html.length > FROZEN_BUDGET) {
-    while (html.length > FROZEN_BUDGET && temp.children.length > 1) {
-      temp.lastElementChild?.remove();
-      html = temp.outerHTML;
-    }
-  }
-  let clipped = false;
-  if (html.length > FROZEN_BUDGET) {
-    html = html.slice(0, FROZEN_BUDGET);
-    clipped = true;
-  }
-  return {
-    format: "dom",
-    html,
-    clipped,
-    capturedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    width: Math.max(1, Math.round(rect.width)),
-    height: Math.max(1, Math.round(rect.height)),
-    surface: "frozen"
-  };
-}
-function sanitizeMountedView(el) {
-  el.querySelectorAll("[data-annota-overlay]").forEach((n) => n.remove());
-  el.querySelectorAll("script").forEach((n) => n.remove());
-  el.querySelectorAll("[inert]").forEach((n) => n.removeAttribute("inert"));
-  if (el.hasAttribute("inert")) el.removeAttribute("inert");
-  el.querySelectorAll("*").forEach(stripDangerousAttrs);
-  stripDangerousAttrs(el);
-  stripSecretValueAttrs(el);
-}
-function mountRecalledView(snap, liveRoot) {
-  let mount;
-  perfMark("annotakit:recall", () => {
-    mount = mountRecalledViewInner(snap, liveRoot);
-  });
-  return mount;
-}
-function mountRecalledViewInner(snap, liveRoot) {
-  const rect = liveRoot.getBoundingClientRect();
-  const container = buildFrozenContainer(liveRoot);
-  if (snap.surface === "frozen") {
-    container.innerHTML = snap.html;
-  } else {
-    const holder = document.createElement("div");
-    holder.style.cssText = `position:absolute;left:${rect.left}px;top:${rect.top}px;width:${Math.max(1, Math.round(snap.width || rect.width))}px;`;
-    holder.innerHTML = snap.html;
-    container.appendChild(holder);
-  }
-  sanitizeMountedView(container);
-  document.body.appendChild(container);
-  const storyClone = container.querySelector("[data-annota-frozen-story]") ?? container.querySelector("#storybook-root") ?? container.firstElementChild ?? container;
-  const portalClones = Array.from(container.children).filter(
-    (c) => c instanceof HTMLElement && c !== storyClone && !c.hasAttribute("data-annota-frozen")
-  );
-  return { container, storyClone, portalClones, teardown: () => container.remove() };
-}
-
 // src/preview/styles.ts
 var OVERLAY_CSS = `
 .annota-root {
@@ -1374,8 +447,8 @@ var OVERLAY_CSS = `
  *        so they can neither hide nor swallow a pin
  *   20 = pins + regions \u2014 ALWAYS on top of passive chrome
  *   30 = deliberate interactive surfaces (composer card, thread card,
- *        help, the frozen pill) \u2014 invoked contexts, allowed above pins
- *        while open */
+ *        help, transient hints) \u2014 invoked contexts, allowed above pins
+ *        while open (v0.6.14: the frozen PILL is gone \u2014 hints are transient) */
 
 /* ---------- pin markers ---------- */
 .annota-pin {
@@ -1452,29 +525,11 @@ var OVERLAY_CSS = `
   box-shadow: 0 4px 14px rgba(0,0,0,.3);
 }
 
-/* v0.6.9 (S3/S5): frozen/recall state pill \u2014 z 30 informational surface.
-   Never blocks (pointer-events: none) and stays a PILL, not a banner (the
-   canvas stays overlay-free by user directive). */
-.annota-frozen-pill {
-  position: fixed;
-  z-index: 30;
-  top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: #0c4a6e;
-  color: #e0f2fe;
-  border: 1px solid #38bdf8;
-  padding: 6px 14px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  pointer-events: none;
-  box-shadow: 0 4px 14px rgba(0,0,0,.3);
-  max-width: min(92vw, 640px);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+/* v0.6.14 (user directive "no sticky elements on the DOM surface",
+   2026-10-19): .annota-frozen-pill DELETED \u2014 the persistent frozen/recall
+   pill annoyed in live use (same class as the earlier "dev only" badge).
+   Freeze/recall entry announces via the transient capture-hint above; the
+   steady-state canvas carries only pins/regions/cards. */
 .annota-hover-box {
   position: fixed;
   z-index: 10;
@@ -1599,26 +654,10 @@ body.annota-cursor * { cursor: crosshair !important; }
 .annota-status-banner.is-error { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
 .annota-status-banner.is-info { background: #f0f9ff; color: #075985; border: 1px solid #bae6fd; }
 
-/* ---------- dev-only badge (passive notice, no interaction \u2014 the launcher
-   is GONE; entry points are the native SB toolbar buttons + \u2325 hotkeys) ---------- */
-.annota-badge {
-  position: fixed;
-  right: 18px;
-  bottom: 18px;
-  pointer-events: none;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  background: rgba(255, 255, 255, .92);
-  border: 1px solid #e5e7eb;
-  border-radius: 999px;
-  padding: 7px 12px;
-  font-weight: 700;
-  font-size: 12px;
-  color: #64748b;
-  box-shadow: 0 4px 16px rgba(15, 23, 42, .12);
-  user-select: none;
-}
+/* v0.6.14: .annota-badge (the "dev only" bottom-right badge) DELETED with
+   its last dead CSS \u2014 the badge itself stopped rendering in v0.6.9; the
+   class had no remaining users. Same user directive: no sticky elements on
+   the DOM surface. */
 
 /* rich one-line element identity (composer) \u2014 same string as the digest */
 .annota-element-summary {
@@ -1716,6 +755,7 @@ function sbChannel() {
   return addons.getChannel();
 }
 var AUTHOR_KEY = "annotakit:author";
+var COMMENT_ORDER_KEY = "annotakit:commentOrder";
 function getAuthor() {
   try {
     return localStorage.getItem(AUTHOR_KEY) || "reviewer";
@@ -1761,21 +801,28 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
     };
   }, [composer]);
   const [activeThread, setActiveThread] = useState(null);
+  const composerRef = useRef(composer);
+  composerRef.current = composer;
+  const activeThreadRef = useRef(activeThread);
+  activeThreadRef.current = activeThread;
   const [frozen, setFrozen] = useState(null);
   const frozenRef = useRef(frozen);
   frozenRef.current = frozen;
   const frozenMountRef = useRef(null);
+  const recallSeqRef = useRef(0);
+  const recallScrollRef = useRef(false);
   const inertedRef = useRef([]);
   useEffect(() => {
     const open = !!composer || !!activeThread;
     if (open && inertedRef.current.length === 0) {
       const overlays = Array.from(document.querySelectorAll("[data-annota-overlay]"));
-      const onPath = (el) => overlays.some((o) => o === el || el.contains(o));
+      const fm = frozenMountRef.current;
+      const onPath = (el) => overlays.some((o) => o === el || el.contains(o)) || fm != null && (el === fm.container || el.contains(fm.container));
       const inerted = [];
       const walk = (parent) => {
         for (const child of Array.from(parent.children)) {
           if (onPath(child)) {
-            if (child !== overlays[0]) walk(child);
+            if (!overlays.includes(child) && child !== fm?.container) walk(child);
             continue;
           }
           if (!child.hasAttribute("inert")) {
@@ -2075,7 +1122,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
   useEffect(() => {
     emitLayerState(visible);
   }, [visible, emitLayerState]);
-  const openCountMemo = threads.filter((t) => t.status === "open").length;
+  const openCountMemo = threads.filter((t) => t.status !== "fixed" && t.status !== "rejected" && t.status !== "resolved").length;
   const fixedCountMemo = threads.filter((t) => t.status === "fixed").length;
   const rejectedCountMemo = threads.filter((t) => t.status === "rejected").length;
   const anchorsResolved = anchors.size > 0 || threads.length === 0;
@@ -2117,20 +1164,38 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
     },
     [anchors]
   );
+  const enterMode = useCallback((m) => {
+    setMode(m);
+    setComposer(null);
+    setActiveThread(null);
+    if (m === "pin") document.body.classList.add("annota-cursor");
+    else document.body.classList.remove("annota-cursor");
+  }, []);
+  const exitMode = useCallback(() => {
+    setMode("idle");
+    setHoverBox(null);
+    setDragRect(null);
+    dragStart.current = null;
+    document.body.classList.remove("annota-cursor");
+  }, []);
   const exitFrozenView = useCallback(() => {
     frozenMountRef.current?.teardown();
     frozenMountRef.current = null;
+    setHint(null);
+    if (hintTimer.current) window.clearTimeout(hintTimer.current);
     liftFrozenVeil();
     greyedGateRef.current?.invalidate();
     if (frozenRef.current) setFrozen(null);
     resolveAll();
   }, [resolveAll, liftFrozenVeil]);
   const enterFreeze = useCallback(() => {
+    if (modeRef.current !== "idle") exitMode();
     frozenMountRef.current = captureFrozenView(storyRoot());
     applyFrozenVeil();
     setFrozen({ kind: "freeze" });
+    showHint(hotkeys === false ? "\u2744 frozen \u2014 the toolbar Pin button pins what you see \xB7 Esc to thaw" : `\u2744 frozen \u2014 ${hotkeyLabel(hk.pin, DEFAULT_HOTKEYS.pin)} to pin what you see \xB7 Esc to thaw`);
     resolveAll();
-  }, [resolveAll, applyFrozenVeil]);
+  }, [resolveAll, applyFrozenVeil, showHint, hk.pin, exitMode, hotkeys]);
   const toggleFreeze = useCallback(() => {
     if (frozenView === false) {
       showHint("Frozen views are disabled for this story (parameters.annotakit.frozenView: false)");
@@ -2169,6 +1234,9 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
         showHint("Close the open thread card first (Esc)");
         return;
       }
+      if (modeRef.current !== "idle") exitMode();
+      const seq = ++recallSeqRef.current;
+      recallScrollRef.current = false;
       if (frozenMountRef.current) {
         frozenMountRef.current.teardown();
         frozenMountRef.current = null;
@@ -2179,8 +1247,25 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
       try {
         const snap = await getSnapshot(threadId);
         if (!mountedRef.current) return;
+        if (!shouldApplyRecall(seq, recallSeqRef.current)) return;
+        if (composerRef.current || activeThreadRef.current) {
+          try {
+            sbChannel().emit(THREAD_RECALLED, threadId);
+          } catch {
+          }
+          showHint(
+            composerRef.current ? "Submit or cancel the open comment first (Esc)" : "Close the open thread card first (Esc)"
+          );
+          return;
+        }
+        if (modeRef.current !== "idle") exitMode();
         if (!snap?.html || !snap.html.trim() || snap.clipped) throw new Error("snapshot missing or clipped");
+        const stale = frozenMountRef.current;
+        stale?.teardown();
         frozenMountRef.current = mountRecalledView(snap, storyRoot());
+        const mount = frozenMountRef.current;
+        const scroller = mount.container.querySelector(":scope > [data-annota-frozen]") ?? mount.container;
+        recallScrollRef.current = applyRecallScroll(snap, scroller, { x: window.scrollX, y: window.scrollY });
         applyFrozenVeil();
         mounted = true;
       } catch {
@@ -2196,11 +1281,12 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
         return;
       }
       setFrozen({ kind: "recall", threadId });
+      showHint(`\u2744 recalling #${threads.find((t) => t.id === threadId)?.number ?? "?"} \u2014 read-only \xB7 Esc to return`);
       setVisible(true);
       setActiveThread(threadId);
       resolveAll();
     },
-    [showHint, focusThread, resolveAll, composer, activeThread, liftFrozenVeil, applyFrozenVeil]
+    [showHint, focusThread, resolveAll, composer, activeThread, liftFrozenVeil, applyFrozenVeil, exitMode, threads]
   );
   useEffect(() => {
     if (!frozen || frozen.kind !== "recall" || !frozen.threadId) return;
@@ -2208,26 +1294,12 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
     const raf = requestAnimationFrame(() => {
       const el = anchors.get(id)?.el;
       if (!el || !el.closest("[data-annota-frozen]")) return;
-      el.scrollIntoView({ block: "center", behavior: "smooth" });
+      if (!recallScrollRef.current) el.scrollIntoView({ block: "center", behavior: "smooth" });
       el.setAttribute("data-annota-flash", "1");
       window.setTimeout(() => el.removeAttribute("data-annota-flash"), 3400);
     });
     return () => cancelAnimationFrame(raf);
   }, [frozen, anchors]);
-  const enterMode = useCallback((m) => {
-    setMode(m);
-    setComposer(null);
-    setActiveThread(null);
-    if (m === "pin") document.body.classList.add("annota-cursor");
-    else document.body.classList.remove("annota-cursor");
-  }, []);
-  const exitMode = useCallback(() => {
-    setMode("idle");
-    setHoverBox(null);
-    setDragRect(null);
-    dragStart.current = null;
-    document.body.classList.remove("annota-cursor");
-  }, []);
   const channelEffect = () => {
     const ch = sbChannel();
     const onFocus = (threadId) => {
@@ -2284,8 +1356,13 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
     let lastRaw = null;
     let lastFullAt = 0;
     const actOnHit = (x, y, el) => {
-      const target = el ?? hitTest(x, y, hitScope(), gate);
+      const scope = hitScope();
+      const target = el ?? hitTest(x, y, scope, gate);
       if (!target) return;
+      if (!isPinnableTarget(target, scope)) {
+        showHint("Click an element inside the story to pin it");
+        return;
+      }
       const root = frozenCaptureRootFor(target);
       const anchor = captureAnchor(target, root);
       setComposer({
@@ -2415,7 +1492,9 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
               return;
             }
             setComposer(null);
-          } else if (frozen) exitFrozenView();
+          } else if (activeThread) setActiveThread(null);
+          else if (frozen) exitFrozenView();
+          else if (helpOpen) setHelpOpen(false);
         }
         return;
       }
@@ -2565,15 +1644,25 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
         out.push({ thread: t, fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h }, status: "orphan" });
       }
     }
+    const slotCount = /* @__PURE__ */ new Map();
+    for (const v of out) {
+      if (v.thread.target.kind === "region") continue;
+      const cx = Math.min(Math.max(v.fixed.x - 4, 2), Math.max(vw - 26, 2));
+      const cy = Math.min(Math.max(v.fixed.y - 26, 2), Math.max(vh - 26, 2));
+      const key = `${Math.round(cx / 12)}:${Math.round(cy / 12)}`;
+      const n = slotCount.get(key) ?? 0;
+      slotCount.set(key, n + 1);
+      if (n > 0) v.fixed = { ...v.fixed, x: v.fixed.x + n * 10, y: v.fixed.y + n * 10 };
+    }
     void vw;
     void vh;
     return out;
   }, [threads, anchors, tick, frozen]);
   if (apiOk === false) {
-    return null;
+    return hint ? /* @__PURE__ */ React.createElement("div", { className: "annota-root" }, /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint", role: "status" }, hint)) : null;
   }
   const activeT = threads.find((t) => t.id === activeThread) ?? null;
-  return /* @__PURE__ */ React.createElement("div", { "data-annota-overlay": "1", className: "annota-root" }, frozen && /* @__PURE__ */ React.createElement("div", { className: "annota-frozen-pill", role: "status" }, frozen.kind === "freeze" ? "\u2744 frozen \u2014 \u2325C to pin what you see \xB7 Esc to thaw" : `\u2744 recalling #${threads.find((t) => t.id === frozen.threadId)?.number ?? "?"} \u2014 read-only \xB7 Esc to return`), visible && pinViews.map(
+  return /* @__PURE__ */ React.createElement("div", { "data-annota-overlay": "1", className: "annota-root" }, visible && pinViews.map(
     ({ thread, fixed, status }) => thread.target.kind === "region" ? /* @__PURE__ */ React.createElement(
       "div",
       {
@@ -2581,7 +1670,16 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
         className: `annota-region${thread.status === "resolved" ? " is-resolved" : ""}${thread.status === "fixed" ? " is-fixed" : ""}${thread.status === "rejected" ? " is-rejected" : ""}${thread.id === activeThread ? " is-active" : ""}`,
         style: { left: clamp(fixed.x, 0, Math.max(window.innerWidth - fixed.w, 0)), top: clamp(fixed.y, 0, Math.max(window.innerHeight - fixed.h, 0)), width: fixed.w, height: fixed.h },
         onClick: () => setActiveThread(thread.id),
-        title: `#${thread.number}`
+        onKeyDown: (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setActiveThread(thread.id);
+          }
+        },
+        tabIndex: 0,
+        role: "button",
+        "aria-label": `Open region thread #${thread.number} (${thread.status})`,
+        title: `#${thread.number} \u2014 Enter/Space opens`
       },
       /* @__PURE__ */ React.createElement("span", { className: "annota-region-tag" }, "#", thread.number)
     ) : /* @__PURE__ */ React.createElement(
@@ -2614,7 +1712,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
       },
       thread.number
     )
-  ), hint && mode === "idle" && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint", role: "status" }, hint), staticMode && storageError && storageError !== dismissedStorageError.current && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, "\u26A0 ", storageError, /* @__PURE__ */ React.createElement(
+  ), hint && /* @__PURE__ */ React.createElement("div", { className: "annota-capture-hint", role: "status" }, hint), staticMode && storageError && storageError !== dismissedStorageError.current && /* @__PURE__ */ React.createElement("div", { className: "annota-toast is-error", role: "alert" }, "\u26A0 ", storageError, /* @__PURE__ */ React.createElement(
     "button",
     {
       className: "annota-btn is-small",
@@ -2720,10 +1818,33 @@ function ComposerCard(props) {
 }
 function ThreadCard(props) {
   const [replyBody, setReplyBody] = React.useState("");
+  const [newestFirst, setNewestFirst] = React.useState(() => {
+    try {
+      return localStorage.getItem(COMMENT_ORDER_KEY) !== "oldest";
+    } catch {
+      return true;
+    }
+  });
+  const toggleCommentOrder = () => {
+    setNewestFirst((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem(COMMENT_ORDER_KEY, next ? "newest" : "oldest");
+      } catch {
+      }
+      return next;
+    });
+  };
   const t = props.thread;
   const near = props.pin?.fixed;
   const { ref, style } = useClampedPosition(near ? near.x + (near.x > window.innerWidth / 2 ? -120 : 120) : 40, near ? near.y : 60);
   const comp = t.component;
+  const prevCountRef = React.useRef(t.comments.length);
+  React.useEffect(() => {
+    const grew = t.comments.length > prevCountRef.current;
+    prevCountRef.current = t.comments.length;
+    if (grew && newestFirst && ref.current) ref.current.scrollTop = 0;
+  }, [t.comments.length, newestFirst, ref]);
   return /* @__PURE__ */ React.createElement("div", { ref, className: "annota-card", style }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "#", t.number, " ", t.status === "open" ? "" : t.status === "fixed" ? "(fixed \u2014 awaiting your review)" : t.status === "rejected" ? "(rejected \u2014 re-work expected)" : "(resolved)"), t.gh?.url && /* @__PURE__ */ React.createElement(
     "a",
     {
@@ -2742,7 +1863,15 @@ function ThreadCard(props) {
       title: "Pinned inside a frozen view \u2014 the stored snapshot is the exact state; use the panel's view action to recall it"
     },
     "\u2744 frozen"
-  ), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, t.story.importPath && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "story:"), " ", t.story.title, "/", t.story.name, " \u2014 ", t.story.importPath), comp?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", comp.source.file, comp.source.line ? `:${comp.source.line}` : ""), comp && comp.chain?.length > 1 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "chain:"), " ", comp.chain.slice(0, 5).filter((n) => Boolean(prettyName(n))).join(" > ")), t.target.selector.cssSelector && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "selector:"), " ", t.target.selector.cssSelector)), t.comments.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.id, className: "annota-comment" }, /* @__PURE__ */ React.createElement("div", { className: "annota-comment-head" }, /* @__PURE__ */ React.createElement("b", null, c.author, c.source === "github" ? " \xB7 from GitHub" : ""), /* @__PURE__ */ React.createElement("span", null, c.createdAt.slice(0, 16).replace("T", " "))), /* @__PURE__ */ React.createElement("p", null, c.body))), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), /* @__PURE__ */ React.createElement("div", { className: "annota-reply-row" }, /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      className: "annota-btn is-small",
+      onClick: toggleCommentOrder,
+      title: newestFirst ? "Comments: newest first (latest reply on top) \u2014 click for oldest first (chat order)" : "Comments: oldest first (chat order) \u2014 click for newest first (latest reply on top)"
+    },
+    newestFirst ? "\u21C5 latest" : "\u21C5 oldest"
+  ), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("div", { className: "annota-meta-rows" }, t.story.importPath && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "story:"), " ", t.story.title, "/", t.story.name, " \u2014 ", t.story.importPath), comp?.source && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "jsx:"), " ", comp.source.file, comp.source.line ? `:${comp.source.line}` : ""), comp && comp.chain?.length > 1 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "chain:"), " ", comp.chain.slice(0, 5).filter((n) => Boolean(prettyName(n))).join(" > ")), t.target.selector.cssSelector && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, "selector:"), " ", t.target.selector.cssSelector)), (newestFirst ? [...t.comments].reverse() : t.comments).map((c) => /* @__PURE__ */ React.createElement("div", { key: c.id, className: "annota-comment" }, /* @__PURE__ */ React.createElement("div", { className: "annota-comment-head" }, /* @__PURE__ */ React.createElement("b", null, c.author, c.source === "github" ? " \xB7 from GitHub" : ""), /* @__PURE__ */ React.createElement("span", null, c.createdAt.slice(0, 16).replace("T", " "))), /* @__PURE__ */ React.createElement("p", null, c.body))), props.error && /* @__PURE__ */ React.createElement("div", { className: "annota-status-banner is-error" }, props.error), /* @__PURE__ */ React.createElement("div", { className: "annota-reply-row" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       className: "annota-input",
@@ -2761,12 +1890,8 @@ function ThreadCard(props) {
   ), t.status === "open" && /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Resolve (reviewer-confirmed)" }, "Resolve"), t.status === "fixed" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Confirm the fix \u2014 the agent addressed this, you verified it" }, "\u2713 Confirm"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "rejected"), title: "Reject \u2014 the fix is not accepted (reply with why); the thread stays marked rejected until re-addressed" }, "Reject")), t.status === "rejected" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-ok", disabled: props.busy, onClick: () => props.onSetStatus(t, "resolved"), title: "Confirm after all \u2014 you re-verified and accept the fix" }, "\u2713 Confirm"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "open"), title: "Clear the rejection \u2014 back to plain open (the verdict is erased)" }, "\u21A9 Clear")), t.status === "resolved" && /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-danger", disabled: props.busy, onClick: () => props.onSetStatus(t, "open") }, "Reopen")));
 }
 function HelpCard(props) {
-  const k = (spec) => {
-    const s = parseHotkey(spec, spec);
-    const key = s.key === "?" ? "?" : s.key.toUpperCase();
-    return s.alt ? `\u2325${key}` : key;
-  };
-  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-help" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "Annotakit shortcuts"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("table", null, /* @__PURE__ */ React.createElement("tbody", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.pin))), /* @__PURE__ */ React.createElement("td", null, "pin an element (click it)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.region))), /* @__PURE__ */ React.createElement("td", null, "mark a region (drag)")), props.frozenView !== false && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.freeze))), /* @__PURE__ */ React.createElement("td", null, "freeze / thaw the current view \u2014 works without moving the mouse (catches hover-driven UI)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.layer))), /* @__PURE__ */ React.createElement("td", null, "show / hide pins")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.drawer))), /* @__PURE__ */ React.createElement("td", null, "open the threads panel (bottom dock \u2014 SB docks it left/right too)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, "Esc")), /* @__PURE__ */ React.createElement("td", null, "cancel / close")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, "\u2318/Ctrl+\u21B5")), /* @__PURE__ */ React.createElement("td", null, "submit comment")))), /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px", fontSize: 11, color: "#64748b" } }, "Shortcuts are ", /* @__PURE__ */ React.createElement("b", null, "Alt/\u2325-prefixed"), " (SB convention \u2014 plain single letters belong to story key handlers). Legacy plain-key configs still respond with \u2325 held. Customize via ", /* @__PURE__ */ React.createElement("code", null, "parameters.annotakit.hotkeys"), " in the story file. Toolbar buttons (native SB toolbar) trigger the same actions. Threads persist in the Storybook dev server's embedded store \u2014 export from the Annotakit panel (bottom dock)."));
+  const k = (spec, fallback) => hotkeyLabel(spec, fallback);
+  return /* @__PURE__ */ React.createElement("div", { className: "annota-card annota-help" }, /* @__PURE__ */ React.createElement("div", { className: "annota-card-header" }, /* @__PURE__ */ React.createElement("span", { className: "annota-grow" }, "Annotakit shortcuts"), /* @__PURE__ */ React.createElement("button", { className: "annota-btn is-small", onClick: props.onClose }, "\u2715")), /* @__PURE__ */ React.createElement("table", null, /* @__PURE__ */ React.createElement("tbody", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.pin, DEFAULT_HOTKEYS.pin))), /* @__PURE__ */ React.createElement("td", null, "pin an element (click it)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.region, DEFAULT_HOTKEYS.region))), /* @__PURE__ */ React.createElement("td", null, "mark a region (drag)")), props.frozenView !== false && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.freeze, DEFAULT_HOTKEYS.freeze))), /* @__PURE__ */ React.createElement("td", null, "freeze / thaw the current view \u2014 works without moving the mouse (catches hover-driven UI)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.layer, DEFAULT_HOTKEYS.layer))), /* @__PURE__ */ React.createElement("td", null, "show / hide pins")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, k(props.hotkeys.drawer, DEFAULT_HOTKEYS.drawer))), /* @__PURE__ */ React.createElement("td", null, "open the threads panel (bottom dock \u2014 SB docks it left/right too)")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, "Esc")), /* @__PURE__ */ React.createElement("td", null, "cancel / close")), /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "annota-kbd" }, "\u2318/Ctrl+\u21B5")), /* @__PURE__ */ React.createElement("td", null, "submit comment")))), /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px", fontSize: 11, color: "#64748b" } }, "Shortcuts are ", /* @__PURE__ */ React.createElement("b", null, "Alt/\u2325-prefixed"), " (SB convention \u2014 plain single letters belong to story key handlers). Legacy plain-key configs still respond with \u2325 held. Customize via ", /* @__PURE__ */ React.createElement("code", null, "parameters.annotakit.hotkeys"), " in the story file. Toolbar buttons (native SB toolbar) trigger the same actions. Threads persist in the Storybook dev server's embedded store \u2014 export from the Annotakit panel (bottom dock)."));
 }
 
 // src/preview/index.ts

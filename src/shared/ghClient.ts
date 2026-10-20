@@ -36,8 +36,9 @@
  */
 
 import { getStaticStore, renderThreadBlock, staticScope, type StaticStore } from './staticStore';
-import type { Comment, Thread } from './types';
+import type { Comment, Thread, ThreadGhRef } from './types';
 import { ISSUE_BODY_LIMIT, mirrorStateOf } from './types';
+import { metaLine } from './metaline'; // DD-10 (S9): the ONE hardening source for mirror titles/bodies/headings
 import { decideMirrorHeal, legacyClientBodyCandidates, legacyMirrorTitle } from './legacyMirror';
 // re-exported for scripts/heal-mirrors.mjs + the regression suite — the
 // legacy reconstructions stay reachable so tests build EXACT old mirrors.
@@ -135,6 +136,13 @@ export interface GhClientStatus {
    *  only trace that survives the heal actually working. */
   tokenDroppedAt: string | null;
   pollMs: number;
+  /** DD-21 (v0.6.15): mapped threads whose issue lives on a DIFFERENT repo
+   *  than the active config — DETACHED (inert + loud). The settings surface
+   *  warns at save time; the per-thread chip carries the detail. */
+  detached?: number;
+  /** Outbox ops parked BECAUSE their target mapping is detached (a subset of
+   *  `parked`; un-parked automatically when the settings change). */
+  detachedParked?: number;
 }
 
 export interface GhLinkFacet {
@@ -157,6 +165,12 @@ interface GhOp {
   kind: 'sync' | 'close';
   threadId?: string;
   issue?: number;
+  /** DD-21 (v0.6.15): close ops carry the repo the target issue was minted
+   *  on (from the mapping at enqueue) — a close whose repo ≠ the effective
+   *  config PARKS (a later repo-restore lands it on the ORIGINAL issue);
+   *  a legacy unstamped target verifies the issue body's `- thread id:`
+   *  stamp before closing (threadId rides the op for that check). */
+  repo?: string;
   enqueuedAt: string;
   attempts?: number;
   /** Retry-not-before timestamp (ms epoch). Infinity-parked ops set
@@ -166,6 +180,9 @@ interface GhOp {
   /** Terminally parked (422 body rejection): never retried, kept for
    * inspection, surfaced via status().parked. */
   parked?: boolean;
+  /** DD-21: parked because the target mapping is DETACHED — un-parked on
+   *  the next settings save (the user may have restored the repo). */
+  parkReason?: 'detached';
 }
 
 /* ------------------------------ transport shim ------------------------------ */
@@ -322,22 +339,27 @@ async function ghJsonPaged<T>(cfg: GhClientConfig, pathname: string, maxPages = 
     const next: RegExpMatchArray | null = link.match(/<([^>]+)>;\s*rel="next"/);
     if (!next) {
       url = null;
-      truncated = false;
+      truncated = false; // a natural end is not truncation
     } else {
       try {
         url = new URL(next[1] as string).origin === new URL(cfg.apiBase).origin ? (next[1] as string) : null;
-        if (!url) truncated = false;
+        // P3 (S9, 33-b): a cross-origin STOP IS a truncation — pages beyond it
+        // are silently dropped; resetting the flag here suppressed the loud
+        // warning (the exact class C19 exists to prevent)
+        if (!url) truncated = true;
       } catch {
         url = null;
-        truncated = false;
+        truncated = true; // a malformed next link drops pages too
       }
     }
   }
-  if (truncated && url) {
+  if (truncated) {
     // v0.6.6 (F10): a pull-scoped WARNING, not the engine error — success
     // clears must not clobber it (it describes the last pull's remote state
     // and survives until the next pull refreshes it)
-    pullWarning = `GitHub pagination cap hit (${maxPages} pages) on ${pathname} — results truncated`;
+    pullWarning = truncated && url
+      ? `GitHub pagination cap hit (${maxPages} pages) on ${pathname} — results truncated`
+      : `GitHub pagination stopped early on ${pathname} (cross-origin/malformed next link) — results truncated`;
   }
   return out;
 }
@@ -541,13 +563,27 @@ export function resolveGhConfig(baked: GhClientSettings | null, override: GhClie
   }
   const token = (merged.token ?? '').trim();
   const repo = (merged.repo ?? '').trim();
-  if (!token || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return null;
+  // v0.6.13 (audit 44-d P2-1): GitHub's real owner/name charset — the SAME
+  // gate at every door (src/server/env.ts ghRepoEnv, the bake's
+  // normalizeGhRepoInput, heal-mirrors' usage gate). The old lax class
+  // `/^[^/\s]+\/[^/\s]+$/` excluded only `/` and whitespace, so the npm-style
+  // shorthand `github:octocat/widgets` passed VERBATIM with `github:octocat`
+  // as the "owner" and armed a dead mirror (every GitHub call 404s — the
+  // runtime gate is the LAST door; the bake/env doors normalize the
+  // shorthand, and a runtime override that still carries it is refused:
+  // unconfigured is honest, a silently-dead engine is not).
+  if (!token || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return null;
   const labels = (merged.labels ?? []).map((l) => String(l).trim()).filter(Boolean);
   const pollMs = typeof merged.pollMs === 'number' && Number.isFinite(merged.pollMs) && merged.pollMs >= 0 ? Math.floor(merged.pollMs) : DEFAULT_POLL_MS;
   // v0.6.7: trailing-slash collapse — `${apiBase}${pathname}` concatenation
   // made a pasted 'https://api.github.com/' produce '//repos/…' URLs that
   // miss every route; normalize once at resolution
-  const apiBase = (merged.apiBase ?? '').trim().replace(/\/+$/, '') || DEFAULT_API;
+  // P3 (S9): shape validation — the server door (gh.ts ghApiBase) twin. A
+  // malformed apiBase silently flowed into every request URL; loud here too.
+  const apiBase = ((merged.apiBase ?? '').trim().replace(/\/+$/, '') || DEFAULT_API);
+  if (!/^https?:\/\/[^/\s]+(\/[^\s]*)?$/i.test(apiBase)) { // host + optional path (the GHE /api/v3 form)
+    throw new Error(`apiBase must be an http(s) origin like https://github.example.com/api/v3 (got ${JSON.stringify(merged.apiBase)})`);
+  }
   return { token, repo, labels: labels.length ? labels : [DEFAULT_LABEL], apiBase, pollMs };
 }
 
@@ -555,7 +591,18 @@ export function resolveGhConfig(baked: GhClientSettings | null, override: GhClie
  *  localStorage override each call — settings changes apply immediately). */
 export async function probeGhConfig(): Promise<GhClientConfig | null> {
   const baked = await probeBakedGhConfig();
-  return resolveGhConfig(baked, readOverride());
+  try {
+    return resolveGhConfig(baked, readOverride());
+  } catch (err) {
+    // v0.6.15 (55-c P3-3): resolveGhConfig THROWS on a malformed apiBase
+    // (hand-edited localStorage — the UI never writes the field) and NO
+    // consumer caught it: the manager's boot poll never landed (the panel
+    // lied 'client GH unconfigured'), the 2s status poll threw inside the
+    // interval, the engine halted with unhandled rejections. Refuse loudly
+    // instead: unconfigured + the error named.
+    if (state) state.lastError = `client GH config refused: ${err instanceof Error ? err.message : String(err)} (fix or clear the saved GitHub settings)`;
+    return null;
+  }
 }
 
 /* ------------------------------ issue body build ---------------------------- */
@@ -564,10 +611,12 @@ export async function probeGhConfig(): Promise<GhClientConfig | null> {
  *  twin of the pull-path self-heal) so tooling can never drift from the
  *  engine's exact format. */
 export function mirrorIssueTitle(t: Thread): string {
-  const storyLabel = t.story?.name ?? t.story?.title ?? t.storyId;
+  // DD-10 (S9): metaLine — single-line + leading-marker neutralize + cap; the
+  // old inline collapse kept a `-`/`#`-leading story name minting structure
+  const storyLabel = metaLine(t.story?.name ?? t.story?.title ?? t.storyId, 120);
   // headline budget 100 (issue #16, server parity): the body carries everything
   // verbatim; the title is the scannable ID
-  const headline = (t.comments[0]?.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  const headline = metaLine(t.comments[0]?.body ?? '', 100);
   return `[review] ${storyLabel} — #${t.number} ${headline || '(no text)'}`.slice(0, 160);
 }
 
@@ -577,7 +626,7 @@ export function mirrorIssueBody(t: Thread, cfg: { repo: string; labels: string[]
   const origin = staticScope();
   const storyUrl = t.story?.url ?? `${origin}?path=/story/${t.storyId}`;
   const out: string[] = [];
-  out.push(`# UI review — ${t.story?.title ?? t.storyId}`);
+  out.push(`# UI review — ${metaLine(t.story?.title ?? t.storyId)}`); // DD-10 (S9, 33-f): the heading was raw — a hostile story title injected structure into the mirror body (server twin digest.ts is metaLine'd)
   out.push('');
   out.push(`storybook (static deployment): ${origin}`);
   out.push(`mirror: ${cfg.repo} · labels: ${cfg.labels.join(', ')} · client-side publish`);
@@ -609,8 +658,14 @@ export function mirrorIssueBody(t: Thread, cfg: { repo: string; labels: string[]
 // Per-comment sentinel: same contract as the server engine — a push that
 // dies between the GitHub call and the ghId stamp is healed on the next pull
 // instead of echoing back as a duplicate imported reply.
+// v0.6.13 (audit 44-b P3-6, the server twin's Batch C P3-5 fold): the author
+// and the sentinel id are metaLine'd EXACTLY like ghsync's mirrorBody — a
+// hostile author (GitHub-cosmetic newlines, a `**`-marker id) could break
+// the mirror line / mint structure. metaLine is identity on engine-generated
+// ids (c_ + base36/hash, no whitespace/markers, <300) so the sentinel
+// round-trip (parseSentinel ↔ local comment ids) holds.
 function mirrorBody(c: Comment): string {
-  return `**${c.author}:** ${c.body}\n<!-- annotakit:c_${c.id} -->`;
+  return `**${metaLine(c.author, 60)}:** ${c.body}\n<!-- annotakit:c_${metaLine(c.id)} -->`;
 }
 
 function parseSentinel(body: string): string | null {
@@ -690,8 +745,8 @@ function opKeyOf(op: Omit<GhOp, 'id' | 'enqueuedAt'>): string {
 }
 
 function enqueue(kind: 'sync', threadId: string, opts?: { fromSweep?: boolean }): void;
-function enqueue(kind: 'close', issue: number, opts?: { fromSweep?: boolean }): void;
-function enqueue(kind: 'sync' | 'close', ref: string | number, opts?: { fromSweep?: boolean }): void {
+function enqueue(kind: 'close', issue: number, opts?: { fromSweep?: boolean; repo?: string | null; threadId?: string }): void;
+function enqueue(kind: 'sync' | 'close', ref: string | number, opts?: { fromSweep?: boolean; repo?: string | null; threadId?: string }): void {
   const ops = readQueue();
   const key = kind === 'sync' ? `sync:${ref}` : `close:${ref}`;
   const existing = ops.find((o) => opKeyOf(o) === key);
@@ -699,13 +754,16 @@ function enqueue(kind: 'sync' | 'close', ref: string | number, opts?: { fromSwee
   // op means the content CHANGED — the rejection may not recur. Unpark and
   // retry once; a fresh 422 re-parks with the new error. The periodic sweep
   // (fromSweep) never unparks — config saves cannot fix a rejected body.
+  // (DD-21 detached-parking rides the same un-park — a new mutation on a
+  // detached thread re-arms it, and the entry guard re-parks if still
+  // foreign.)
   const unpark = Boolean(existing?.parked) && !opts?.fromSweep;
   const op: GhOp = existing
-    ? { ...existing, enqueuedAt: new Date().toISOString(), notBefore: 0, lastError: undefined, ...(unpark ? { parked: false, attempts: 0 } : {}) }
+    ? { ...existing, enqueuedAt: new Date().toISOString(), notBefore: 0, lastError: undefined, ...(unpark ? { parked: false, attempts: 0, parkReason: undefined } : {}), ...(opts?.repo ? { repo: opts.repo } : {}), ...(opts?.threadId && kind === 'close' ? { threadId: opts.threadId } : {}) }
     : {
         id: `op_${Math.random().toString(36).slice(2, 10)}`,
         kind,
-        ...(kind === 'sync' ? { threadId: String(ref) } : { issue: Number(ref) }),
+        ...(kind === 'sync' ? { threadId: String(ref) } : { issue: Number(ref), ...(opts?.repo ? { repo: opts.repo } : {}), ...(opts?.threadId ? { threadId: opts.threadId } : {}) }),
         enqueuedAt: new Date().toISOString(),
       };
   const next = existing ? ops.map((o) => (opKeyOf(o) === key ? op : o)) : [...ops, op];
@@ -906,6 +964,87 @@ function freshThread(base: StaticStore, id: string): Thread | undefined {
   return base.list().find((t) => t.id === id);
 }
 
+/* ------------------------- DD-21: mapping repo identity ------------------------ */
+
+/** The mapping's repo identity: the explicit stamp first, then DERIVED from
+ *  the issue URL — END-ANCHORED on `/issues/N` (owner/repo are the two
+ *  segments before `issues`), host-agnostic so GHE web roots with prefix
+ *  paths parse too. Every mint site has written `url: html_url` since the
+ *  first mirror, so legacy docs resolve without a migration. Null when
+ *  neither is usable (verify-and-stamp territory — never assume). */
+export function ghMappingRepo(ref: ThreadGhRef | undefined): string | null {
+  if (!ref) return null;
+  if (typeof ref.repo === 'string' && ref.repo) return ref.repo;
+  if (typeof ref.url === 'string' && ref.url) {
+    try {
+      const segs = new URL(ref.url).pathname.split('/').filter(Boolean);
+      const owner = segs[segs.length - 4];
+      const name = segs[segs.length - 3];
+      if (segs[segs.length - 2] === 'issues' && /^[A-Za-z0-9_.-]+$/.test(owner ?? '') && /^[A-Za-z0-9_.-]+$/.test(name ?? '')) {
+        return `${owner}/${name}`;
+      }
+    } catch {
+      /* unparseable url → unknown */
+    }
+  }
+  return null;
+}
+
+/** A KNOWN mapping repo that differs from the active config = DETACHED
+ *  (inert + loud). Unknown (null) is NOT detached — verify-and-stamp owns
+ *  that decision, never an assumption. */
+function isDetachedMapping(ref: ThreadGhRef | undefined, cfgRepo: string): boolean {
+  const r = ghMappingRepo(ref);
+  return r !== null && r !== cfgRepo;
+}
+
+/** Thread ids whose UNSTAMPED mapping was verified FOREIGN this session (the
+ *  one-GET verify memo — a pull and a push never double-pay for it). */
+const verifiedForeign = new Set<string>();
+
+/** DD-21 amendment 3: an unstamped + underivable mapping gets ONE GET under
+ *  the active repo. The body's `- thread id:` stamp matches → the mapping is
+ *  genuinely ours HERE: stamp cfg.repo onto it (persisted; permanent). A 404
+ *  or a mismatch → foreign: NEVER unlink (the issue may be alive on its own
+ *  repo) — mark detached for this session. */
+async function verifyAndStampMapping(base: StaticStore, cfg: GhClientConfig, t: Thread): Promise<boolean> {
+  if (!t.gh) return false;
+  if (verifiedForeign.has(t.id)) return false;
+  let body: string | null = null;
+  try {
+    const issue = await getIssueRemote(cfg, t.gh.issue);
+    body = typeof issue.body === 'string' ? issue.body : null;
+  } catch {
+    body = null; // 404 or error — the issue does not live HERE
+  }
+  const m = body !== null ? body.match(/^- thread id: (.+)$/m) : null;
+  if (m?.[1]?.trim() === t.id) {
+    const fresh = freshThread(base, t.id);
+    if (fresh?.gh && fresh.gh.issue === t.gh.issue) {
+      await base.patch({ ...fresh, gh: { ...fresh.gh, repo: cfg.repo } });
+    }
+    return true;
+  }
+  verifiedForeign.add(t.id);
+  return false;
+}
+
+/** Park an op because its target mapping is DETACHED (amendment 4:
+ *  park-not-retire — a repo-restore resumes it; the next settings save
+ *  un-parks every detached op). */
+function parkOpDetached(opId: string, why: string): void {
+  const ops = readQueue();
+  writeQueue(ops.map((o) => (o.id === opId ? { ...o, parked: true, parkReason: 'detached' as const, notBefore: 0, lastError: why } : o)));
+}
+
+/** Un-park every detached-parked op (a settings save just changed the config
+ *  — the user may have restored the original repo). */
+function unparkDetachedOps(): void {
+  const ops = readQueue();
+  if (!ops.some((o) => o.parked && o.parkReason === 'detached')) return;
+  writeQueue(ops.map((o) => ((o.parked && o.parkReason === 'detached') ? { ...o, parked: false, parkReason: undefined, attempts: 0, lastError: undefined } : o)));
+}
+
 /** True when the thread has a queued/in-flight op — pull must skip it (its
  *  remote state is about to change). */
 function threadPending(id: string): boolean {
@@ -943,9 +1082,28 @@ function lostLeaseError(): Error & { status: number; transient: boolean } {
   });
 }
 
-async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): Promise<void> {
+async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): Promise<'done' | 'parked'> {
   const t = freshThread(base, String(op.threadId));
-  if (!t) return; // thread deleted — its own 'close' op owns the issue
+  if (!t) return 'done'; // thread deleted — its own 'close' op owns the issue
+
+  // DD-21 (v0.6.15): a mapping whose repo differs from the active config is
+  // DETACHED — writing to it would contaminate a same-numbered FOREIGN issue
+  // (the 55-c P2: a foreign close resolved our thread; our delete closed the
+  // foreign issue). The op PARKS (not retires — a repo-restore resumes it);
+  // an UNSTAMPED + underivable mapping gets ONE verify-and-stamp GET first.
+  if (t.gh) {
+    const mapRepo = ghMappingRepo(t.gh);
+    if (mapRepo === null) {
+      const verified = await verifyAndStampMapping(base, cfg, t);
+      if (!verified) {
+        parkOpDetached(op.id, `issue #${t.gh.issue} does not belong to this thread on ${cfg.repo} (unstamped mapping, verify mismatch) — op parked (mirror DETACHED); restore the repo setting or unlink the thread`);
+        return 'parked';
+      }
+    } else if (mapRepo !== cfg.repo) {
+      parkOpDetached(op.id, `issue #${t.gh.issue} lives on ${mapRepo}; the mirror now targets ${cfg.repo} — op parked (mirror DETACHED); restore the repo setting or unlink the thread to re-mirror`);
+      return 'parked';
+    }
+  }
 
   if (!t.gh) {
     // NEW-5 (wave-4, engine parity with ghsync's C14): a stamped orphan for
@@ -955,22 +1113,53 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
     // were in the body) — the delta flow pushes them as issue comments.
     try {
       const listed = await listLabeledIssuesRemote(cfg);
-      const mapped = new Set(base.list().filter((x) => x.gh).map((x) => x.gh?.issue as number));
+      // DD-21 amendment 5: DETACHED mappings do not reserve their issue number
+      // on the active repo — a foreign #N must not block adopting a genuine
+      // orphan #N here (that minted duplicate issues).
+      const mapped = new Set(
+        base.list()
+          .filter((x) => x.gh && !isDetachedMapping(x.gh, cfg.repo))
+          .map((x) => x.gh?.issue as number),
+      );
       const orphan = listed.find((i) => {
         if (mapped.has(i.number) || typeof i.body !== 'string' || !i.body) return false;
         const m = i.body.match(/^- thread id: (.+)$/m);
         return m?.[1]?.trim() === t.id;
       });
       if (orphan) {
+        // DD-13 (13a, S9 — the client twin of ghsync's adoptOrphanState): READ
+        // the issue's state, never force local over it. An orphan is open BY
+        // CONSTRUCTION, so open is the create-time baseline; a CLOSED orphan
+        // with an unconfirmed local row imports resolved (resolvedAt=closed_at,
+        // the gh-close system comment, reopenedAt cleared — a confirm
+        // supersedes any resubmit event); closed+resolved mirrors (deltas
+        // only); open+resolved keeps the resolve (the lifecycle section below
+        // closes the issue as catch-up on the next flush).
+        const importResolved = String(orphan.state) === 'closed' && t.status !== 'resolved';
         const stampedOrphan: Thread = {
           ...t,
+          ...(importResolved
+            ? {
+                status: 'resolved' as const,
+                resolvedAt: orphan.closed_at ?? new Date().toISOString(),
+              }
+            : {}),
           // v0.6.6 (F12): server-clock high-water mark — a local-clock stamp
           // re-opened the clock-skew permanent-miss window at every seam
-          gh: { issue: orphan.number, url: orphan.html_url, state: orphan.state, syncedAt: orphan.updated_at ?? new Date().toISOString() },
+          gh: { issue: orphan.number, url: orphan.html_url, repo: cfg.repo, state: orphan.state, syncedAt: orphan.updated_at ?? new Date().toISOString() },
         };
+        if (importResolved) {
+          // v0.6.14 (audit 53-c P3, the third door of the commit's own named
+          // class): the adoption used to append the gh-close note UNGUARDED —
+          // a re-adoption after a reopen cycle minted a second 'closed on
+          // GitHub' under a fresh random id. Route it through
+          // appendSystemComment like the pull paths.
+          appendSystemComment(stampedOrphan, `gh-close-${orphan.number}`, orphan.closed_by?.login ?? 'github', 'closed on GitHub');
+        }
+        if (importResolved) delete stampedOrphan.reopenedAt;
         await base.patch(stampedOrphan);
         if (state) state.lastPushAt = new Date().toISOString();
-        return;
+        return 'done';
       }
     } catch {
       /* listing failed — proceed to a normal create (best effort) */
@@ -983,12 +1172,12 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
     if (!cur) {
       await addIssueCommentRemote(cfg, created.number, `${GH_SENTINEL}\nthread deleted in Storybook (static) — closing.`);
       await setIssueStateRemote(cfg, created.number, 'closed');
-      return;
+      return 'done';
     }
     // stamp mapping + mark every existing comment as mirrored (issue body)
     const stamped: Thread = {
       ...cur,
-      gh: { issue: created.number, url: created.html_url, state: 'open', syncedAt: created.updated_at ?? new Date().toISOString() },
+      gh: { issue: created.number, url: created.html_url, repo: cfg.repo, state: 'open', syncedAt: created.updated_at ?? new Date().toISOString() },
       comments: cur.comments.map((c) => (c.ghId || c.source === 'github' ? c : { ...c, ghId: 'issue-body' })),
     };
     await base.patch(stamped); // original method — no re-enqueue
@@ -1000,15 +1189,58 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
       if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, state: 'closed' } });
     }
     state && (state.lastPushAt = new Date().toISOString());
-    return;
+    return 'done';
   }
 
   let pushed = 0;
   let remoteStamp: string | undefined; // v0.6.6 (F12): last REST-response server timestamp
 
+  // DD-8a (S9 — DD-8 REPLACED after the 34-b REJECT: the boot pull was a
+  // verified no-op; this per-op listing covers boot AND every steady-state
+  // retry): before pushing un-stamped comments on a mapped thread, ONE
+  // listing of the issue's comments (since=syncedAt) + sentinel match. A
+  // tab that crashed between addIssueCommentRemote and the ghId stamp left
+  // the comment un-stamped; re-flushing it (boot, the 30s sweep, any retry)
+  // used to DOUBLE-POST it. The sentinel in the remote body is the engine's
+  // own fingerprint: stamp the local comment via base.patch instead; the
+  // existing `if (c.ghId) continue` skip below does the rest. A read + a
+  // local patch only — no lease renewal needed (a follower healing here is
+  // idempotent; the leader's flush finds the comment stamped and skips).
+  {
+    const unstamped = t.comments.filter((c) => !c.ghId && c.source !== 'github');
+    if (unstamped.length > 0) {
+      try {
+        const remoteComments = await listIssueCommentsRemote(cfg, t.gh.issue, t.gh.syncedAt);
+        for (const rc of remoteComments) {
+          const localId = parseSentinel(String(rc.body ?? ''));
+          if (!localId) continue;
+          const hit = unstamped.some((c) => c.id === localId);
+          if (!hit) continue;
+          const cur = freshThread(base, t.id);
+          if (!cur || !cur.gh) return 'done'; // deleted mid-heal; the close op takes over
+          const idx = cur.comments.findIndex((x) => x.id === localId && !x.ghId);
+          if (idx >= 0) {
+            const comments = [...cur.comments];
+            comments[idx] = { ...comments[idx], ghId: String(rc.id) };
+            await base.patch({ ...cur, gh: cur.gh, comments });
+          }
+        }
+      } catch {
+        /* listing failed — the un-stamped comments push as normal (the pre-DD-8 shape; the pull's self-heal still catches them) */
+      }
+    }
+  }
+
+  // DD-8a follow-up: the heal above may have stamped comments — the push
+  // loop below must iterate the FRESH row, not the stale pre-heal snapshot
+  // (iterating the stale copy re-pushed the healed comment — the exact
+  // duplicate the listing exists to prevent; caught by the suite's probe).
+  const tF = freshThread(base, t.id);
+  if (!tF || !tF.gh) return 'done'; // deleted mid-heal; the close op takes over
+
   // 1. un-mirrored local replies → issue comments (sentinel-marked, exact
   //    ghId stamp right after each push — re-reading fresh in between)
-  for (const c of t.comments) {
+  for (const c of tF.comments) {
     if (c.ghId || c.source === 'github') continue;
     // F4: renew before EVERY remote comment write — a >45s comment drain
     // must never outlive the lease (duplicate-comment window)
@@ -1016,7 +1248,7 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
     const gh = await addIssueCommentRemote(cfg, t.gh.issue, mirrorBody(c));
     remoteStamp = gh.updated_at ?? gh.created_at ?? remoteStamp;
     const cur = freshThread(base, t.id);
-    if (!cur) return; // deleted mid-push; the close op takes over
+    if (!cur) return 'done'; // deleted mid-push; the close op takes over
     const idx = cur.comments.findIndex((x) => x.id === c.id);
     const curGh = cur.gh;
     if (idx >= 0 && curGh && !cur.comments[idx].ghId) {
@@ -1028,11 +1260,11 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
   }
 
   // 2. lifecycle: thread.status vs mirrored issue state
-  const curGh = t.gh;
-  const want = mirrorStateOf(t.status);
+  const curGh = tF.gh;
+  const want = mirrorStateOf(tF.status);
   if (curGh.state !== want) {
     if (!stillLeading()) throw lostLeaseError();
-    await addIssueCommentRemote(cfg, curGh.issue, want === 'closed' ? resolutionNotice(t) : reopenNotice(t));
+    await addIssueCommentRemote(cfg, curGh.issue, want === 'closed' ? resolutionNotice(tF) : reopenNotice(tF));
     const flipped = await setIssueStateRemote(cfg, curGh.issue, want);
     remoteStamp = flipped.updated_at ?? remoteStamp;
     const fresh = freshThread(base, t.id);
@@ -1043,13 +1275,38 @@ async function processSyncOp(base: StaticStore, cfg: GhClientConfig, op: GhOp): 
     if (fresh?.gh) await base.patch({ ...fresh, gh: { ...fresh.gh, syncedAt: remoteStamp ?? new Date().toISOString() } });
   }
   if (pushed > 0 && state) state.lastPushAt = new Date().toISOString();
+  return 'done';
 }
 
-async function processCloseOp(cfg: GhClientConfig, op: GhOp): Promise<void> {
-  if (!op.issue) return; // thread was never mirrored — nothing to close
+async function processCloseOp(cfg: GhClientConfig, op: GhOp): Promise<'done' | 'parked'> {
+  if (!op.issue) return 'done'; // thread was never mirrored — nothing to close
+  // DD-21 amendment 2: the close op carries the repo the issue was minted on.
+  // A close whose repo ≠ the effective config targets a same-numbered FOREIGN
+  // issue on the new repo — PARK it (a repo-restore lands the close on the
+  // ORIGINAL issue); a legacy unstamped op verifies the body's thread-id
+  // stamp before closing (one GET, never assume).
+  if (op.repo && op.repo !== cfg.repo) {
+    parkOpDetached(op.id, `close of issue #${op.issue} parked — it lives on ${op.repo}, the mirror now targets ${cfg.repo} (restoring the repo setting will land this close on the original issue)`);
+    return 'parked';
+  }
+  if (!op.repo && op.threadId) {
+    let bodyMatch = false;
+    try {
+      const issue = await getIssueRemote(cfg, op.issue);
+      const m = typeof issue.body === 'string' ? issue.body.match(/^- thread id: (.+)$/m) : null;
+      bodyMatch = m?.[1]?.trim() === op.threadId;
+    } catch {
+      bodyMatch = false; // 404/error — the issue does not live here
+    }
+    if (!bodyMatch) {
+      parkOpDetached(op.id, `close of issue #${op.issue} parked — its body does not carry this thread's id stamp on ${cfg.repo} (legacy unstamped mapping; refusing to close a possible foreign issue)`);
+      return 'parked';
+    }
+  }
   if (!stillLeading()) throw lostLeaseError();
   await addIssueCommentRemote(cfg, op.issue, `${GH_SENTINEL}\nthread deleted in Storybook (static) — closing.`);
   await setIssueStateRemote(cfg, op.issue, 'closed');
+  return 'done';
 }
 
 async function flushOnce(base: StaticStore): Promise<void> {
@@ -1080,9 +1337,11 @@ async function flushOnce(base: StaticStore): Promise<void> {
       ranWork = true;
       const op = ops[0] as GhOp;
       try {
-        if (op.kind === 'sync') await processSyncOp(base, cfg, op);
-        else await processCloseOp(cfg, op);
-        removeOp(op.id);
+        // DD-21: a 'parked' result leaves the op queued (detached mapping —
+        // park-not-retire; the next settings save un-parks it)
+        const res = op.kind === 'sync' ? await processSyncOp(base, cfg, op) : await processCloseOp(cfg, op);
+        if (res !== 'parked') removeOp(op.id);
+        else continue;
         // v0.6.6 (F10): clear the engine error on op success, but a pull
         // warning (pagination truncation, malformed skips) describes remote
         // state — it survives until the next pull
@@ -1113,6 +1372,26 @@ async function flushOnce(base: StaticStore): Promise<void> {
               enqueue('sync', String(op.threadId));
               continue; // the loop re-reads the queue; the fresh op creates a new issue
             }
+          }
+        }
+        // DD-7 (S9, 33-h P1 — the server's tombstoneDone parity): a CLOSE op
+        // hitting 404 — the issue is already deleted on GitHub (the
+        // tombstone's target is gone). Left alone the op retried forever.
+        // One getIssueRemote verify (a transient race exists); definitely
+        // gone → removeOp + the parked note, never a retry loop.
+        if (op.kind === 'close' && op.issue !== undefined && (err as { status?: number })?.status === 404) {
+          let closeGone = false;
+          try {
+            await getIssueRemote(cfg, op.issue); // exists after all — race; fall through to the retry ladder
+          } catch (e2) {
+            closeGone = (e2 as { status?: number })?.status === 404;
+          }
+          if (closeGone) {
+            removeOp(op.id);
+            const note = `close skipped — issue #${op.issue} already deleted on GitHub`;
+            if (state) state.lastError = note; // parked note — surfaced in health; the next op success clears it (F10)
+            console.warn(`[storybook-annotakit] gh client (static): ${note}`);
+            continue; // the loop re-reads the queue
           }
         }
         // v0.6.7 (PR #33) 401 SELF-HEAL: a SAVED (override) token that GitHub
@@ -1250,6 +1529,18 @@ function systemComment(ghId: string, author: string, body: string): Comment {
   };
 }
 
+/** DD-20 (v0.6.14): the append-side twin of the server engine's
+ *  systemComment idempotence guard (ghsync.ts — `some(c => c.ghId === ghId)`).
+ *  The close/reopen event ids are PER ISSUE, not per event — a close→reopen→
+ *  close cycle on one issue re-fires the SAME `gh-close-N` id; without the
+ *  guard the second close appended a second copy under a fresh random id
+ *  (the panel's duplicate "closed on GitHub" notice). The recurring
+ *  one-door-fixed-twin-missed class — both doors now guard. */
+function appendSystemComment(t: Thread, ghId: string, author: string, body: string): void {
+  if (t.comments.some((c) => c.ghId === ghId)) return; // idempotent on re-pull
+  t.comments = [...t.comments, systemComment(ghId, author, body)];
+}
+
 /** Import remote changes for mapped threads (engine pull parity): state flips
  *  and third-party comments. Sentinel-marked mirrors are never re-imported. */
 async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: number; warning?: string }> {
@@ -1262,10 +1553,25 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
   let healed = 0;
 
   const remote = new Map((await listLabeledIssuesRemote(cfg)).map((i) => [i.number, i]));
+  let detachedSeen = 0;
   for (const t of base.list()) {
     if (!t.gh) continue; // unmapped: push owns creation
     if (threadPending(t.id)) continue; // queued push — remote is stale
     const mir = t.gh;
+    // DD-21: a DETACHED mapping never reconciles — and the 404-unlink flow
+    // below must NOT fire for it either (a foreign-repo issue 404s here;
+    // unlinking would silently re-mirror onto the new repo, abandoning a
+    // live review issue). Unknown identity → ONE verify-and-stamp GET.
+    if (ghMappingRepo(mir) === null) {
+      const verified = await verifyAndStampMapping(base, cfg, t);
+      if (!verified) {
+        detachedSeen++;
+        continue;
+      }
+    } else if (isDetachedMapping(mir, cfg.repo)) {
+      detachedSeen++;
+      continue;
+    }
     let issue = remote.get(mir.issue);
     if (!issue) {
       try {
@@ -1336,7 +1642,7 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
           malformed++;
           continue;
         }
-        if (!known.has(String(c.id)) && !c.body.includes(GH_SENTINEL)) fresh.push(c);
+        if (!known.has(String(c.id)) && !String(c.body ?? '').trimStart().startsWith(GH_SENTINEL)) fresh.push(c); // DD-11 (S9, 33-b P2-2): a QUOTE-REPLY quoting our notice (sentinel mid-body) was suppressed as a system notice — only a reply that STARTS with the sentinel is one
       }
       if (malformed > 0) {
         // v0.6.6 (F10): warning-scoped (see pullWarning) — the next success
@@ -1358,7 +1664,7 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
         // reviewer confirmed on GitHub — from open (direct) OR fixed (the gate)
         next.status = 'resolved';
         next.resolvedAt = issue.closed_at ?? pullStartedAt;
-        next.comments = [...next.comments, systemComment(`gh-close-${mir.issue}`, issue.closed_by?.login ?? 'github', 'closed on GitHub')];
+        appendSystemComment(next, `gh-close-${mir.issue}`, issue.closed_by?.login ?? 'github', 'closed on GitHub');
       } else if (statusChange === 'reopen' && next.status === 'resolved') {
         // reopen fires from resolved ONLY — fixed+open is the natural state
         next.status = 'open';
@@ -1370,7 +1676,7 @@ async function pullOnce(base: StaticStore): Promise<{ pulled: number; healed: nu
         // this value and re-stamps nowIso() — only event PRESENCE matters to
         // the merge; the stamp survives as defense-in-depth.
         next.reopenedAt = pullStartedAt;
-        next.comments = [...next.comments, systemComment(`gh-reopen-${mir.issue}`, 'github', 'reopened on GitHub')];
+        appendSystemComment(next, `gh-reopen-${mir.issue}`, 'github', 'reopened on GitHub');
       }
       // confirm supersedes the event (both doors — incl. a confirm from
       // rejected carrying a resubmit event)
@@ -1557,10 +1863,17 @@ function startRuntime(base: StaticStore): void {
 
 const LINKED = Symbol('annotakit-gh-linked');
 
-function buildStatus(): GhClientStatus {
+function buildStatus(base?: StaticStore): GhClientStatus {
   const override = readOverride();
   const resolved = resolveGhConfig(resolvedBaked, override);
   const ops = readQueue();
+  // DD-21: DETACHED surfaces — mapped threads whose issue lives on another
+  // repo, and ops parked by that (un-parked on the next settings save).
+  const detached =
+    base && resolved
+      ? base.list().filter((t) => t.gh && (verifiedForeign.has(t.id) || isDetachedMapping(t.gh, resolved.repo))).length
+      : 0;
+  const detachedParked = ops.filter((o) => Boolean(o.parked) && o.parkReason === 'detached').length;
   const suppressed = Boolean(override?.disabled);
   // v0.6.6 (F1): a NON-EMPTY saved token shadows the baked config (an
   // empty/whitespace one is treated as absent by resolveGhConfig — legacy
@@ -1594,6 +1907,7 @@ function buildStatus(): GhClientStatus {
     // the panel hint gates on !tokenOverridden).
     tokenDroppedAt: override?.tokenDroppedAt ?? null,
     pollMs: resolved?.pollMs ?? DEFAULT_POLL_MS,
+    ...(detached > 0 || detachedParked > 0 ? { detached, detachedParked } : {}),
   };
 }
 
@@ -1643,12 +1957,18 @@ export async function getGhLinkedStaticStore(): Promise<LinkedStaticStore> {
   linked.deleteThread = (threadId) => {
     const victim = base.list().find((t) => t.id === threadId);
     const issue = victim?.gh?.issue;
+    // DD-21 amendment 2: the close op carries WHERE the issue lives (the
+    // mapping's repo — derived for legacy unstamped docs) + the victim id
+    // (the verify fallback's stamp check). processCloseOp parks the op when
+    // the target is foreign — a delete must never close a same-numbered
+    // issue on the newly-targeted repo.
+    const opRepo = victim?.gh ? ghMappingRepo(victim.gh) : null;
     return base.deleteThread(threadId).then(() => {
-      if (issue) enqueue('close', issue);
+      if (issue) enqueue('close', issue, { repo: opRepo, threadId });
     });
   };
   linked.gh = {
-    status: buildStatus,
+    status: () => buildStatus(base),
     saveSettings(patch: GhClientSettings) {
       const ok = writeOverride(patch);
       if (!ok && state) {
@@ -1659,6 +1979,8 @@ export async function getGhLinkedStaticStore(): Promise<LinkedStaticStore> {
       }
       clearOpBackoff(); // the user just changed the config — retry NOW, not after the old backoff
       if (state) state.pullBackoffUntil = 0; // v0.6.6 (F11): a config change also clears a 401 pull backoff
+      unparkDetachedOps(); // DD-21 amendment 4: a repo change re-arms detached-parked ops (restore = resume; still-foreign = the guard re-parks)
+      verifiedForeign.clear(); // re-verify unknowns against the NEW repo
       if (state?.leader) void flushOnce(base);
     },
     clearSettings() {

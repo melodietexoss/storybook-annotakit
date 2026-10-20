@@ -32,8 +32,8 @@ export const OVERLAY_CSS = `
  *        so they can neither hide nor swallow a pin
  *   20 = pins + regions — ALWAYS on top of passive chrome
  *   30 = deliberate interactive surfaces (composer card, thread card,
- *        help, the frozen pill) — invoked contexts, allowed above pins
- *        while open */
+ *        help, transient hints) — invoked contexts, allowed above pins
+ *        while open (v0.6.14: the frozen PILL is gone — hints are transient) */
 
 /* ---------- pin markers ---------- */
 .annota-pin {
@@ -110,29 +110,11 @@ export const OVERLAY_CSS = `
   box-shadow: 0 4px 14px rgba(0,0,0,.3);
 }
 
-/* v0.6.9 (S3/S5): frozen/recall state pill — z 30 informational surface.
-   Never blocks (pointer-events: none) and stays a PILL, not a banner (the
-   canvas stays overlay-free by user directive). */
-.annota-frozen-pill {
-  position: fixed;
-  z-index: 30;
-  top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: #0c4a6e;
-  color: #e0f2fe;
-  border: 1px solid #38bdf8;
-  padding: 6px 14px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  pointer-events: none;
-  box-shadow: 0 4px 14px rgba(0,0,0,.3);
-  max-width: min(92vw, 640px);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+/* v0.6.14 (user directive "no sticky elements on the DOM surface",
+   2026-10-19): .annota-frozen-pill DELETED — the persistent frozen/recall
+   pill annoyed in live use (same class as the earlier "dev only" badge).
+   Freeze/recall entry announces via the transient capture-hint above; the
+   steady-state canvas carries only pins/regions/cards. */
 .annota-hover-box {
   position: fixed;
   z-index: 10;
@@ -257,26 +239,10 @@ body.annota-cursor * { cursor: crosshair !important; }
 .annota-status-banner.is-error { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
 .annota-status-banner.is-info { background: #f0f9ff; color: #075985; border: 1px solid #bae6fd; }
 
-/* ---------- dev-only badge (passive notice, no interaction — the launcher
-   is GONE; entry points are the native SB toolbar buttons + ⌥ hotkeys) ---------- */
-.annota-badge {
-  position: fixed;
-  right: 18px;
-  bottom: 18px;
-  pointer-events: none;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  background: rgba(255, 255, 255, .92);
-  border: 1px solid #e5e7eb;
-  border-radius: 999px;
-  padding: 7px 12px;
-  font-weight: 700;
-  font-size: 12px;
-  color: #64748b;
-  box-shadow: 0 4px 16px rgba(15, 23, 42, .12);
-  user-select: none;
-}
+/* v0.6.14: .annota-badge (the "dev only" bottom-right badge) DELETED with
+   its last dead CSS — the badge itself stopped rendering in v0.6.9; the
+   class had no remaining users. Same user directive: no sticky elements on
+   the DOM surface. */
 
 /* rich one-line element identity (composer) — same string as the digest */
 .annota-element-summary {

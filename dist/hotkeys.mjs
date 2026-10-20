@@ -6,7 +6,7 @@ import {
   isLetterSpecKey,
   isTypingTarget,
   parseHotkey
-} from "./chunk-F7IFSFQY.mjs";
+} from "./chunk-RIIVYBJP.mjs";
 export {
   DEFAULT_HOTKEYS,
   altMatches,

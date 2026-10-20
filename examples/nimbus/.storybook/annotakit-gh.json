@@ -1,8 +1,0 @@
-{
-  "token": "[REDACTED:github_token]",
-  "repo": "melodietexoss/storybook-annotakit",
-  "labels": [
-    "annotakit"
-  ],
-  "pollMs": 60000
-}

@@ -43,7 +43,15 @@ export interface GhComment {
 }
 
 export function ghApiBase(): string {
-  return process.env.ANNOTAKIT_GH_API || DEFAULT_API;
+  // P3 (S9): shape validation — a malformed ANNOTAKIT_GH_API (spaces, a bare
+  // word, a non-http scheme) used to flow into every request URL silently.
+  // Loud at the door (agents don't read warnings — this throws per request).
+  const raw = (process.env.ANNOTAKIT_GH_API || '').trim().replace(/\/+$/, '');
+  const base = raw || DEFAULT_API;
+  if (!/^https?:\/\/[^/\s]+(\/[^\s]*)?$/i.test(base)) { // host + optional path (the GHE /api/v3 form)
+    throw new Error(`ANNOTAKIT_GH_API must be an http(s) origin like https://github.example.com/api/v3 (got ${JSON.stringify(process.env.ANNOTAKIT_GH_API)})`);
+  }
+  return base;
 }
 
 export function missingTokenMessage(configPath: string): string {
@@ -216,19 +224,28 @@ async function ghJsonPaged<T>(
     // stop paging on mismatch or on an unparseable URL.
     if (!next) {
       url = null;
-      truncated = false;
+      truncated = false; // a natural end is not truncation
     } else {
       try {
         url = new URL(next[1]).origin === new URL(ghApiBase()).origin ? (next[1] as string) : null;
-        if (!url) truncated = false;
+        // 44-b P2-3 (S9): a cross-origin STOP IS a truncation — pages beyond
+        // it are silently dropped; the client twin got this in the E batch,
+        // the server kept the pre-fix shape (the C19 silent-truncation class).
+        if (!url) truncated = true;
       } catch {
         url = null; // unparseable next-link — treat as end of pagination
-        truncated = false;
+        truncated = true; // a malformed next drops pages too
       }
     }
   }
-  if (truncated && url) {
-    console.warn(`[storybook-annotakit] ⚠ GitHub pagination cap hit (${maxPages} pages) on ${pathname} — results truncated; raise the cap if this repo really has more data`);
+  if (truncated) { // 44-b P2-3: url-null stops (cross-origin/malformed) count too — `truncated && url` never fired with url null
+    // 44-b P2-3: two honest shapes — the cap vs the early stop (the client
+    // twin's two-message form)
+    console.warn(
+      truncated && url
+        ? `[storybook-annotakit] ⚠ GitHub pagination cap hit (${maxPages} pages) on ${pathname} — results truncated; raise the cap if this repo really has more data`
+        : `[storybook-annotakit] ⚠ GitHub pagination stopped early on ${pathname} (cross-origin/malformed next link) — results truncated`,
+    );
   }
   return out;
 }

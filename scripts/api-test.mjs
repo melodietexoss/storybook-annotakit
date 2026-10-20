@@ -208,6 +208,29 @@ async function main() {
   check('json thread lean but complete', Boolean(jthread?.component?.source?.file && jthread?.target?.selector?.cssSelector && jthread?.comments?.length));
   // lean check scoped to TEST-OWNED threads (live sessions may legitimately
   // carry clipped outerHTML from real browser captures)
+  // v0.6.15 (Y2, wave-3): counts-vs-threads PARITY — the export's counts
+  // block must agree with the threads it carries (the headline/bucket
+  // disagreement class; unknown→open is the static-suite-pinned twin)
+  {
+    let parityOk = true;
+    let parityWhy = '';
+    for (const st of bundle.stories ?? []) {
+      const tally = { open: 0, fixed: 0, rejected: 0, resolved: 0 };
+      for (const t of st.threads ?? []) {
+        if (t.status === 'fixed') tally.fixed++;
+        else if (t.status === 'rejected') tally.rejected++;
+        else if (t.status === 'resolved') tally.resolved++;
+        else tally.open++; // unknown → open (H-B-15 count twin)
+      }
+      for (const k of ['open', 'fixed', 'rejected', 'resolved']) {
+        if ((st.counts?.[k] ?? -1) !== tally[k]) {
+          parityOk = false;
+          parityWhy = `story ${st.story?.storyId}: counts.${k}=${st.counts?.[k]} vs ${tally[k]} actual`;
+        }
+      }
+    }
+    check('export json counts match the threads they summarize', parityOk, parityWhy);
+  }
   const ownThreadsJson = JSON.stringify((bundle.stories[0]?.threads ?? []).filter((t) => ownIds.includes(t.id)));
   check('json lean: no outerHTML on API threads', !ownThreadsJson.includes('outerHTML'));
   // v0.6.1 (Track B): the lean budget applies to TEST-OWNED threads only —
@@ -382,18 +405,59 @@ async function main() {
   check('forgery: a full-doc PATCH missing the field cannot DROP the event', dropped.status === 200 && typeof dropped.json?.reopenedAt === 'string', `reopenedAt=${dropped.json?.reopenedAt}`);
 
   // (b) POST idempotent replay is FLAGGED (body + header) — a replay of a
-  // DIFFERENT body must not masquerade as "landed"
+  // DIFFERENT body must not masquerade as "landed".
+  // S9/DD-1: ids are run-UNIQUE now — a previous run's cleanup DELETE
+  // tombstoned the old stable id, and tombstoned ids 409 forever (by design).
+  const replayId = `th_replay_${Date.now().toString(36)}`;
   const replayBase = {
     storyId,
     story: { storyId, title: 'Contract', name: 'ReplayTarget', importPath: './src/x.stories.tsx' },
     target: { kind: 'pin', selector: { cssSelector: 'div', fragment: { x: 1, y: 1, w: 2, h: 2 } }, fingerprint: { tag: 'div' }, context: { tag: 'div', text: 'replay target' }, bbox: { x: 1, y: 1, w: 2, h: 2 } },
   };
-  const rep1 = await j('POST', `${API}/threads`, { ...replayBase, id: 'th_replay_v061', comments: [{ id: 'c-rep-1', author: 'api-test', body: 'first body', createdAt: new Date().toISOString() }] });
+  const rep1 = await j('POST', `${API}/threads`, { ...replayBase, id: replayId, comments: [{ id: 'c-rep-1', author: 'api-test', body: 'first body', createdAt: new Date().toISOString() }] });
   check('replay POST #1 → 201 (no replayed flag)', rep1.status === 201 && rep1.json?.replayed !== true, `status=${rep1.status}`);
   if (rep1.json?.id) ownIds.push(rep1.json.id);
-  const rep2 = await j('POST', `${API}/threads`, { ...replayBase, id: 'th_replay_v061', comments: [{ id: 'c-rep-2', author: 'api-test', body: 'amended body — must NOT land', createdAt: new Date().toISOString() }] });
+  const rep2 = await j('POST', `${API}/threads`, { ...replayBase, id: replayId, comments: [{ id: 'c-rep-2', author: 'api-test', body: 'amended body — must NOT land', createdAt: new Date().toISOString() }] });
   check('replay POST #2 → 200 + replayed:true + header', rep2.status === 200 && rep2.json?.replayed === true && rep2.headers?.get?.('x-annotakit-replayed') === '1', `status=${rep2.status} flag=${rep2.json?.replayed}`);
   check('replay returns the OLD body (create-only contract)', rep2.json?.comments?.[0]?.body === 'first body', JSON.stringify(rep2.json?.comments?.[0] ?? null));
+
+  // (b2) S9/DD-1: POST-after-DELETE with the same id is FINAL — 409 + the
+  // machine-readable marker (the pre-fix bug: 201 visible locally, silently
+  // annihilated at the next boot-restore + pushed to every peer).
+  const zombieId = `th_zombie_${Date.now().toString(36)}`;
+  const z1 = await j('POST', `${API}/threads`, { ...replayBase, id: zombieId, comments: [{ id: 'c-z-1', author: 'api-test', body: 'doomed', createdAt: new Date().toISOString() }] });
+  check('DD-1: fresh id → 201', z1.status === 201, `status=${z1.status}`);
+  const zDel = await j('DELETE', `${API}/threads/${zombieId}`);
+  check('DD-1: DELETE → 200', zDel.status === 200, `status=${zDel.status}`);
+  const z2 = await j('POST', `${API}/threads`, { ...replayBase, id: zombieId, comments: [{ id: 'c-z-2', author: 'api-test', body: 'resurrect attempt', createdAt: new Date().toISOString() }] });
+  check('DD-1: re-POST the deleted id → 409 + deletedId:true', z2.status === 409 && z2.json?.deletedId === true && /tombstone/i.test(String(z2.json?.error)), `status=${z2.status} body=${JSON.stringify(z2.json).slice(0, 120)}`);
+  const z3 = await j('POST', `${API}/threads`, { ...replayBase, id: `${zombieId}_v2`, comments: [{ id: 'c-z-3', author: 'api-test', body: 'fresh id works', createdAt: new Date().toISOString() }] });
+  check('DD-1: a NEW id after the 409 → 201 (the honest remedy)', z3.status === 201, `status=${z3.status}`);
+  if (z3.json?.id) ownIds.push(z3.json.id);
+
+  // (b3) S9/DD-15: the partial-PATCH door gates mergeable-field SHAPES — a
+  // non-iterable `comments` used to 500 ("full.comments is not iterable");
+  // {story: 5} corrupted the stored doc.
+  const shapeT = await j('POST', `${API}/threads`, {
+    storyId,
+    story: { storyId, title: 'Contract', name: 'ShapeTarget', importPath: './src/x.stories.tsx' },
+    target: { kind: 'pin', selector: { cssSelector: 'div', fragment: { x: 1, y: 1, w: 2, h: 2 } }, fingerprint: { tag: 'div' }, context: { tag: 'div', text: 'shape target' }, bbox: { x: 1, y: 1, w: 2, h: 2 } },
+    comments: [{ id: 'c-shape-1', author: 'api-test', body: 'shape carrier', createdAt: new Date().toISOString() }],
+  });
+  const shapeId = shapeT.json?.id;
+  if (shapeId) ownIds.push(shapeId);
+  const badComments = await j('PATCH', `${API}/threads/${shapeId}`, { comments: 5 });
+  check('DD-15: partial PATCH comments=5 → 400 (not 500)', badComments.status === 400, `status=${badComments.status}`);
+  const badStory = await j('PATCH', `${API}/threads/${shapeId}`, { story: 5 });
+  check('DD-15: partial PATCH story=5 → 400', badStory.status === 400, `status=${badStory.status}`);
+  const badTarget = await j('PATCH', `${API}/threads/${shapeId}`, { target: null });
+  check('DD-15: partial PATCH target=null → 400', badTarget.status === 400, `status=${badTarget.status}`);
+  // DD-15b: identity fields are server-owned on the full-doc door
+  const fullDoc = (await j('GET', `${API}/threads/${shapeId}`)).json;
+  const moved = await j('PATCH', `${API}/threads/${shapeId}`, { ...fullDoc, storyId: 'other--story', number: 999, createdAt: '1999-01-01T00:00:00.000Z' });
+  check('DD-15b: full-doc PATCH cannot move storyId/number/createdAt', moved.status === 200 && moved.json?.storyId === storyId && moved.json?.number !== 999 && moved.json?.createdAt !== '1999-01-01T00:00:00.000Z', `status=${moved.status} storyId=${moved.json?.storyId} number=${moved.json?.number}`);
+  const shapeAfter = await j('GET', `${API}/threads/${shapeId}`);
+  check('DD-15: the store survived the bad shapes (thread intact)', shapeAfter.status === 200 && Array.isArray(shapeAfter.json?.comments) && shapeAfter.json.comments.length === 1, `status=${shapeAfter.status}`);
 
   // (c) comment body cap: 64k chars is the door (413 with the limit stated)
   const capT = await j('POST', `${API}/threads`, {
@@ -526,6 +590,58 @@ async function main() {
     check('F8: /schema documents the reload route', (schemaReload.json?.endpoints ?? []).some((e) => Array.isArray(e) && String(e[1] ?? '').includes('/gh/reload')));
     const health = await j('GET', `${API}/health`);
     check('F7: /health exposes gh.tokenState + agentSurfaces.githubAuth', typeof health.json?.gh?.tokenState === 'string' && typeof health.json?.agentSurfaces?.githubAuth === 'string', `gh=${JSON.stringify(health.json?.gh?.tokenState)} surfaces=${JSON.stringify(health.json?.agentSurfaces?.githubAuth)}`);
+  }
+
+  /* v0.6.14 DD-20 ("always two replies per issue"): the PATCH door treats a
+     non-empty ghId as a SECONDARY identity key. A full-doc PATCH carrying a
+     reply under the OTHER engine's local id (the browser's c_gh_* import vs
+     this store's import of the same GitHub comment) used to APPEND the
+     stored twin as a second copy — the panel's duplicate reply. The twin is
+     consumed instead: exactly one entry, ghId/source preserved. */
+  {
+    const t = await j('POST', `${API}/threads`, {
+      id: `th_dd20_${Date.now().toString(36)}`,
+      storyId, author: 'dd20', target: { kind: 'region', selector: { fragment: { x: 1, y: 1, w: 2, h: 2 } }, context: { tag: 'region' }, bbox: { x: 1, y: 1, w: 2, h: 2 }, captureViewportWidth: 1000 },
+      comments: [{ author: 'dd20', body: 'dd20 base' }],
+    });
+    const tid = t.json?.id;
+    if (tid) {
+      ownIds.push(tid);
+      // simulate the store holding the dev engine's import of gh comment 555
+      const first = await j('GET', `${API}/threads/${tid}`);
+      const doc1 = first.json;
+      const withDevImport = { ...doc1, comments: [...doc1.comments, { id: 'c_devimport_dd20', author: 'agent', body: 'dd20 agent reply', createdAt: new Date().toISOString(), ghId: '555', source: 'github' }] };
+      const p1 = await j('PATCH', `${API}/threads/${tid}`, withDevImport);
+      // now the browser's copy arrives under its own id (same ghId). NOTE:
+      // the PATCH door RE-KEYS comment ids new to the thread (C12/A8) —
+      // filter by ghId, never by the id we sent (it came back re-hashed).
+      const second = await j('GET', `${API}/threads/${tid}`);
+      const doc2 = second.json;
+      const withBrowserImport = { ...doc2, comments: [...doc2.comments.filter((c) => c.ghId !== '555'), { id: 'c_gh_browser_dd20', author: 'agent', body: 'dd20 agent reply', createdAt: new Date().toISOString(), ghId: '555', source: 'github' }] };
+      const p2 = await j('PATCH', `${API}/threads/${tid}`, withBrowserImport);
+      const after = await j('GET', `${API}/threads/${tid}`);
+      const copies = (after.json?.comments ?? []).filter((c) => c.body === 'dd20 agent reply');
+      check('DD-20: PATCH-door twin consumed (one reply, not two)', p2.status === 200 && copies.length === 1, `status=${p2.status} n=${copies.length}`);
+      check('DD-20: the surviving copy keeps ghId + source', copies[0]?.ghId === '555' && copies[0]?.source === 'github', JSON.stringify(copies[0]).slice(0, 100));
+      check('DD-20: unrelated comments survive the twin-merge', (after.json?.comments ?? []).some((c) => c.body === 'dd20 base'));
+    } else {
+      check('DD-20: setup thread created', false, `status=${t.status}`);
+    }
+  }
+
+  /* v0.6.14 (sweep 53-d P3-8): ?sort=recent — the agent-surface recency
+     parity (the panel's latest-first comparator, server-side). */
+  {
+    const all = await j('GET', `${API}/threads`);
+    const byNum = all.json?.threads ?? [];
+    const sorted = await j('GET', `${API}/threads?sort=recent`);
+    const rec = sorted.json?.threads ?? [];
+    check('?sort=recent 200 + same count', sorted.status === 200 && rec.length === byNum.length, `${rec.length} vs ${byNum.length}`);
+    const key = (t) => String(t.updatedAt ?? t.createdAt ?? '');
+    const expected = [...byNum].sort((a, b) => key(b).localeCompare(key(a)));
+    check('?sort=recent = updatedAt DESC (createdAt fallback)', JSON.stringify(rec.map((t) => t.id)) === JSON.stringify(expected.map((t) => t.id)), `first=${rec[0]?.id}`);
+    const bad = await j('GET', `${API}/threads?sort=newest`);
+    check('?sort=<unknown> is a 400 (never silently ignored)', bad.status === 400, `status=${bad.status}`);
   }
 
   /* cleanup: remove ONLY threads this test created (live sessions may own others) */
