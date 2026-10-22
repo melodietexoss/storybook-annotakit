@@ -285,7 +285,7 @@ function getStaticStore() {
       tombstones = merged.deletedIds;
       localEdits = true;
     } else if (persisted) {
-      threads = persisted.threads;
+      threads = persisted.threads.map(healThreadTwins);
       tombstones = persisted.deletedIds;
       localEdits = true;
     } else {

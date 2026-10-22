@@ -192,6 +192,10 @@ function ghHandler(req, res) {
   }
   // GET single issue
   if (m === 'GET' && pm) {
+    // 56-a P1 fixture support: the single-issue GET (the tombstone loop's
+    // verification getIssue) must honor gh.fail like its sibling routes —
+    // the transient-error (5xx) tombstone semantics are untestable without it
+    if (maybeFail()) return;
     const issue = gh.issues.find((i) => i.number === Number(pm[1]));
     return issue ? json(200, { ...issue, html_url: issueUrl(issue.number) }) : json(404, { message: 'Not Found' });
   }
@@ -931,25 +935,127 @@ async function main() {
     check('17e the status reports the DETACHED mappings', (st17.body?.detached ?? 0) >= 1, JSON.stringify({ detached: st17.body?.detached, stalled: st17.body?.stalled }));
     check('17f the detached thread is NOT stalled (the sweep excludes it)', st17.body?.stalled === 0, JSON.stringify(st17.body?.stalled));
 
-    // (c) delete → the tombstone close VERIFY: a foreign body stamp → skip +
-    //     done (never close a possible foreign issue, never spin)
+    // (c) delete → the tombstone (repo-stamped test/repo) must PARK under
+    //     other/repo — never close a same-numbered foreign issue, never even
+    //     GET it (v0.6.16 56-a P1: the pre-fix guard only checked
+    //     PRESENT-but-foreign stamps; an ABSENT stamp on the new repo's
+    //     same-numbered issue fell straight through to the close)
     const issue17 = gh.issues.find((x) => x.number === n17);
-    if (issue17) issue17.body = '- thread id: SOMEONE_ELSE\n';
+    if (issue17) issue17.body = '- thread id: SOMEONE_ELSE\n'; // a foreign-looking stamp — the park must not even read it
     const del17 = await jb('DELETE', `/annotakit/api/threads/${t17.id}`);
     check('17g the thread deleted locally', del17.status === 200);
+    gh.calls.length = 0;
     await jb('POST', '/annotakit/api/sync');
     await sleep(500);
     const patches17 = gh.calls.filter((c) => c.method === 'PATCH' && new RegExp(`/issues/${n17}$`).test(c.path)).length;
-    check('17h the tombstone close SKIPPED the foreign-stamped issue', patches17 === 0 && gh.issues.find((x) => x.number === n17)?.state === 'open', `patches=${patches17}`);
+    const gets17 = gh.calls.filter((c) => c.method === 'GET' && new RegExp(`/issues/${n17}$`).test(c.path)).length;
+    check('17h the repo-mismatched tombstone PARKS (no close PATCH, no GET)', patches17 === 0 && gets17 === 0, `patches=${patches17} gets=${gets17}`);
     await jb('POST', '/annotakit/api/sync');
     await sleep(400);
     const patches17b = gh.calls.filter((c) => c.method === 'PATCH' && new RegExp(`/issues/${n17}$`).test(c.path)).length;
-    check('17i the skipped tombstone is DONE (no retry spin)', patches17b === 0, `patches=${patches17b}`);
+    check('17i the parked tombstone does not spin (still no PATCH)', patches17b === 0, `patches=${patches17b}`);
 
+    // (d) repo-restore lands the deferred close on the ORIGINAL issue — the
+    //     tombstone survived the park (not marked done), so the re-pointed-back
+    //     server closes exactly the issue the mapping lived on (no state drift)
+    if (issue17) issue17.body = `- thread id: ${t17.id}\n`;
     proc17.kill();
     await new Promise((r) => {
       const done = setTimeout(r, 5000);
       proc17.once('exit', () => { clearTimeout(done); r(); });
+    });
+    const mkSub = (repoEnv) => spawn(
+      process.execPath,
+      [
+        '-e',
+        `const http = require('node:http');
+         const { createMiddleware } = require(${JSON.stringify(DIST)});
+         const srv = http.createServer((req, res) => createMiddleware(${JSON.stringify(configDir)})(req, res, () => { res.writeHead(404); res.end(); }));
+         srv.listen(0, '127.0.0.1', () => console.log('READY ' + srv.address().port));
+         setInterval(() => {}, 1 << 30);`,
+      ],
+      { env: { ...process.env, ANNOTAKIT_GH_REPO: repoEnv }, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const proc17r = mkSub('test/repo');
+    let port17r = 0;
+    proc17r.stdout.on('data', (d) => {
+      const m = String(d).match(/READY (\d+)/);
+      if (m) port17r = Number(m[1]);
+    });
+    const booted17r = await waitFor(() => port17r > 0, 15000, 'restore subprocess boot');
+    check('17j the repo-restored server boots on the shared store', booted17r);
+    const jr = async (method, p, body) => {
+      const res = await fetch(`http://127.0.0.1:${port17r}${p}`, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+      const text = await res.text();
+      return { status: res.status, body: text ? JSON.parse(text) : null };
+    };
+    gh.calls.length = 0;
+    await jr('POST', '/annotakit/api/sync');
+    await waitFor(() => gh.issues.find((x) => x.number === n17)?.state === 'closed', 6000, 'the parked close lands after repo-restore');
+    const closed17 = gh.issues.find((x) => x.number === n17)?.state === 'closed';
+    const comment17 = (gh.comments[n17] ?? []).some((c) => c.body.includes('deleted in Storybook'));
+    check('17j the parked close LANDED on the original issue after the restore', closed17 && comment17, `state=${gh.issues.find((x) => x.number === n17)?.state}`);
+
+    // (e) absent stamp on the SAME repo → skip + done (never close an
+    //     unverified issue; the old code closed exactly here)
+    {
+      const cr = await jr('POST', '/annotakit/api/threads', threadInput(102));
+      await waitFor(async () => (await jr('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === cr.body?.id)?.gh, 5000, 'mint 17k');
+      const tk17 = (await jr('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === cr.body?.id);
+      const nk = tk17?.gh?.issue;
+      const issk = gh.issues.find((x) => x.number === nk);
+      if (issk) issk.body = 'a body with NO thread-id stamp at all\n';
+      const delk = await jr('DELETE', `/annotakit/api/threads/${tk17.id}`);
+      check('17k the same-repo thread deleted', delk.status === 200, `status=${delk.status}`);
+      gh.calls.length = 0;
+      await jr('POST', '/annotakit/api/sync');
+      await sleep(500);
+      const noClose = gh.issues.find((x) => x.number === nk)?.state === 'open';
+      const noPatch = !gh.calls.some((c) => c.method === 'PATCH' && new RegExp(`/issues/${nk}$`).test(c.path));
+      check('17k the absent-stamp tombstone is SKIPPED (issue stays open, no PATCH)', noClose && noPatch, `state=${gh.issues.find((x) => x.number === nk)?.state}`);
+      await jr('POST', '/annotakit/api/sync');
+      await sleep(400);
+      const noPatch2 = !gh.calls.some((c) => c.method === 'PATCH' && new RegExp(`/issues/${nk}$`).test(c.path));
+      check('17k the skipped tombstone is DONE (no spin)', noPatch2);
+    }
+
+    // (f) transient getIssue error (500) → the tombstone stays OPEN (not done,
+    //     not closed) and the next cycle retries — the old code mapped ANY
+    //     getIssue error to "absent" and closed/fell through unverified
+    {
+      const cr = await jr('POST', '/annotakit/api/threads', threadInput(103));
+      await waitFor(async () => (await jr('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === cr.body?.id)?.gh, 5000, 'mint 17l');
+      const tl = (await jr('GET', '/annotakit/api/threads')).body.threads.find((x) => x.id === cr.body?.id);
+      const nl = tl?.gh?.issue;
+      // fail the getIssue of that issue until the first failure LANDS (the
+      // fake's fail counter decrements on every request — matching or not —
+      // so a count of 1 gets eaten by the pull's own list calls before the
+      // tombstone's verification GET). Arm wide, watch for the GET, then
+      // clear so the next cycle succeeds.
+      const failRe = new RegExp(`/issues/${nl}$`);
+      // baseline the call log first: the MINT cycle's own drift check already
+      // GETs the fresh issue — matching it would clear the fail before the
+      // tombstone's verification GET ever runs (the exact stale-match trap)
+      const callsBase = gh.calls.length;
+      gh.fail = { regex: failRe, status: 500, count: 100 };
+      const dell = await jr('DELETE', `/annotakit/api/threads/${tl.id}`);
+      check('17l the transient-case thread deleted', dell.status === 200, `status=${dell.status}`);
+      const sawFailedGet = await waitFor(() => gh.calls.slice(callsBase).some((c) => c.method === 'GET' && failRe.test(c.path)), 9000, 'the 500d getIssue'); // 9s: retained-reply drains from earlier sections can delay the kick's tombstone GET under load (a 5s window flaked once)
+      gh.fail = null;
+      await sleep(300);
+      const stayedOpen = gh.issues.find((x) => x.number === nl)?.state === 'open';
+      check("17l the 500'd close attempt left the issue open", sawFailedGet && stayedOpen, `sawGet=${sawFailedGet} state=${gh.issues.find((x) => x.number === nl)?.state}`);
+      gh.calls.length = 0;
+      await jr('POST', '/annotakit/api/sync');
+      await waitFor(() => gh.issues.find((x) => x.number === nl)?.state === 'closed', 6000, 'the retried close lands');
+      check('17l the open tombstone RETRIED and closed on the next cycle', gh.issues.find((x) => x.number === nl)?.state === 'closed');
+      gh.fail = null;
+    }
+
+    proc17r.kill();
+    await new Promise((r) => {
+      const done = setTimeout(r, 5000);
+      proc17r.once('exit', () => { clearTimeout(done); r(); });
     });
   }
 

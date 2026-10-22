@@ -64,7 +64,7 @@ export interface GhSync {
   /** Queue a push-reconcile for one thread (deduped, ordered). */
   enqueue(threadId: string): void;
   /** A thread with an issue mapping was deleted: tombstone → close the issue. */
-  enqueueDelete(issue: number): void;
+  enqueueDelete(issue: number, tombRepo?: string, threadId?: string): void;
   /** Force full reconcile: push every thread, then pull remote. Idempotent. */
   syncAll(): Promise<GhSyncSummary>;
   /** Pull remote state/comments into the store (used by the poll timer too). */
@@ -183,6 +183,8 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
   // sweep anchor = engine creation (boot), NOT epoch 0 — /health must never
   // report "next sweep at 1970" before the first sweep has run
   let lastStalledSweep = Date.now();
+  // v0.6.16 (56-a P1): repo-parked tombstones warn once per issue number
+  const parkedTombstoneWarned = new Set<number>();
 
   const configured = (): { token?: string; repo?: string; error?: string } => {
     const t = token();
@@ -893,41 +895,55 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     }
 
     // tombstones: locally deleted threads → close their issues once.
-    // DD-21 amendment 2 (server twin): the tombstone table is issue-NUMBER
-    // keyed (no repo identity) — after a repo change, issue #N on the NEW
-    // repo is a FOREIGN issue. Verify the target before closing: the body
-    // must carry a `- thread id:` stamp matching one of OUR deleted ids.
-    // A mismatch/absent stamp marks the tombstone done WITHOUT closing (we
+    // DD-21 amendment 2 (server twin): the tombstone carries the repo the
+    // issue lived on — after a repo change, a same-numbered issue on the NEW
+    // repo is FOREIGN. A repo-stamped tombstone that ≠ the active repo PARKS
+    // (a repo-restore lands the close on the ORIGINAL issue); a legacy
+    // unstamped tombstone verifies the body's `- thread id:` stamp. A
+    // mismatch/absent stamp marks the tombstone done WITHOUT closing (we
     // must never close a foreign issue, and retrying forever would spin).
     const deletedIds = await store.listDeletedIds();
-    for (const issueNumber of await store.listOpenTombstones()) {
+    for (const ts of await store.listOpenTombstones()) {
+      const issueNumber = ts.issue;
       try {
-        let bodyStamp: string | null = null;
-        try {
-          const target = await getIssue(tk, rp, issueNumber);
-          const m = typeof target.body === 'string' ? target.body.match(/^- thread id: (.+)$/m) : null;
-          bodyStamp = m?.[1]?.trim() ?? null;
-        } catch {
-          bodyStamp = null; // 404 → the 404 branch below owns it
+        if (ts.repo && ts.repo !== rp) {
+          // parked — stay open, no network call, no spin; loud once per issue
+          if (!parkedTombstoneWarned.has(issueNumber)) {
+            parkedTombstoneWarned.add(issueNumber);
+            console.warn(`[storybook-annotakit] gh-sync: close of issue #${issueNumber} PARKED — it lives on ${ts.repo}, the mirror now targets ${rp} (restoring the repo setting will land this close on the original issue)`);
+          }
+          continue;
         }
-        if (bodyStamp !== null && !deletedIds.has(bodyStamp)) {
-          console.warn(`[storybook-annotakit] gh-sync: tombstone close of issue #${issueNumber} SKIPPED — its body stamp (${bodyStamp.slice(0, 24)}…) is not one of our deleted threads on ${rp} (foreign issue after a repo change?)`);
+        let target: Awaited<ReturnType<typeof getIssue>> | null = null;
+        try {
+          target = await getIssue(tk, rp, issueNumber);
+        } catch (err) {
+          if ((err as { status?: number })?.status === 404) {
+            // issue already gone — nothing to close, stop retrying forever
+            await store.tombstoneDone(issueNumber);
+            closedTombstones++;
+            continue;
+          }
+          // transient (403/5xx/rate-limit) — leave the tombstone open, retry
+          // next cycle (v0.6.16 56-a P1: this used to fall through to a close
+          // attempt on an UNVERIFIED issue)
+          throw err;
+        }
+        const m = typeof target.body === 'string' ? target.body.match(/^- thread id: (.+)$/m) : null;
+        const bodyStamp = m?.[1]?.trim() ?? null;
+        if (bodyStamp === null || !deletedIds.has(bodyStamp)) {
+          // absent OR foreign stamp → never close a possible foreign issue
+          console.warn(`[storybook-annotakit] gh-sync: tombstone close of issue #${issueNumber} SKIPPED — ${bodyStamp === null ? 'its body carries no thread-id stamp (not ours?)' : `its body stamp (${bodyStamp.slice(0, 24)}…) is not one of our deleted threads`} on ${rp}`);
           await store.tombstoneDone(issueNumber);
           continue;
         }
-        if (remote.get(issueNumber)?.state !== 'closed') {
+        if (target.state !== 'closed') {
           await addIssueComment(tk, rp, issueNumber, `${GH_SENTINEL}\nthread deleted in Storybook — closing.`);
           await setIssueState(tk, rp, issueNumber, 'closed');
         }
         await store.tombstoneDone(issueNumber);
         closedTombstones++;
       } catch (err) {
-        if ((err as { status?: number })?.status === 404) {
-          // issue already gone — nothing to close, stop retrying forever
-          await store.tombstoneDone(issueNumber);
-          closedTombstones++;
-          continue;
-        }
         lastError = `tombstone close failed (issue #${issueNumber}): ${err instanceof Error ? err.message : String(err)}`;
         pullHadError = true;
       }
@@ -969,8 +985,8 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     queue.push(threadId);
   };
 
-  const enqueueDelete = (issue: number): void => {
-    void store.tombstone(issue).then(() => {
+  const enqueueDelete = (issue: number, tombRepo?: string, threadId?: string): void => {
+    void store.tombstone(issue, tombRepo, threadId).then(() => {
       // close promptly in auto mode; otherwise the next POST /sync does it
       if (opts.enabled && token() && repo) {
         void run(pullOnceRaw).catch((err: unknown) => {
@@ -1056,7 +1072,7 @@ export function createGhSync(opts: GhSyncOptions): GhSync {
     const stalled = (await stalledThreads()).length;
     // 44-b P2-2: the summary now reports the window honestly — a forced cycle
     // that got mid-flight-429'd mid-loop showed all-zeros with no signal.
-    return { ok: true, created, pushed, pulled, healed, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled, backoffActive: Date.now() < backoffUntil };
+    return { ok: true, created, pushed, pulled, healed, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled, backoffActive: Date.now() < backoffUntil, lastError: lastError || undefined };
   };
 
   const syncAll = async (): Promise<GhSyncSummary> => {

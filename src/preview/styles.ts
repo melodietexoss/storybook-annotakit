@@ -199,7 +199,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 .annota-comment .annota-comment-head b { color: #1f2430; }
 .annota-comment p { margin: 0; white-space: pre-wrap; }
 
-.annota-reply-row { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid #eef0f4; }
+.annota-reply-row { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid #eef0f4; position: sticky; bottom: 0; background: #fff; border-radius: 0 0 10px 10px; }
 .annota-input, .annota-textarea {
   width: 100%;
   border: 1px solid #d7dbe3;

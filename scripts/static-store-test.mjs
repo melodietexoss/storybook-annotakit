@@ -30,6 +30,7 @@ function makeLocalStorage() {
 
 const storageShim = makeLocalStorage();
 const seedData = { threads: [], deleted: [] }; // mutated per scenario; fetch reads it live (S9 E-bake: `deleted` flows; blocks reset it)
+let seedDisabled = false; // 56-e P4-2 (block 23b): simulate a deployment with NO seed file
 let pageUrl = 'https://site.test/stories/index.html';
 
 globalThis.localStorage = storageShim;
@@ -43,6 +44,7 @@ globalThis.fetch = async (url) => {
   // scope-aware: only the /stories/ deployment serves the baked seed —
   // /other/ is a different deployment with NO seed file
   if (String(url).includes('annotakit-threads.json')) {
+    if (seedDisabled) return { ok: false, status: 404, json: async () => ({}) }; // 56-e P4-2: block 23b needs a seed-LESS boot (the persisted-only branch)
     if (String(url).includes('/stories/')) return { ok: true, json: async () => seedData };
     return { ok: false, status: 404, json: async () => ({}) };
   }
@@ -1141,6 +1143,66 @@ seedData.deleted = [];
   resetStaticStoreForTests();
   seedData.threads = [];
   seedData.deleted = [];
+}
+
+/* 23 — v0.6.16 (56-e P4-2): the DD-20 heal at ALL THREE no-merge observation
+ * paths — the seed-only load and reloadFromPersisted shipped in Z2 WITHOUT
+ * fixtures, and the boot-load-persisted path (persisted && !seed) never
+ * healed at all (found while writing these). */
+{
+  // (a) polluted SEED, no persisted doc (the fresh-visitor path)
+  resetStaticStoreForTests();
+  storageShim.clear();
+  const polluted = thread('th_23a');
+  polluted.comments = [
+    { id: 'c_23a_a', author: 'r', body: 'base', createdAt: '2026-10-01T00:00:00.000Z' },
+    { id: 'c_23a_b', author: 'agent', body: 'doubled reply', createdAt: '2026-10-01T00:00:01.000Z', ghId: '555', source: 'github' },
+    { id: 'c_23a_c', author: 'agent', body: 'doubled reply', createdAt: '2026-10-01T00:00:02.000Z', ghId: '555', source: 'github' },
+  ];
+  seedData.threads = [polluted];
+  seedData.deleted = [];
+  const sa = await getStaticStore();
+  const la = sa.list().find((t) => t.id === 'th_23a');
+  ok('23a polluted SEED heals on the seed-only load (one reply, not two)', (la?.comments ?? []).filter((c) => c.body === 'doubled reply').length === 1, JSON.stringify((la?.comments ?? []).map((c) => c.id)));
+
+  // (b) polluted PERSISTED doc, no seed (the boot-load-persisted path — the
+  //     v0.6.16 fix: this path loaded verbatim, doubled replies until the
+  //     first local mutation)
+  const storeKey = Object.keys(storageShim._dump())[0]; // (a) persisted under the real scope key
+  resetStaticStoreForTests();
+  storageShim.clear();
+  seedDisabled = true; // no seed file → the persisted-only branch
+  const docB = {
+    v: 1,
+    savedAt: new Date().toISOString(),
+    threads: [{ ...polluted, id: 'th_23b', comments: [
+      { id: 'c_23b_a', author: 'r', body: 'base', createdAt: '2026-10-01T00:00:00.000Z' },
+      { id: 'c_23b_b', author: 'agent', body: 'doubled reply', createdAt: '2026-10-01T00:00:01.000Z', ghId: '777', source: 'github' },
+      { id: 'c_23b_c', author: 'agent', body: 'doubled reply', createdAt: '2026-10-01T00:00:02.000Z', ghId: '777', source: 'github' },
+    ] }],
+    deletedIds: [],
+    counters: { s1: 5 },
+  };
+  storageShim.setItem(storeKey, JSON.stringify(docB));
+  const sb = await getStaticStore();
+  const lb = sb.list().find((t) => t.id === 'th_23b');
+  ok('23b polluted PERSISTED doc heals on the boot load (the third no-merge path)', (lb?.comments ?? []).filter((c) => c.body === 'doubled reply').length === 1, JSON.stringify((lb?.comments ?? []).map((c) => c.id)));
+  seedDisabled = false; // restore the seed for (c)'s reload (the persisted doc drives it either way)
+
+  // (c) reloadFromPersisted: a polluted doc arrives from another tab —
+  //     the adoption heals (the Z2 fix, now pinned). Driven via the public
+  //     method (the store's own storage-event listener is the same code path).
+  storageShim.setItem(storeKey, JSON.stringify({ ...docB, threads: [{ ...docB.threads[0], id: 'th_23c', comments: [
+    { id: 'c_23c_a', author: 'r', body: 'base', createdAt: '2026-10-01T00:00:00.000Z' },
+    { id: 'c_23c_b', author: 'agent', body: 'doubled reply', createdAt: '2026-10-01T00:00:01.000Z', ghId: '888', source: 'github' },
+    { id: 'c_23c_c', author: 'agent', body: 'doubled reply', createdAt: '2026-10-01T00:00:02.000Z', ghId: '888', source: 'github' },
+  ] }] }));
+  sb.reloadFromPersisted();
+  const lc = sb.list().find((t) => t.id === 'th_23c');
+  ok('23c reloadFromPersisted heals the storage-event adoption (one reply)', (lc?.comments ?? []).filter((c) => c.body === 'doubled reply').length === 1, JSON.stringify((lc?.comments ?? []).map((c) => c.id)));
+  seedData.threads = [];
+  seedData.deleted = [];
+  seedDisabled = false;
 }
 
 console.log(`\n${passed} passed, 0 failed (static-store suite)`);

@@ -626,6 +626,84 @@ check('textQuoteGate: same-viewport bbox agreement, cross-viewport text-alone (t
   assert.strictEqual(iou(elsewhere, then), 0, 'disjoint boxes → exactly 0');
 });
 
+/* -------- v0.6.16 (wave-6, 55-d P3-1 residual): the own-text fingerprint -------- */
+console.log('own-text fingerprint (the shift-up discriminator):');
+{
+  const { fingerprintOwnTextOk } = anchorMod;
+  // the shift-up shape: the pinned row's own text was recorded; the next
+  // same-tag/same-neighbor row that slides into the bbox carries DIFFERENT text
+  // NOTE: the recorded value is stored TRANSFORMED (normalizeText lowercases
+  // + collapses whitespace; extractFingerprint stores clip(normalizeText(…)))
+  const recorded = 'row a — monthly summary';
+  check('shift-up sibling with different own text is REJECTED', () => assert.strictEqual(fingerprintOwnTextOk('Row B — quarterly figures', recorded), false));
+  check('the element itself (identical own text) passes', () => assert.strictEqual(fingerprintOwnTextOk('Row A — monthly summary', recorded), true));
+  check('whitespace/case normalization is applied before comparing', () => assert.strictEqual(fingerprintOwnTextOk('  Row  A   —\n monthly SUMMARY ', recorded), true));
+  check('legacy anchors (no recorded ownText) always pass — additive', () => assert.strictEqual(fingerprintOwnTextOk('anything at all', undefined), true));
+  check('textless elements (empty candidate vs empty recorded) pass', () => assert.strictEqual(fingerprintOwnTextOk('', ''), true));
+  check('a dynamic-text change is honestly rejected at this rung', () => assert.strictEqual(fingerprintOwnTextOk('5 notifications', '3 notifications'), false));
+}
+
+/* ---------------- v0.6.16 (wave-6, 57-a P3): the pin cascade math ------------- */
+console.log('pin cascade (57-a P3 — the corner case, three browser rounds in the making):');
+{
+  const cascade = await import('../dist/cascade.mjs');
+  const { cascadeSlots } = cascade;
+  // viewport shape from the live probes: 980 x 237 (bottom dock open)
+  const VW = 980, VH = 237;
+  const maxX = VW - 26, maxY = VH - 26; // 954, 211
+
+  // (1) the DEEP-PAST corner headline: fragments (975,255) + (970,250) —
+  // both past the clamp ceilings. Pre-v0.6.16: collapsed onto (954,211),
+  // the buried pin 0/209 pixels clickable (live-proven twice).
+  {
+    const [a, b] = cascadeSlots([{ x: 975, y: 255 }, { x: 970, y: 250 }], VW, VH);
+    check('deep-past corner pair SEPARATES (not one pixel)', () => assert.ok(Math.abs(a.x - b.x) >= 10 && Math.abs(a.y - b.y) >= 10, `a=(${a.x},${a.y}) b=(${b.x},${b.y})`));
+    check('deep-past corner pair stays IN VIEWPORT', () => assert.ok(a.x <= maxX && a.y <= maxY && b.x <= maxX && b.y <= maxY && a.x >= 2 && b.x >= 2 && a.y >= 2 && b.y >= 2, `a=(${a.x},${a.y}) b=(${b.x},${b.y}) max=(${maxX},${maxY})`));
+  }
+
+  // (2) shallow-past pair (within one step of the ceiling) — the v0.6.16
+  // first fix's working range, still exact
+  {
+    const [a, b] = cascadeSlots([{ x: 959, y: 238 }, { x: 960, y: 239 }], VW, VH);
+    check('shallow-past corner pair separates', () => assert.ok(Math.abs(a.x - b.x) >= 10 && Math.abs(a.y - b.y) >= 10, `a=(${a.x},${a.y}) b=(${b.x},${b.y})`));
+  }
+
+  // (3) the mid-canvas ladder: +10/+10 per slot-mate (the v0.6.14 core)
+  {
+    const pins = Array.from({ length: 5 }, () => ({ x: 400, y: 110 })); // identical anchors — the same-element 5-pin stack
+    const slots = cascadeSlots(pins, VW, VH);
+    const uniq = new Set(slots.map((sl) => `${sl.x},${sl.y}`));
+    check('mid-canvas 5-deep ladder: 5 distinct positions', () => assert.ok(uniq.size === 5, JSON.stringify(slots)));
+    check('mid-canvas ladder steps by ~10px', () => assert.ok(slots[1].x - slots[0].x === 10 && slots[1].y - slots[0].y === 10, JSON.stringify(slots)));
+  }
+
+  // (4) different unclamped buckets clamping to the SAME edge slot cascade
+  //     (the v0.6.15 fix's own case — must keep working through the rewrite)
+  {
+    const [a, b] = cascadeSlots([{ x: 960, y: 80 }, { x: 975, y: 84 }], VW, VH);
+    check('same-clamped-slot right-edge pair cascades (distinct, in-viewport)', () => assert.ok(a.x !== b.x || Math.abs(b.y - a.y) >= 10, `a=(${a.x},${a.y}) b=(${b.x},${b.y})`));
+  }
+
+  // (5) single pin: the render position equals the plain clamp (no cascade)
+  {
+    const [a] = cascadeSlots([{ x: 500, y: 200 }], VW, VH);
+    check('single pin: base clamp position (no cascade offset)', () => assert.ok(a.x === 496 && a.y === 174, `a=(${a.x},${a.y})`));
+  }
+
+  // (6) regions are exempt (their rects differ)
+  {
+    const [a, b] = cascadeSlots([{ x: 500, y: 200 }, { x: 502, y: 202, region: true }], VW, VH);
+    check('regions are cascade-exempt', () => assert.ok(a.x === 496 && b.x === 498, `a=(${a.x},${a.y}) b=(${b.x},${b.y})`));
+  }
+
+  // (7) a deep stack at the corner never escapes the viewport (8 pins)
+  {
+    const pins = Array.from({ length: 8 }, () => ({ x: 975, y: 255 }));
+    const slots = cascadeSlots(pins, VW, VH);
+    check('8-deep corner stack: all in-viewport, all distinct', () => assert.ok(slots.every((sl) => sl.x >= 2 && sl.x <= maxX && sl.y >= 2 && sl.y <= maxY) && new Set(slots.map((sl) => `${sl.x},${sl.y}`)).size === 8, JSON.stringify(slots)));
+  }
+}
+
 /* ------------------------------ total ------------------------------ */
 
 console.log(`\n${passed} passed, ${failed} failed (s6 unit suite)`);

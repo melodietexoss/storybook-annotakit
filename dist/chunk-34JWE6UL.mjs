@@ -296,9 +296,10 @@ function captureFrozenSnapshotInner(mount, pinned) {
   }
   if (byteLen(html) > FROZEN_BUDGET) {
     while (byteLen(html) > FROZEN_BUDGET && temp.children.length > 1) {
-      const last = temp.lastElementChild;
-      if (last && (last.matches(`[${MARK}]`) || last.querySelector(`[${MARK}]`))) break;
-      last?.remove();
+      let drop = temp.lastElementChild;
+      while (drop && (drop.matches(`[${MARK}]`) || drop.querySelector(`[${MARK}]`))) drop = drop.previousElementSibling;
+      if (!drop || drop === temp.firstElementChild) break;
+      drop.remove();
       html = temp.outerHTML;
     }
   }

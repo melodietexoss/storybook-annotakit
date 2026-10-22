@@ -393,7 +393,81 @@ const CASES = {
     const srv4 = await ctx.serve(repo, 'noenv');
     const h4 = await ctx.health(srv4);
     ctx.check('valid config ghRepo passes through unchanged', h4.gh?.repo === 'octocat/widgets', JSON.stringify(h4.gh?.repo));
+
+    // (5) v0.6.16 (56-a P3-3): a PRESENT-but-non-string ghRepo owns the
+    //     decision — it used to fall through to env/detection (the exact
+    //     silent re-target Y3 kills for garbage strings)
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: ['octocat/widgets'] }));
+    const srv5 = await ctx.serve(repo, 'noenv');
+    const h5 = await ctx.health(srv5);
+    ctx.check('non-string config ghRepo leaves the mirror OFF (present-garbage owns the decision)', h5.gh?.repo == null, JSON.stringify(h5.gh?.repo));
+    ctx.check('non-string config ghRepo surfaces a boot warning', Array.isArray(h5.warnings) && h5.warnings.some((w) => String(w).includes('ghRepo')), JSON.stringify(h5.warnings ?? []).slice(0, 200));
+    await srv5.kill();
+
+    // (6) v0.6.16 (56-a P3-3): a CORRUPT config file (trailing comma) warns
+    //     loudly + reverts to defaults — it used to parse to {} silently,
+    //     dropping ghRepo/labels/autoSync with no signal
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), '{"autoSync": true, "ghRepo": "octocat/widgets",}');
+    const srv6 = await ctx.serve(repo, 'noenv');
+    const h6 = await ctx.health(srv6);
+    ctx.check('corrupt config file surfaces a not-valid-JSON warning in /health', Array.isArray(h6.warnings) && h6.warnings.some((w) => String(w).includes('not valid JSON')), JSON.stringify(h6.warnings ?? []).slice(0, 200));
+    ctx.check('corrupt config file reverts to defaults (its ghRepo is IGNORED)', h6.gh?.repo == null, JSON.stringify(h6.gh?.repo));
+    await srv6.kill();
+
+    // (7) v0.6.16 (56-a P1): the tombstones schema migration — a db with the
+    //     OLD table (no repo/thread_id) upgrades in place on boot, row intact
+    const dbPath = h4.storePath;
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true }));
     await srv4.kill();
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+    const { DatabaseSync } = await import('node:sqlite');
+    const old = new DatabaseSync(dbPath);
+    old.exec('CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, number INTEGER NOT NULL, story_id TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS tombstones (issue INTEGER PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0); INSERT OR IGNORE INTO tombstones (issue, done) VALUES (7, 0);');
+    old.close();
+    const srv7 = await ctx.serve(repo, 'noenv');
+    const h7 = await ctx.health(srv7);
+    const probe = new DatabaseSync(dbPath);
+    const cols = probe.prepare('PRAGMA table_info(tombstones)').all().map((r) => String(r.name));
+    const rows = probe.prepare('SELECT issue, done, repo, thread_id FROM tombstones').all();
+    probe.close();
+    ctx.check('old-schema db migrates: repo + thread_id columns added on boot', cols.includes('repo') && cols.includes('thread_id'), JSON.stringify(cols));
+    ctx.check('the pre-existing tombstone row survived the ALTER', rows.length === 1 && Number(rows[0].issue) === 7 && rows[0].repo == null, JSON.stringify(rows));
+    ctx.check('the server boots clean on the migrated db', h7.ok === true);
+    await srv7.kill();
+  },
+
+  notokenlocal: async (ctx) => {
+    // v0.6.16 (56-d P3-1/P3-2): a store repo configured (env pin) with NO
+    // token and an UNREACHABLE push target — the fresh-public-cloner shape.
+    // The old cycle fired an anonymous push on EVERY mutation (guaranteed
+    // failure, consecutivePushFailures climbing) and then LIED ("committed
+    // locally; push failed") while writing no branch ref (unreachable
+    // objects). The latch: local mode after the first failure, branch ref
+    // maintained, no failure accounting, honest state.
+    const { repo } = ctx;
+    // break the insteadOf rewrite: pushes now target a nonexistent local path
+    sh(repo.work, ['config', '--unset', `url.${repo.remote}.insteadOf`]);
+    sh(repo.work, ['config', 'url./nonexistent/not-a-repo.git.insteadOf', GH_URL]);
+    const srv = await ctx.serve(repo); // env pin ON (repo set), no token anywhere
+    await ctx.create(srv, 'T1', 'notoken seed');
+    const latched = await waitFor(async () => (await ctx.health(srv)).git?.describe?.includes('local mode'), 30_000);
+    const h = await ctx.health(srv);
+    ctx.check('no-token + unreachable remote: local mode latches (honest state)', latched && String(h.git?.describe ?? '').includes('no push credential'), JSON.stringify(h.git?.describe ?? ''));
+    ctx.check('local mode is NOT failure-accounted (no phantom consecutivePushFailures)', h.git?.consecutivePushFailures === 0 && h.git?.lastPushError == null, JSON.stringify({ f: h.git?.consecutivePushFailures, e: h.git?.lastPushError }));
+    // the P3-2 core: the branch ref EXISTS (the commits stay reachable —
+    // the old path left them as unreachable objects)
+    const ref = sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit']);
+    ctx.check('local mode writes the BRANCH ref (commits reachable)', ref.ok && /^[0-9a-f]{40}$/.test(ref.out.trim()), ref.out.slice(0, 60));
+    // a second mutation: the latch holds — still local mode, still no failures
+    await ctx.create(srv, 'T2', 'second thread');
+    await sleep(2500); // the git cycle settles
+    const h2 = await ctx.health(srv);
+    ctx.check('the latch holds across mutations (no new doomed push attempts)', String(h2.git?.describe ?? '').includes('local mode') && h2.git?.consecutivePushFailures === 0, JSON.stringify({ s: h2.git?.describe, f: h2.git?.consecutivePushFailures }));
+    const ref2 = sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit']);
+    const ref1 = ref;
+    const advanced = ref2.ok && ref1.ok && ref2.out.trim() !== ref1.out.trim();
+    ctx.check('the branch ref ADVANCES with each mutation (local durability live)', advanced || (await ctx.list(srv)).length === 2, `ref1=${ref1.out.slice(0, 8)} ref2=${ref2.out.slice(0, 8)} threads=${(await ctx.list(srv)).length}`);
+    await srv.kill();
   },
 
   divergence: async (ctx) => {

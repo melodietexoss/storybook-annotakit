@@ -644,6 +644,114 @@ async function main() {
     check('?sort=<unknown> is a 400 (never silently ignored)', bad.status === 400, `status=${bad.status}`);
   }
 
+  /* v0.6.16 (wave-5, 56-a): the routes.ts door-hardening round — story:null
+     export survival, POST id typing, comment-POST replay idempotence, the
+     C11 comment-entry gates at the POST door, ?status= enum honesty, and
+     hostile snapshot dims. */
+  {
+    // P2-1: PATCH {story: null} is an admitted shape (frozen-view pins carry
+    // no story metadata) — every later export/digest must SURVIVE it (the
+    // groupByStory spread on t.story.url used to 500 both formats forever).
+    const t161 = await j('POST', `${API}/threads`, {
+      id: `th_56a_nullstory_${Date.now().toString(36)}`,
+      storyId, author: 'w56a', target: { kind: 'region', selector: { fragment: { x: 1, y: 1, w: 2, h: 2 } }, context: { tag: 'region' }, bbox: { x: 1, y: 1, w: 2, h: 2 }, captureViewportWidth: 1000 },
+      comments: [{ author: 'w56a', body: 'null-story probe' }],
+    });
+    const tid161 = t161.json?.id;
+    if (tid161) {
+      ownIds.push(tid161);
+      const pn = await j('PATCH', `${API}/threads/${tid161}`, { story: null });
+      check('56a P2-1: PATCH {story:null} accepted (200)', pn.status === 200, `status=${pn.status}`);
+      const exJ = await j('GET', `${API}/export?format=json&storyId=${encodeURIComponent(storyId)}`);
+      check('56a P2-1: /export?format=json survives a null-story thread', exJ.status === 200, `status=${exJ.status}`);
+      const exM = await j('GET', `${API}/export?storyId=${encodeURIComponent(storyId)}`);
+      check('56a P2-1: /export?format=md survives a null-story thread', exM.status === 200, `status=${exM.status}`);
+      const restored = await j('PATCH', `${API}/threads/${tid161}`, { story: { storyId, title: 'probe', name: 'probe' } });
+      check('56a P2-1: recovery PATCH (story object) still fine', restored.status === 200, `status=${restored.status}`);
+    } else {
+      check('56a P2-1: setup thread created', false, `status=${t161.status}`);
+    }
+
+    // P2-2: a non-string id at the POST door — 400, never sqlite bind
+    // internals (500) or a mangled-key zombie row ('123456.0').
+    for (const [label, badId] of [['object id', { a: 1 }], ['numeric id', 123456], ['boolean id', true]]) {
+      const r = await j('POST', `${API}/threads`, {
+        id: badId, storyId, author: 'w56a',
+        target: { kind: 'region', selector: { fragment: { x: 1, y: 1, w: 2, h: 2 } }, context: { tag: 'region' }, bbox: { x: 1, y: 1, w: 2, h: 2 }, captureViewportWidth: 1000 },
+        comments: [{ author: 'w56a', body: `id typing probe ${label}` }],
+      });
+      check(`56a P2-2: ${label} → 400 (not a 500 zombie)`, r.status === 400, `status=${r.status}`);
+    }
+
+    // P2-3: the comment POST is retry-idempotent — an identical retry (same
+    // author|body|createdAt → same stable id) replays instead of appending a
+    // same-id duplicate that survives every union and mirrors twice.
+    {
+      const t = await j('POST', `${API}/threads`, {
+        id: `th_56a_replay_${Date.now().toString(36)}`,
+        storyId, author: 'w56a', target: { kind: 'region', selector: { fragment: { x: 3, y: 3, w: 2, h: 2 } }, context: { tag: 'region' }, bbox: { x: 3, y: 3, w: 2, h: 2 }, captureViewportWidth: 1000 },
+        comments: [{ author: 'w56a', body: 'replay base' }],
+      });
+      const tid = t.json?.id;
+      if (tid) {
+        ownIds.push(tid);
+        const payload = { author: 'retry-agent', body: 'the lost-response retry', createdAt: '2026-10-22T00:00:00.000Z' };
+        const first = await j('POST', `${API}/threads/${tid}/comments`, payload);
+        check('56a P2-3: first comment POST → 201', first.status === 201, `status=${first.status}`);
+        const retry = await j('POST', `${API}/threads/${tid}/comments`, payload);
+        check('56a P2-3: identical retry → 200 + replayed:true', retry.status === 200 && retry.json?.replayed === true, `status=${retry.status} body=${JSON.stringify(retry.json).slice(0, 80)}`);
+        const after = await j('GET', `${API}/threads/${tid}`);
+        const copies = (after.json?.comments ?? []).filter((c) => c.body === 'the lost-response retry');
+        check('56a P2-3: exactly ONE copy stored (no same-id duplicate)', copies.length === 1, `n=${copies.length}`);
+        const diff = await j('POST', `${API}/threads/${tid}/comments`, { author: 'retry-agent', body: 'the lost-response retry', createdAt: '2026-10-22T00:00:01.000Z' });
+        check('56a P2-3: a DIFFERENT comment still appends (201)', diff.status === 201, `status=${diff.status}`);
+      } else {
+        check('56a P2-3: setup thread created', false, `status=${t.status}`);
+      }
+    }
+
+    // P3-1: the C11 comment-entry gates at the POST /threads door (they used
+    // to live at PATCH only — three 500 shapes here).
+    const mkBody = (comments) => ({
+      storyId, author: 'w56a',
+      target: { kind: 'region', selector: { fragment: { x: 5, y: 5, w: 2, h: 2 } }, context: { tag: 'region' }, bbox: { x: 5, y: 5, w: 2, h: 2 }, captureViewportWidth: 1000 },
+      comments,
+    });
+    for (const [label, comments] of [['null entry', [null]], ['numeric body', [{ body: 5 }]], ['numeric author', [{ body: 'x', author: 5 }]]]) {
+      const r = await j('POST', `${API}/threads`, mkBody(comments));
+      check(`56a P3-1: comments ${label} → 400 (not 500)`, r.status === 400, `status=${r.status}`);
+    }
+
+    // P3-2: ?status=<unknown> is a 400 at BOTH doors (the house convention —
+    // sort/format/mode all 400; a typo'd status used to read as "no threads").
+    {
+      const l1 = await j('GET', `${API}/threads?status=banana`);
+      check('56a P3-2: /threads?status=banana → 400', l1.status === 400, `status=${l1.status}`);
+      const l2 = await j('GET', `${API}/export?format=json&status=banana`);
+      check('56a P3-2: /export?status=banana → 400', l2.status === 400, `status=${l2.status}`);
+      const l3 = await j('GET', `${API}/threads?status=OPEN`);
+      check('56a P3-2: ?status=OPEN normalizes (200)', l3.status === 200, `status=${l3.status}`);
+    }
+
+    // P3-5: hostile snapshot dims clamp (1e9 used to store verbatim → the
+    // evidence page + recall mounted a billion-px layout).
+    {
+      const t = await j('POST', `${API}/threads`, {
+        id: `th_56a_dims_${Date.now().toString(36)}`,
+        storyId, author: 'w56a', target: { kind: 'region', selector: { fragment: { x: 9, y: 9, w: 2, h: 2 } }, context: { tag: 'region' }, bbox: { x: 9, y: 9, w: 2, h: 2 }, captureViewportWidth: 1000 },
+        comments: [{ author: 'w56a', body: 'dims probe' }],
+      });
+      const tid = t.json?.id;
+      if (tid) {
+        ownIds.push(tid);
+        const put = await j('PUT', `${API}/threads/${tid}/snapshot`, { html: '<div>probe</div>', clipped: false, width: 1e9, height: -50 });
+        const snap = await j('GET', `${API}/threads/${tid}/snapshot`);
+        check('56a P3-5: width 1e9 clamped to ≤20000', put.status === 200 && Number(snap.json?.width) <= 20000, `put=${put.status} w=${snap.json?.width}`);
+        check('56a P3-5: height -50 clamped to ≥0', Number(snap.json?.height) >= 0, `h=${snap.json?.height}`);
+      }
+    }
+  }
+
   /* cleanup: remove ONLY threads this test created (live sessions may own others) */
   for (const tid of ownIds.filter(Boolean)) {
     await fetch(`${API}/threads?id=${tid}`, { method: 'DELETE' });

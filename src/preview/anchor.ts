@@ -180,7 +180,10 @@ function extractFingerprint(el: HTMLElement): ElementFingerprint {
       sib = sib.nextElementSibling;
     }
   }
-  return { tag: el.tagName.toLowerCase(), attrs, neighborText };
+  // v0.6.16 (wave-6): the element's OWN text — the shift-up discriminator
+  // (additive; see ElementFingerprint.ownText).
+  const ownText = clip(normalizeText(el.textContent ?? ''), 60) || undefined;
+  return { tag: el.tagName.toLowerCase(), attrs, neighborText, ownText };
 }
 
 export interface CapturedAnchor {
@@ -337,6 +340,15 @@ export function textQuoteGate(bboxNow: BBox, bboxThen: BBox, widthNow: number, w
   return iou(bboxNow, bboxThen) >= IOU_THRESHOLD;
 }
 
+/** v0.6.16 (wave-6, the 55-d P3-1 residual): does a neighbor-rung candidate's
+ * own text agree with the RECORDED own text? A recorded `ownText` of
+ * undefined (legacy anchors, or textless elements) always passes — the check
+ * is additive. Pure so the s6 suite pins the shift-up discrimination. */
+export function fingerprintOwnTextOk(candidateText: string | null, recordedOwnText: string | undefined): boolean {
+  if (recordedOwnText === undefined) return true; // legacy/textless — no signal
+  return clip(normalizeText(candidateText ?? ''), 60) === recordedOwnText;
+}
+
 function findByTextQuote(ann: AnchorLike, root: HTMLElement): HTMLElement | null {
   const q = ann.selector.textQuote;
   if (!q?.exact) return null;
@@ -426,6 +438,13 @@ function findByFingerprint(ann: AnchorLike, root: HTMLElement): HTMLElement | nu
         // own-text fingerprint extension is the follow-up).
         const idAttr = fp.attrs.find((a) => a.name === 'id' || a.name === 'data-testid');
         if (idAttr && el.getAttribute(idAttr.name) !== idAttr.value) continue;
+        // v0.6.16 (wave-6, the 55-d P3-1 residual closed): the element's OWN
+        // text discriminates the shift-up shape for pins WITHOUT an
+        // identifying attr — the next same-tag/same-neighbor row sliding into
+        // the recorded bbox carries different own text (the deleted row's
+        // text was recorded at capture). Legacy anchors (no ownText) keep
+        // the documented residual — the check is additive.
+        if (fp.ownText !== undefined && fingerprintOwnTextOk(el.textContent, fp.ownText) === false) continue;
         // ...and the candidate must AGREE with the recorded bbox at the same
         // capture width — the v0.6.13 textQuoteGate, applied here: the pinned
         // element being DELETED while a surviving sibling carries matching

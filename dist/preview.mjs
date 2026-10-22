@@ -1,13 +1,17 @@
 import {
+  applyRecallScroll,
+  shouldApplyRecall
+} from "./chunk-624TCCP6.mjs";
+import {
   captureFrozenSnapshot,
   captureFrozenView,
   captureSnapshot,
   mountRecalledView
-} from "./chunk-75MKQES5.mjs";
+} from "./chunk-34JWE6UL.mjs";
 import {
   captureAnchor,
   resolveAnchor
-} from "./chunk-4YZXNHV2.mjs";
+} from "./chunk-54KKMA3X.mjs";
 import {
   API_BASE,
   FOCUS_THREAD,
@@ -21,14 +25,14 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-JG34ADOS.mjs";
+} from "./chunk-JPCSIDTT.mjs";
 import {
   getGhLinkedStaticStore
-} from "./chunk-23RNGYKC.mjs";
+} from "./chunk-3MAABR6H.mjs";
 import {
   MAX_BODY_CHARS,
   elementSummary
-} from "./chunk-DEMUCS72.mjs";
+} from "./chunk-56EMSXTR.mjs";
 import {
   DEFAULT_HOTKEYS,
   altMatches,
@@ -43,9 +47,8 @@ import {
   isPinnableTarget
 } from "./chunk-5NAI4TQG.mjs";
 import {
-  applyRecallScroll,
-  shouldApplyRecall
-} from "./chunk-624TCCP6.mjs";
+  cascadeSlots
+} from "./chunk-4SSIEFRK.mjs";
 
 // src/preview/index.ts
 import React2 from "react";
@@ -74,7 +77,8 @@ function componentName(fiber) {
   const t = fiber.type;
   if (!t) return null;
   if (typeof t === "string") return null;
-  const name = t.displayName || t.name;
+  const render = t.render;
+  const name = t.displayName || t.name || (typeof render === "function" ? render.name : void 0);
   return typeof name === "string" && name ? name : null;
 }
 function fiberKeyOf(el) {
@@ -211,7 +215,7 @@ var smCache = /* @__PURE__ */ new Map();
 function loadSourceMap(modulePath) {
   let p = smCache.get(modulePath);
   if (!p) {
-    p = (async () => {
+    const attempt = (async () => {
       try {
         const url = typeof location !== "undefined" ? `${location.origin}/${modulePath}` : modulePath;
         const text = await (await fetch(url)).text();
@@ -223,6 +227,16 @@ function loadSourceMap(modulePath) {
         return null;
       }
     })();
+    p = attempt.then(
+      (v) => {
+        if (v === null) smCache.delete(modulePath);
+        return v;
+      },
+      () => {
+        smCache.delete(modulePath);
+        return null;
+      }
+    );
     smCache.set(modulePath, p);
   }
   return p;
@@ -236,7 +250,7 @@ async function correctSource(source) {
   try {
     const lines = await loadSourceMap(source.file);
     if (!lines) return source;
-    const orig = mapPosition(lines, source.line - 1, source.column);
+    const orig = mapPosition(lines, source.line - 1, source.column - 1);
     return orig ? { ...source, line: orig.line, column: orig.column } : source;
   } catch {
     return source;
@@ -246,9 +260,11 @@ function summarizeProps(props) {
   if (!props) return void 0;
   const out = {};
   let count = 0;
+  let visited = 0;
   for (const [key, value] of Object.entries(props)) {
     if (key.startsWith("_")) continue;
     if (count >= 8) break;
+    if (++visited > 200) break;
     const s = propValueToString(value);
     if (s === null) continue;
     out[key] = s;
@@ -269,6 +285,13 @@ function propValueToString(value) {
   }
 }
 function inspectComponent(el) {
+  try {
+    return inspectComponentRaw(el);
+  } catch {
+    return null;
+  }
+}
+function inspectComponentRaw(el) {
   if (el.closest?.("[data-annota-frozen]")) return null;
   let fiber = closestFiber(el);
   if (!fiber) fiber = react18Fallback(el);
@@ -359,6 +382,8 @@ async function buildStoryRef(storyId, context = {}) {
 }
 
 // src/preview/api.ts
+var FETCH_TIMEOUT_MS = 1e4;
+var fetchTimeout = () => ({ signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
 async function json(res) {
   const text = await res.text();
   let body = null;
@@ -373,36 +398,62 @@ async function json(res) {
   }
   return body;
 }
+function asThreadsEnvelope(body) {
+  if (body && typeof body === "object" && Array.isArray(body.threads)) {
+    return body.threads;
+  }
+  throw new Error("annotakit: malformed threads envelope (expected {threads: []})");
+}
+function asThread(body, what) {
+  if (body && typeof body === "object" && typeof body.id === "string") {
+    return body;
+  }
+  throw new Error(`annotakit: malformed ${what} response (expected a thread document)`);
+}
 async function getThreads(storyId) {
   const url = storyId ? `${API_BASE}/threads?storyId=${encodeURIComponent(storyId)}` : `${API_BASE}/threads`;
-  const body = await json(await fetch(url, { cache: "no-store" }));
-  return body.threads ?? [];
+  const body = await json(await fetch(url, { cache: "no-store", ...fetchTimeout() }));
+  return asThreadsEnvelope(body);
 }
 async function createThread(input) {
-  return await json(
-    await fetch(`${API_BASE}/threads`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(input)
-    })
+  return asThread(
+    await json(
+      await fetch(`${API_BASE}/threads`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+        ...fetchTimeout()
+      })
+    ),
+    "createThread"
   );
 }
 async function patchThread(thread, statusAuthor) {
-  return await json(
-    await fetch(`${API_BASE}/threads/${encodeURIComponent(thread.id)}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(statusAuthor ? { ...thread, statusAuthor } : thread)
-    })
+  return asThread(
+    await json(
+      await fetch(`${API_BASE}/threads/${encodeURIComponent(thread.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(statusAuthor ? { ...thread, statusAuthor } : thread),
+        ...fetchTimeout()
+      })
+    ),
+    "patchThread"
   );
 }
 async function addComment(threadId, body, author) {
-  return await json(
-    await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/comments`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ body, author })
-    })
+  return asThread(
+    await json(
+      await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/comments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        // v0.6.16 (56-b P3-7 partial): a caller-supplied createdAt is the
+        // idempotency key — an identical retry replays server-side (no dup).
+        body: JSON.stringify({ body, author, createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
+        ...fetchTimeout()
+      })
+    ),
+    "addComment"
   );
 }
 async function postSnapshot(threadId, snapshot) {
@@ -410,12 +461,13 @@ async function postSnapshot(threadId, snapshot) {
     await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/snapshot`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(snapshot)
+      body: JSON.stringify(snapshot),
+      ...fetchTimeout()
     })
   );
 }
 async function getSnapshot(threadId) {
-  return await json(await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/snapshot`, { cache: "no-store" }));
+  return await json(await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/snapshot`, { cache: "no-store", ...fetchTimeout() }));
 }
 
 // src/preview/styles.ts
@@ -614,7 +666,7 @@ body.annota-cursor * { cursor: crosshair !important; }
 .annota-comment .annota-comment-head b { color: #1f2430; }
 .annota-comment p { margin: 0; white-space: pre-wrap; }
 
-.annota-reply-row { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid #eef0f4; }
+.annota-reply-row { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid #eef0f4; position: sticky; bottom: 0; background: #fff; border-radius: 0 0 10px 10px; }
 .annota-input, .annota-textarea {
   width: 100%;
   border: 1px solid #d7dbe3;
@@ -810,6 +862,8 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
   frozenRef.current = frozen;
   const frozenMountRef = useRef(null);
   const recallSeqRef = useRef(0);
+  const fetchSeqRef = useRef(0);
+  const draftIdRef = useRef(null);
   const recallScrollRef = useRef(false);
   const inertedRef = useRef([]);
   useEffect(() => {
@@ -952,14 +1006,17 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
     snapshot: postSnapshot
   });
   const refresh = useCallback(async () => {
+    const seq = ++fetchSeqRef.current;
     try {
       const list = await dataRef.current.list(storyIdRef.current);
       if (!mountedRef.current) return;
+      if (seq !== fetchSeqRef.current) return;
       retryCount.current = 0;
       setThreads(list);
       setError(null);
     } catch (e) {
       if (!mountedRef.current) return;
+      if (seq !== fetchSeqRef.current) return;
       if (retryCount.current < 5) {
         const delay = 400 * 2 ** retryCount.current;
         retryCount.current += 1;
@@ -1558,7 +1615,11 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
         const component = raw?.source ? await correctComponent(raw) : raw;
         const story = await buildStoryRef(storyId, { title, name });
         const comment = { id: uid("c"), author: getAuthor(), body, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+        if (!draftIdRef.current || draftIdRef.current.composer !== composer) {
+          draftIdRef.current = { composer, id: uid("th") };
+        }
         const created = await dataRef.current.create({
+          id: draftIdRef.current.id,
           storyId,
           story,
           component,
@@ -1631,29 +1692,27 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
         out.push({
           thread: t,
           fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h },
+          render: { x: 0, y: 0 },
+          // filled by the cascade pass below
           status: "resolved"
         });
         continue;
       }
       if (pin.el) {
         const r = pin.el.getBoundingClientRect();
-        out.push({ thread: t, fixed: { x: r.left, y: r.top, w: r.width, h: r.height }, status: pin.status });
+        out.push({ thread: t, fixed: { x: r.left, y: r.top, w: r.width, h: r.height }, render: { x: 0, y: 0 }, status: pin.status });
       } else {
         const rootRect = activeRoot().getBoundingClientRect();
         const f = t.target.selector.fragment ?? t.target.bbox;
-        out.push({ thread: t, fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h }, status: "orphan" });
+        out.push({ thread: t, fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h }, render: { x: 0, y: 0 }, status: "orphan" });
       }
     }
-    const slotCount = /* @__PURE__ */ new Map();
-    for (const v of out) {
-      if (v.thread.target.kind === "region") continue;
-      const cx = Math.min(Math.max(v.fixed.x - 4, 2), Math.max(vw - 26, 2));
-      const cy = Math.min(Math.max(v.fixed.y - 26, 2), Math.max(vh - 26, 2));
-      const key = `${Math.round(cx / 12)}:${Math.round(cy / 12)}`;
-      const n = slotCount.get(key) ?? 0;
-      slotCount.set(key, n + 1);
-      if (n > 0) v.fixed = { ...v.fixed, x: v.fixed.x + n * 10, y: v.fixed.y + n * 10 };
-    }
+    const slots = cascadeSlots(
+      out.map((v) => ({ x: v.fixed.x, y: v.fixed.y, region: v.thread.target.kind === "region" })),
+      vw,
+      vh
+    );
+    for (let i = 0; i < out.length; i++) out[i].render = slots[i] ?? { x: 2, y: 2 };
     void vw;
     void vh;
     return out;
@@ -1663,7 +1722,7 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
   }
   const activeT = threads.find((t) => t.id === activeThread) ?? null;
   return /* @__PURE__ */ React.createElement("div", { "data-annota-overlay": "1", className: "annota-root" }, visible && pinViews.map(
-    ({ thread, fixed, status }) => thread.target.kind === "region" ? /* @__PURE__ */ React.createElement(
+    ({ thread, fixed, render, status }) => thread.target.kind === "region" ? /* @__PURE__ */ React.createElement(
       "div",
       {
         key: thread.id,
@@ -1695,8 +1754,11 @@ function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }) {
           thread.id === activeThread ? "is-active" : ""
         ].filter(Boolean).join(" "),
         style: {
-          left: clamp(fixed.x - 4, 2, Math.max(window.innerWidth - 26, 2)),
-          top: clamp(fixed.y - 26, 2, Math.max(window.innerHeight - 26, 2))
+          // v0.6.16 (57-a P3): the cascade's final position — clamped +
+          // cascade-offset in one place (the old double clamp re-ate
+          // the fixed-space offset at the corner)
+          left: render.x,
+          top: render.y
         },
         onClick: () => setActiveThread(thread.id),
         onKeyDown: (e) => {
@@ -1836,7 +1898,7 @@ function ThreadCard(props) {
     });
   };
   const t = props.thread;
-  const near = props.pin?.fixed;
+  const near = props.pin?.render ?? props.pin?.fixed;
   const { ref, style } = useClampedPosition(near ? near.x + (near.x > window.innerWidth / 2 ? -120 : 120) : 40, near ? near.y : 60);
   const comp = t.component;
   const prevCountRef = React.useRef(t.comments.length);

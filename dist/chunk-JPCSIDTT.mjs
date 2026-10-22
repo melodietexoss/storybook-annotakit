@@ -1,6 +1,6 @@
 import {
   probeSeed
-} from "./chunk-DEMUCS72.mjs";
+} from "./chunk-56EMSXTR.mjs";
 
 // src/shared/events.ts
 var THREADS_CHANGED = "annotakit/threads-changed";

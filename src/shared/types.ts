@@ -140,6 +140,12 @@ export interface ElementFingerprint {
    *  writes it; consumption must not assume it. */
   attrs?: AttrFingerprint[];
   neighborText?: string;
+  /** v0.6.16 (wave-6, the 55-d P3-1 residual): the element's OWN text at
+   *  capture (normalized + clipped). Additive — legacy anchors lack it and
+   *  the neighbor rung simply skips the cross-check for them. Discriminates
+   *  the shift-up deletion shape: the next same-tag/same-neighbor row that
+   *  slides into the recorded bbox carries DIFFERENT own text. */
+  ownText?: string;
 }
 
 /** DOM context of the pinned element — the fields an agent needs to identify
@@ -416,6 +422,11 @@ export interface GhSyncStatus {
 
 /** Result of POST /sync (force reconcile both directions). */
 export interface GhSyncSummary {
+  /** v0.6.16 (56-a P3-6): the last push/pull/tombstone error, if any — a
+   *  forced reconcile where everything failed used to read as ok:true with
+   *  all-zero counters and NO error field (the agent had to make a second
+   *  GET /sync to learn why). Same string GET /sync reports. */
+  lastError?: string;
   /** v0.6.13 (44-b P2-2): true when the rate-limit window was armed when the
    *  summary was built (a forced cycle deferred by a mid-flight 429 shows
    *  all-zero counters with this flag — honest instead of silent). */

@@ -117,7 +117,7 @@ curl -X POST $API/gh/reload                        # token rotation without rest
                                                    #   gh/reload row below
 ```
 
-Also: `POST /threads` (create — copy the /schema example) · `GET /threads/<id>` · `?storyId=` filter · `/export?format=md|json` · `/threads/<id>/snapshot` (`?format=html` renders).
+Also: `POST /threads` (create — copy the /schema example) · `GET /threads/<id>` · `?storyId=` + `?status=open|fixed|rejected|resolved` filters (unknown status = 400) + `?sort=recent` (updatedAt DESC) · `/export?format=md|json` (`?mode=full` = verbatim bodies) · `/threads/<id>/snapshot` (`?format=html` renders).
 
 Loop: GET threads → `component.source.file:line` + `story.importPath` → fix code → reply evidence → PATCH `{"status":"fixed"}` (partial OK, JSON-merge; omitted comments never dropped) = addressed AWAITING REVIEW. `resolved` = REVIEWER confirmation (panel ✓ / GitHub close); open→resolved direct legal for trivial fixes. `rejected` = the reviewer did NOT accept a fix (re-work: fix again → PATCH fixed → re-enters review); the issue stays OPEN + a system notice comment lands on it.
 
@@ -132,6 +132,7 @@ Loop: GET threads → `component.source.file:line` + `story.importPath` → fix 
 | PATCH body | deep `target` validation (malformed = 400 at the door); client `gh` blocks DROPPED (engine-owned) |
 | comment bodies | capped 64,000 chars (413 beyond) — evidence as links; full body lives in store + JSON export |
 | comment ids | re-hashed server-side (stored stay — union keys) — key comments by thread id, never your own comment id |
+| comment POST | v0.6.16: retry-IDEMPOTENT — an identical `author|body|createdAt` triple replays (200 `replayed:true` + `X-Annotakit-Replayed`, no duplicate) instead of appending a same-id double; send a STABLE `createdAt` per logical reply to make lost-response retries safe |
 | thread number | PER-STORY (two stories can each have a #1) — key threads by `id` |
 | pre-mapping replies | land in the issue BODY on backfill; post-mapping replies mirror as comments |
 | gh/reload | POST-only (GET → 405). Re-reads `.env`, applies CHANGES to boot-applied keys only (shell vars win); `applied/removed/tokenChanged/requiresRestart` (repo/labels/poll boot-captured → restart) |

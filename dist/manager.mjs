@@ -9,16 +9,16 @@ import {
   UI_COMMAND,
   UI_STATE,
   probeMode
-} from "./chunk-JG34ADOS.mjs";
+} from "./chunk-JPCSIDTT.mjs";
 import {
   getGhLinkedStaticStore,
   ghClientStatus,
   ghMappingRepo
-} from "./chunk-23RNGYKC.mjs";
+} from "./chunk-3MAABR6H.mjs";
 import {
   MAX_BODY_CHARS,
   renderStaticDigest
-} from "./chunk-DEMUCS72.mjs";
+} from "./chunk-56EMSXTR.mjs";
 import {
   DEFAULT_HOTKEYS,
   hotkeyLabel,
@@ -32,7 +32,7 @@ import {
 } from "./chunk-SA6YJLWN.mjs";
 
 // src/manager/index.tsx
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { addons, types, useStorybookApi, useStorybookState } from "storybook/manager-api";
 import { useTheme } from "storybook/theming";
 import { BoxIcon, CameraIcon, CheckIcon, CommentIcon, CommentsIcon, EyeIcon, EyeCloseIcon, LinkIcon, PinIcon, SyncIcon } from "@storybook/icons";
@@ -202,20 +202,25 @@ function ReviewPanel() {
       if (poll) window.clearInterval(poll);
     };
   }, [staticMode]);
+  const fetchSeqRef = useRef(0);
   const refresh = useCallback(async () => {
+    const seq = ++fetchSeqRef.current;
     try {
       if (staticMode) {
         const store = await getGhLinkedStaticStore();
+        if (seq !== fetchSeqRef.current) return;
         setThreads(store.list(scope === "story" ? storyId : void 0));
         setSnapshotIds(/* @__PURE__ */ new Set());
         setError(null);
       } else {
         const { threads: list, snapshots } = await getThreadsAndSnapshots(scope === "story" ? storyId : void 0);
+        if (seq !== fetchSeqRef.current) return;
         setThreads(list);
         setSnapshotIds(snapshots);
         setError(null);
       }
     } catch (e) {
+      if (seq !== fetchSeqRef.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
     if (staticMode) return;
@@ -596,7 +601,7 @@ function ReviewPanel() {
     background: active ? bg : "transparent",
     color: active ? "#fff" : theme.textColor
   });
-  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: theme.fontBase, fontSize: 13, padding: "8px 10px", height: "100%", overflow: "auto", color: theme.textColor } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "story"), onClick: () => setScope("story") }, "This story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "all"), onClick: () => setScope("all") }, "All stories")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "all"), onClick: () => setFilter("all"), title: "Show everything" }, "all"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "open"), onClick: () => setFilter("open"), title: "Show only open (agent work queue)" }, "open"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "active"), onClick: () => setFilter("active"), title: "Everything unresolved \u2014 open + to review + rejected (resolved excluded): the full outstanding-work view" }, "active"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "review"), onClick: () => setFilter("review"), title: "Threads the agent marked fixed \u2014 awaiting your verification (the check-latest-batch view)" }, "to review"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "rejected"), onClick: () => setFilter("rejected"), title: "Fixes you rejected \u2014 awaiting the agent's re-work (the verdict is durable)" }, "rejected")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "story"), onClick: () => changeSort("story"), title: "Stable order: story title, then thread number \u2014 resolving never reorders the list" }, "by story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "recent"), onClick: () => changeSort("recent"), title: "Latest first: most recently touched (replies, status flips, new pins) on top \u2014 the default (persisted; the 'by story' switch is remembered too)" }, "latest")), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: theme.textMutedColor } }, threads.length ? `${openCount} open${fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : ""}${rejectedCount > 0 ? ` \xB7 ${rejectedCount} rejected` : ""}${uiOrphan > 0 ? ` \xB7 ${uiOrphan} orphan` : ""} / ${threads.length} threads` : "no threads"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { style: { fontFamily: theme.fontBase, fontSize: 13, padding: "8px 10px", height: "100%", overflow: "auto", color: theme.textColor } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "story"), "aria-pressed": scope === "story", onClick: () => setScope("story") }, "This story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, scope === "all"), "aria-pressed": scope === "all", onClick: () => setScope("all") }, "All stories")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "all"), "aria-pressed": filter === "all", onClick: () => setFilter("all"), title: "Show everything" }, "all"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "open"), "aria-pressed": filter === "open", onClick: () => setFilter("open"), title: "Show only open (agent work queue)" }, "open"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "active"), "aria-pressed": filter === "active", onClick: () => setFilter("active"), title: "Everything unresolved \u2014 open + to review + rejected (resolved excluded): the full outstanding-work view" }, "active"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "review"), "aria-pressed": filter === "review", onClick: () => setFilter("review"), title: "Threads the agent marked fixed \u2014 awaiting your verification (the check-latest-batch view)" }, "to review"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, filter === "rejected"), "aria-pressed": filter === "rejected", onClick: () => setFilter("rejected"), title: "Fixes you rejected \u2014 awaiting the agent's re-work (the verdict is durable)" }, "rejected")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: "hidden" } }, /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "story"), "aria-pressed": sortMode === "story", onClick: () => changeSort("story"), title: "Stable order: story title, then thread number \u2014 resolving never reorders the list" }, "by story"), /* @__PURE__ */ React.createElement("button", { style: miniBtn(theme.colorSecondary, sortMode === "recent"), "aria-pressed": sortMode === "recent", onClick: () => changeSort("recent"), title: "Latest first: most recently touched (replies, status flips, new pins) on top \u2014 the default (persisted; the 'by story' switch is remembered too)" }, "latest")), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: theme.textMutedColor } }, threads.length ? `${openCount} open${fixedCount > 0 ? ` \xB7 ${fixedCount} to review` : ""}${rejectedCount > 0 ? ` \xB7 ${rejectedCount} rejected` : ""}${uiOrphan > 0 ? ` \xB7 ${uiOrphan} orphan` : ""} / ${threads.length} threads` : "no threads"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
     "input",
     {
       style: { padding: "3px 8px", fontSize: 11, borderRadius: 6, border: `1px solid ${theme.inputBorder || theme.appBorderColor}`, background: theme.inputBackground || "transparent", color: theme.textColor, width: 110 },
@@ -634,7 +639,7 @@ function ReviewPanel() {
     ghStat?.lastError && /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: 999, background: negativeColor, display: "inline-block" }, title: "publishing error \u2014 open for details" }),
     !ghStat?.lastError && ghStat?.configured && !ghStat.suppressed && /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: 999, background: positiveColor, display: "inline-block" }, title: "client publishing live \u2014 feedback lands on GitHub from this browser" }),
     !ghStat?.lastError && ghStat?.configured && ghStat.suppressed && /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: 999, background: "#f59e0b", display: "inline-block" }, title: ghStat.queue > 0 ? `client GH off \u2014 ${ghStat.queue} queued (holds until re-enabled)` : "client GH off (local-only)" })
-  )), ghOpen && !staticMode && /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 0", borderBottom: `1px solid ${theme.appBorderColor}`, fontSize: 11, display: "flex", flexDirection: "column", gap: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, sync ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { ...chip(sync.mode === "auto" ? `${positiveColor}22` : "#f59e0b22", sync.mode === "auto" ? positiveColor : "#b45309") } }, sync.mode === "auto" ? "auto-sync" : sync.mode === "unconfigured" ? "local mode" : "mirror off"), /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, sync.mode === "auto" && /* @__PURE__ */ React.createElement(React.Fragment, null, sync.mapped, "/", sync.threads, " threads mirrored", sync.pending > 0 ? ` \xB7 ${sync.pending} queued` : "", sync.stalled > 0 ? ` \xB7 ${sync.stalled} stalled` : "", sync.lastPushAt ? ` \xB7 pushed ${ago(sync.lastPushAt)}` : "", sync.lastPullAt ? ` \xB7 pulled ${ago(sync.lastPullAt)}` : "", sync.pollSec > 0 ? ` \xB7 polls every ${sync.pollSec}s` : "", sync.labels && sync.labels.length ? ` \xB7 labels: ${sync.labels.join(", ")}` : ""), sync.backoffUntil && /* @__PURE__ */ React.createElement(React.Fragment, null, sync.lastError ? " \xB7 " : "", "backoff until ", new Date(sync.backoffUntil).toLocaleTimeString()))) : /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "sync status unavailable (dev server offline?)"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
+  )), ghOpen && !staticMode && /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 0", borderBottom: `1px solid ${theme.appBorderColor}`, fontSize: 11, display: "flex", flexDirection: "column", gap: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, sync ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", { style: { ...chip(sync.mode === "auto" ? `${positiveColor}22` : "#f59e0b22", sync.mode === "auto" ? positiveColor : "#b45309") } }, sync.mode === "auto" ? "auto-sync" : sync.mode === "unconfigured" ? "local mode" : "mirror off"), /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, sync.mode === "auto" && /* @__PURE__ */ React.createElement(React.Fragment, null, sync.mapped, "/", sync.threads, " threads mirrored", sync.detached > 0 ? ` \xB7 ${sync.detached} detached` : "", sync.pending > 0 ? ` \xB7 ${sync.pending} queued` : "", sync.stalled > 0 ? ` \xB7 ${sync.stalled} stalled` : "", sync.lastPushAt ? ` \xB7 pushed ${ago(sync.lastPushAt)}` : "", sync.lastPullAt ? ` \xB7 pulled ${ago(sync.lastPullAt)}` : "", sync.pollSec > 0 ? ` \xB7 polls every ${sync.pollSec}s` : "", sync.labels && sync.labels.length ? ` \xB7 labels: ${sync.labels.join(", ")}` : ""), sync.backoffUntil && /* @__PURE__ */ React.createElement(React.Fragment, null, sync.lastError ? " \xB7 " : "", "backoff until ", new Date(sync.backoffUntil).toLocaleTimeString()))) : /* @__PURE__ */ React.createElement("span", { style: { color: theme.textMutedColor } }, "sync status unavailable (dev server offline?)"), /* @__PURE__ */ React.createElement("span", { style: { flex: 1 } }), /* @__PURE__ */ React.createElement(
     "button",
     {
       style: { padding: "3px 10px", fontSize: 11, fontWeight: 700, cursor: syncing ? "default" : "pointer", borderRadius: 6, border: "none", background: theme.colorSecondary, color: "#fff", display: "inline-flex", gap: 4, alignItems: "center" },
@@ -756,15 +761,18 @@ function ReviewPanel() {
         /* @__PURE__ */ React.createElement(LinkIcon, { width: 10, height: 10 }),
         " ",
         t.gh.issue
-      ), t.gh && ghStat?.configured && ghStat.repo && ghMappingRepo(t.gh) !== null && ghMappingRepo(t.gh) !== ghStat.repo && /* @__PURE__ */ React.createElement(
-        "span",
-        {
-          title: `mirror DETACHED \u2014 issue #${t.gh.issue} lives on ${ghMappingRepo(t.gh)}, the active repo is ${ghStat.repo}. This thread is frozen (no push, no pull, no close). Restore the repo setting or unlink the thread to re-mirror.`,
-          style: chip("#7c2d1233", "#fb7185"),
-          onClick: (e) => e.stopPropagation()
-        },
-        "detached"
-      ), t.component?.name && /* @__PURE__ */ React.createElement("span", { style: chip(`${theme.colorSecondary}18`, theme.colorSecondary) }, t.component.name), t.transient && /* @__PURE__ */ React.createElement(
+      ), (() => {
+        const activeRepo = ghStat?.repo ?? health?.gh?.repo;
+        return t.gh && activeRepo && ghMappingRepo(t.gh) !== null && ghMappingRepo(t.gh) !== activeRepo ? /* @__PURE__ */ React.createElement(
+          "span",
+          {
+            title: `mirror DETACHED \u2014 issue #${t.gh.issue} lives on ${ghMappingRepo(t.gh)}, the active repo is ${activeRepo}. This thread is frozen (no push, no pull, no close). Restore the repo setting or unlink the thread to re-mirror.`,
+            style: chip("#7c2d1233", "#fb7185"),
+            onClick: (e) => e.stopPropagation()
+          },
+          "detached"
+        ) : null;
+      })(), t.component?.name && /* @__PURE__ */ React.createElement("span", { style: chip(`${theme.colorSecondary}18`, theme.colorSecondary) }, t.component.name), t.transient && /* @__PURE__ */ React.createElement(
         "span",
         {
           style: chip("#0c4a6e18", "#0369a1"),

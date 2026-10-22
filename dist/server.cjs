@@ -77,7 +77,9 @@ CREATE TABLE IF NOT EXISTS counters (
 );
 CREATE TABLE IF NOT EXISTS tombstones (
   issue INTEGER PRIMARY KEY,
-  done INTEGER NOT NULL DEFAULT 0
+  done INTEGER NOT NULL DEFAULT 0,
+  repo TEXT,
+  thread_id TEXT
 );
 CREATE TABLE IF NOT EXISTS snapshots (
   thread_id TEXT PRIMARY KEY,
@@ -92,6 +94,11 @@ function sqliteStore(db, storePath) {
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA busy_timeout = 3000;");
   db.exec(SCHEMA);
+  {
+    const cols = new Set(db.prepare("PRAGMA table_info(tombstones)").all().map((r) => String(r.name)));
+    if (!cols.has("repo")) db.exec("ALTER TABLE tombstones ADD COLUMN repo TEXT");
+    if (!cols.has("thread_id")) db.exec("ALTER TABLE tombstones ADD COLUMN thread_id TEXT");
+  }
   const rowToThread = (row) => JSON.parse(row.payload);
   const listThreads = async (filter) => {
     const where = [];
@@ -199,11 +206,13 @@ function sqliteStore(db, storePath) {
     } catch {
     }
   };
-  const tombstone = async (issue) => {
+  const tombstone = async (issue, repo, threadId) => {
     if (!Number.isFinite(issue) || issue <= 0) return;
-    db.prepare("INSERT OR IGNORE INTO tombstones (issue, done) VALUES (?, 0)").run(issue);
+    db.prepare(
+      "INSERT INTO tombstones (issue, done, repo, thread_id) VALUES (?, 0, ?, ?) ON CONFLICT(issue) DO UPDATE SET repo = excluded.repo, thread_id = excluded.thread_id"
+    ).run(issue, repo ?? null, threadId ?? null);
   };
-  const listOpenTombstones = async () => db.prepare("SELECT issue FROM tombstones WHERE done = 0 ORDER BY issue ASC").all().map((r) => Number(r.issue));
+  const listOpenTombstones = async () => db.prepare("SELECT issue, repo, thread_id FROM tombstones WHERE done = 0 ORDER BY issue ASC").all().map((r) => ({ issue: Number(r.issue), repo: r.repo == null ? void 0 : String(r.repo), threadId: r.thread_id == null ? void 0 : String(r.thread_id) }));
   const tombstoneDone = async (issue) => {
     db.prepare("DELETE FROM tombstones WHERE issue = ?").run(issue);
   };
@@ -429,14 +438,19 @@ function jsonStore(storePath) {
       return doc.threads.length;
     },
     checkpoint: () => void 0,
-    tombstone: (issue) => mutate(async () => {
-      if (Number.isFinite(issue) && issue > 0 && !doc.tombstones.some((t) => t.issue === issue)) {
-        doc.tombstones.push({ issue, done: false });
+    tombstone: (issue, repo, threadId) => mutate(async () => {
+      if (Number.isFinite(issue) && issue > 0) {
+        const existing = doc.tombstones.find((t) => t.issue === issue);
+        if (!existing) doc.tombstones.push({ issue, done: false, repo, threadId });
+        else {
+          existing.repo = repo;
+          existing.threadId = threadId;
+        }
       }
     }),
     listOpenTombstones: async () => {
       await loadRead();
-      return doc.tombstones.filter((t) => !t.done).map((t) => t.issue);
+      return doc.tombstones.filter((t) => !t.done).map((t) => ({ issue: t.issue, repo: t.repo, threadId: t.threadId }));
     },
     tombstoneDone: (issue) => mutate(async () => {
       doc.tombstones = doc.tombstones.filter((t) => t.issue !== issue);
@@ -542,13 +556,22 @@ async function migrateLegacyStore(configDir, store, currentDataDir) {
   }
   return 0;
 }
+var configWarnings = [];
 function readConfig(configDir) {
+  const fsSync2 = __require("fs");
+  const file = path2__default.default.resolve(configDir, "annotakit.config.json");
+  let raw;
   try {
-    const fsSync2 = __require("fs");
-    return JSON.parse(
-      fsSync2.readFileSync(path2__default.default.resolve(configDir, "annotakit.config.json"), "utf8")
-    );
+    raw = fsSync2.readFileSync(file, "utf8");
   } catch {
+    return {};
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    const msg = `annotakit.config.json is not valid JSON (${err instanceof Error ? err.message : String(err)}) \u2014 IGNORED, defaults apply. Fix the file to restore its settings.`;
+    console.warn(`[storybook-annotakit] ${msg}`);
+    configWarnings.push(msg);
     return {};
   }
 }
@@ -1487,6 +1510,7 @@ function createGhSync(opts) {
     }
   };
   let lastStalledSweep = Date.now();
+  const parkedTombstoneWarned = /* @__PURE__ */ new Set();
   const configured = () => {
     const t = token();
     if (!t) return { error: missingTokenMessage(configPath) };
@@ -1958,22 +1982,35 @@ reopened in Storybook \u2014 thread #${t.number}.`;
       }
     }
     const deletedIds = await store.listDeletedIds();
-    for (const issueNumber of await store.listOpenTombstones()) {
+    for (const ts of await store.listOpenTombstones()) {
+      const issueNumber = ts.issue;
       try {
-        let bodyStamp = null;
-        try {
-          const target = await getIssue(tk, rp, issueNumber);
-          const m = typeof target.body === "string" ? target.body.match(/^- thread id: (.+)$/m) : null;
-          bodyStamp = m?.[1]?.trim() ?? null;
-        } catch {
-          bodyStamp = null;
+        if (ts.repo && ts.repo !== rp) {
+          if (!parkedTombstoneWarned.has(issueNumber)) {
+            parkedTombstoneWarned.add(issueNumber);
+            console.warn(`[storybook-annotakit] gh-sync: close of issue #${issueNumber} PARKED \u2014 it lives on ${ts.repo}, the mirror now targets ${rp} (restoring the repo setting will land this close on the original issue)`);
+          }
+          continue;
         }
-        if (bodyStamp !== null && !deletedIds.has(bodyStamp)) {
-          console.warn(`[storybook-annotakit] gh-sync: tombstone close of issue #${issueNumber} SKIPPED \u2014 its body stamp (${bodyStamp.slice(0, 24)}\u2026) is not one of our deleted threads on ${rp} (foreign issue after a repo change?)`);
+        let target = null;
+        try {
+          target = await getIssue(tk, rp, issueNumber);
+        } catch (err) {
+          if (err?.status === 404) {
+            await store.tombstoneDone(issueNumber);
+            closedTombstones++;
+            continue;
+          }
+          throw err;
+        }
+        const m = typeof target.body === "string" ? target.body.match(/^- thread id: (.+)$/m) : null;
+        const bodyStamp = m?.[1]?.trim() ?? null;
+        if (bodyStamp === null || !deletedIds.has(bodyStamp)) {
+          console.warn(`[storybook-annotakit] gh-sync: tombstone close of issue #${issueNumber} SKIPPED \u2014 ${bodyStamp === null ? "its body carries no thread-id stamp (not ours?)" : `its body stamp (${bodyStamp.slice(0, 24)}\u2026) is not one of our deleted threads`} on ${rp}`);
           await store.tombstoneDone(issueNumber);
           continue;
         }
-        if (remote.get(issueNumber)?.state !== "closed") {
+        if (target.state !== "closed") {
           await addIssueComment(tk, rp, issueNumber, `${GH_SENTINEL}
 thread deleted in Storybook \u2014 closing.`);
           await setIssueState(tk, rp, issueNumber, "closed");
@@ -1981,11 +2018,6 @@ thread deleted in Storybook \u2014 closing.`);
         await store.tombstoneDone(issueNumber);
         closedTombstones++;
       } catch (err) {
-        if (err?.status === 404) {
-          await store.tombstoneDone(issueNumber);
-          closedTombstones++;
-          continue;
-        }
         lastError = `tombstone close failed (issue #${issueNumber}): ${err instanceof Error ? err.message : String(err)}`;
         pullHadError = true;
       }
@@ -2009,8 +2041,8 @@ thread deleted in Storybook \u2014 closing.`);
     queued.add(threadId);
     queue.push(threadId);
   };
-  const enqueueDelete = (issue) => {
-    void store.tombstone(issue).then(() => {
+  const enqueueDelete = (issue, tombRepo, threadId) => {
+    void store.tombstone(issue, tombRepo, threadId).then(() => {
       if (opts.enabled && token() && repo) {
         void run(pullOnceRaw).catch((err) => {
           const e = err;
@@ -2070,7 +2102,7 @@ thread deleted in Storybook \u2014 closing.`);
     }
     if (pushError) lastError = pushError;
     const stalled = (await stalledThreads()).length;
-    return { ok: true, created, pushed, pulled, healed, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled, backoffActive: Date.now() < backoffUntil };
+    return { ok: true, created, pushed, pulled, healed, closedTombstones, issuesTotal: created + threadsNow.filter((t) => t.gh).length, stalled, backoffActive: Date.now() < backoffUntil, lastError: lastError || void 0 };
   };
   const syncAll = async () => {
     const cfg = configured();
@@ -2312,6 +2344,7 @@ function createAutoSync(opts) {
   let readmeSha = null;
   let legacyReadmeShas = null;
   let everPushed = false;
+  let noCredLocalMode = false;
   let consecutivePushFailures = 0;
   let lastPushError = null;
   let lastSyncAt = null;
@@ -2438,6 +2471,7 @@ function createAutoSync(opts) {
       return { ok: false, out: "empty-sha guard" };
     }
     if (!repo) return { ok: false, out: "no remote" };
+    if (noCredLocalMode) return { ok: false, out: "local mode (no push credential)" };
     maybeWarnArgvAuth();
     const token = ghToken();
     const url = `https://github.com/${repo}.git`;
@@ -2656,6 +2690,7 @@ function createAutoSync(opts) {
           }
           return false;
         }
+        noCredLocalMode = noCredLocalMode && !ghToken();
         let push = await pushCommit(commit, timeoutMs);
         let pushedSha = commit;
         let pushedParent = parent;
@@ -2686,7 +2721,12 @@ function createAutoSync(opts) {
           }
         }
         if (!push.ok) {
-          if (repo) {
+          if (repo && !ghToken()) {
+            noCredLocalMode = true;
+            state = "local mode \u2014 no push credential; branch updated locally (set ANNOTAKIT_GH_TOKEN in .env to push)";
+            lastSyncAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
+            await gitAsync(root, ["update-ref", `refs/heads/${branch}`, commit], timeoutMs);
+          } else if (repo) {
             consecutivePushFailures += 1;
             lastPushError = redact(push.out).slice(0, 200) || "git push failed";
             lastSyncAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
@@ -2853,7 +2893,7 @@ var THREADS_CHANGED = "annotakit/threads-changed";
 var API_BASE = "/annotakit/api";
 
 // src/server/routes.ts
-var VERSION = "0.6.15";
+var VERSION = "0.6.16";
 var BOOTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var CONFIG_FILE = "annotakit.config.json";
 var GH_LABEL = "annotakit";
@@ -2887,9 +2927,10 @@ function bootstrap(configDir, port) {
   const root = projectRoot(configDir);
   const detected = detectGithubRepo(root);
   const configRepoRaw = typeof config.ghRepo === "string" ? config.ghRepo : null;
+  const configRepoPresent = config.ghRepo !== void 0 && config.ghRepo !== null;
   const configRepo = configRepoRaw !== null ? normalizeGhRepoInput(configRepoRaw) : null;
   const envRepo = ghRepoEnv();
-  const repo = configRepoRaw !== null ? configRepo : envRepo ?? detected.repo;
+  const repo = configRepoPresent ? configRepo : envRepo ?? detected.repo;
   const ghLabels = resolveGhLabels(config);
   const shutdownHooks = [];
   const sync = createAutoSync({
@@ -2907,10 +2948,10 @@ function bootstrap(configDir, port) {
   });
   const repoSource = configRepo ? `${CONFIG_FILE} ghRepo` : envRepo ? "ANNOTAKIT_GH_REPO env" : detected.source;
   const configToken = typeof config.ghToken === "string" ? config.ghToken : void 0;
-  const bootWarnings = [];
-  if (configRepoRaw !== null && configRepo === null) {
+  const bootWarnings = [...configWarnings];
+  if (configRepoPresent && configRepo === null) {
     bootWarnings.push(
-      `${CONFIG_FILE} "ghRepo" ${JSON.stringify(configRepoRaw)} is not a valid GitHub repo \u2014 expected "owner/name" (github.com URLs and the github: shorthand normalize). The GitHub mirror stays OFF instead of arming a dead target; fix the value to enable mirroring.`
+      `${CONFIG_FILE} "ghRepo" ${JSON.stringify(config.ghRepo)} is not a valid GitHub repo \u2014 expected "owner/name" as a string (github.com URLs and the github: shorthand normalize). The GitHub mirror stays OFF instead of arming a dead target; fix the value to enable mirroring.`
     );
   }
   const kit = kitRepo();
@@ -3043,7 +3084,7 @@ function applyCors(req, res, methods = "GET,POST,PATCH,DELETE,OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", origin);
     let allow = methods;
     try {
-      const path4 = new URL(req.url ?? "/", "http://localhost").pathname;
+      const path4 = new URL(req.url ?? "/", "http://localhost").pathname.replace(/\/+$/, "") || "/";
       const known = KNOWN_API_ROUTES.find(([re]) => re.test(path4));
       if (known) allow = known[1];
     } catch {
@@ -3105,6 +3146,7 @@ var ROUTE_404_HINT = "unknown route \u2014 GET /annotakit/api/schema documents e
 var warnedStories = /* @__PURE__ */ new Set();
 function warnUnknownStory(storyId, hasImportPath) {
   if (hasImportPath || warnedStories.has(storyId)) return;
+  if (warnedStories.size > 500) warnedStories.clear();
   warnedStories.add(storyId);
   console.warn(
     `[storybook-annotakit] note: thread created for storyId ${JSON.stringify(storyId)} WITHOUT story metadata (importPath) \u2014 digests will show a bare story-id section with no story file. Pass story: {title, name, importPath} when you have it; a typo'd storyId is invisible to the server.`
@@ -3146,7 +3188,7 @@ function stableCommentId(author, body, createdAt) {
   return "c_" + crypto.createHash("sha256").update(`${author}|${body}|${createdAt}`).digest("base64url").slice(0, 12);
 }
 function normalizeComment(c) {
-  if (!c.author?.trim()) c.author = "anonymous";
+  if (typeof c.author !== "string" || !c.author.trim()) c.author = "anonymous";
   if (!c.createdAt) c.createdAt = nowIso();
   c.id = stableCommentId(c.author, c.body, c.createdAt);
   return c;
@@ -3182,12 +3224,22 @@ function validateThreadInput(body) {
   const comments = Array.isArray(body.comments) ? body.comments : [];
   if (!storyId) throw Object.assign(new Error("storyId is required"), { status: 400 });
   validateTargetShape(target);
+  if (body.id !== void 0 && typeof body.id !== "string") {
+    throw Object.assign(new Error(`thread id must be a string (client-minted th_\u2026 for replay-safe retries; got ${typeof body.id})`), { status: 400 });
+  }
   if (comments.length === 0) {
     throw Object.assign(new Error("at least one comment is required"), { status: 400 });
   }
   for (const c of comments) {
-    if (!c.body?.trim()) throw Object.assign(new Error("comment body is required"), { status: 400 });
-    if (typeof c.body !== "string") throw Object.assign(new Error("comment body must be a string"), { status: 400 });
+    if (c === null || typeof c !== "object" || Array.isArray(c)) {
+      throw Object.assign(new Error("each comment must be an object (author, body, createdAt?)"), { status: 400 });
+    }
+    if (typeof c.body !== "string" || !c.body.trim()) {
+      throw Object.assign(new Error("comment body is required (a non-empty string)"), { status: 400 });
+    }
+    if (c.author !== void 0 && c.author !== null && typeof c.author !== "string") {
+      throw Object.assign(new Error(`comment author must be a string when present (got ${typeof c.author})`), { status: 400 });
+    }
     if (c.body.length > MAX_BODY_CHARS) {
       throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars \u2014 the full body stays in the store/json export; keep evidence links instead of pasting whole logs)`), { status: 413 });
     }
@@ -3232,13 +3284,24 @@ function buildPatchCandidate(prev, body) {
   }
   return next;
 }
+var KNOWN_STATUSES = /* @__PURE__ */ new Set(["open", "fixed", "rejected", "resolved"]);
+function parseStatusParam(url) {
+  const raw = url.searchParams.get("status");
+  if (raw === null || raw === "") return void 0;
+  const s = raw.toLowerCase();
+  if (!KNOWN_STATUSES.has(s)) {
+    throw Object.assign(new Error(`unknown status ${JSON.stringify(raw)} \u2014 use ?status=open|fixed|rejected|resolved (omit for all threads)`), { status: 400 });
+  }
+  return s;
+}
 function groupByStory(threads, origin) {
   const map = /* @__PURE__ */ new Map();
   for (const t of threads) {
     let entry = map.get(t.storyId);
     if (!entry) {
+      const storyUrl = `${origin}/?path=/story/${t.storyId}`;
       entry = {
-        story: { ...t.story, url: t.story.url ?? `${origin}/?path=/story/${t.storyId}` },
+        story: t.story ? { ...t.story, url: t.story.url ?? storyUrl } : { storyId: t.storyId, url: storyUrl },
         counts: { open: 0, fixed: 0, rejected: 0, resolved: 0 },
         threads: []
       };
@@ -3300,7 +3363,7 @@ async function handleApi(req, res, url, configDir, origin) {
       COMMENT: {
         url: `${API_BASE}/threads/<id>/comments`,
         body: { author: "agent", body: "fixed in abc123" },
-        note: "returns the FULL updated thread doc (201), not the comment; comment bodies capped at 64000 chars"
+        note: "returns the FULL updated thread doc (201), not the comment; comment bodies capped at 64000 chars. v0.6.16: idempotent retries \u2014 an identical author|body|createdAt POST replays (200 + replayed:true, no duplicate); a stable client-minted createdAt is the idempotency key"
       },
       DELETE: { url: `${API_BASE}/threads/<id>` },
       SNAPSHOT: {
@@ -3364,7 +3427,7 @@ async function handleApi(req, res, url, configDir, origin) {
         storyId: url.searchParams.get("storyId") ?? void 0,
         // H-A-12: the filter is case-exact in sqlite — normalize so
         // ?status=Open (an easy agent typo) matches like the PATCH normalizer
-        status: url.searchParams.get("status")?.toLowerCase() || void 0
+        status: parseStatusParam(url)
       });
       const sort = url.searchParams.get("sort")?.toLowerCase() || null;
       if (sort !== null && sort !== "recent") {
@@ -3405,8 +3468,8 @@ async function handleApi(req, res, url, configDir, origin) {
       if (!id) throw Object.assign(new Error("?id= required"), { status: 400 });
       const prev = await store.getThread(id);
       const ok = await store.deleteThread(id);
-      if (!ok) return notFound(res), true;
-      if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
+      if (!ok) return notFound(res, THREAD_404_HINT), true;
+      if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue, prev.gh.repo, prev.id);
       afterMutation(rt, { storyId: prev?.storyId, threadId: void 0, reason: "deleted" });
       sendJson(res, 200, { ok: true });
       return true;
@@ -3425,7 +3488,7 @@ async function handleApi(req, res, url, configDir, origin) {
       const prev = await store.getThread(id);
       const ok = await store.deleteThread(id);
       if (!ok) return notFound(res, THREAD_404_HINT), true;
-      if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
+      if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue, prev.gh.repo, prev.id);
       afterMutation(rt, { storyId: prev?.storyId, threadId: void 0, reason: "deleted" });
       sendJson(res, 200, { ok: true });
       return true;
@@ -3569,11 +3632,17 @@ async function handleApi(req, res, url, configDir, origin) {
         body: commentBody,
         createdAt: typeof body.createdAt === "string" ? body.createdAt : nowIso()
       });
-      thread.comments.push(comment);
-      const updated = await store.updateThread(thread);
-      if (!updated) return notFound(res), true;
-      afterMutation(rt, { storyId: updated.storyId, threadId: updated.id, reason: "commented" });
-      await sendMutationJson(rt, res, 201, updated);
+      const replay = thread.comments.some((c) => c.id === comment.id);
+      if (!replay) thread.comments.push(comment);
+      if (!replay) {
+        const updated = await store.updateThread(thread);
+        if (!updated) return notFound(res), true;
+        afterMutation(rt, { storyId: updated.storyId, threadId: updated.id, reason: "commented" });
+        await sendMutationJson(rt, res, 201, updated);
+      } else {
+        res.setHeader("X-Annotakit-Replayed", "1");
+        await sendJson(res, 200, { ...thread, replayed: true });
+      }
       return true;
     }
   }
@@ -3601,8 +3670,11 @@ async function handleApi(req, res, url, configDir, origin) {
         html,
         clipped: body.clipped === true,
         capturedAt: typeof body.capturedAt === "string" ? body.capturedAt : nowIso(),
-        width: Math.round(Number(body.width) || 800),
-        height: Math.round(Number(body.height) || 600),
+        // v0.6.16 (56-a P3-5): hostile dims (1e9 / negative) used to store
+        // verbatim — the evidence page and the recall mounted a billion-px
+        // layout. Clamp like the scroll fields below (scroll's ≥0 precedent).
+        width: Math.max(0, Math.min(2e4, Math.round(Number(body.width)) || 800)),
+        height: Math.max(0, Math.min(2e4, Math.round(Number(body.height)) || 600)),
         // v0.6.9 (S3): the frozen-container shape marker — additive; the
         // legacy story-root shape simply lacks it (old snapshots).
         surface: body.surface === "frozen" ? "frozen" : void 0,
@@ -3615,14 +3687,14 @@ async function handleApi(req, res, url, configDir, origin) {
     }
     if (method === "GET" || method === "HEAD") {
       const snap = await store.getSnapshot(id);
-      if (!snap) return notFound(res, THREAD_404_HINT), true;
+      if (!snap) return notFound(res, "this thread has no snapshot (plan-b evidence is optional \u2014 PUT one first, or check the thread doc)"), true;
       const fmt = url.searchParams.get("format");
       if (fmt !== null && fmt !== "html" && fmt !== "json") {
         throw Object.assign(new Error(`unknown format ${JSON.stringify(fmt)} \u2014 use ?format=html (human view) or omit for JSON`), { status: 400 });
       }
       if (fmt === "html") {
         const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-        const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'; frame-src 'none'"><title>annotakit snapshot ${esc(id)}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped (capture exceeded the client size cap)</div>' : ""}</body></html>`;
+        const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'; frame-src 'none'; object-src 'none'"><title>annotakit snapshot ${esc(id)}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped (capture exceeded the client size cap)</div>' : ""}</body></html>`;
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
         res.end(method === "HEAD" ? void 0 : page);
         return true;
@@ -3638,7 +3710,7 @@ async function handleApi(req, res, url, configDir, origin) {
   }
   if (p === `${API_BASE}/export` && method === "GET") {
     const storyId = url.searchParams.get("storyId") ?? void 0;
-    const status = url.searchParams.get("status")?.toLowerCase() || void 0;
+    const status = parseStatusParam(url);
     const threads = await store.listThreads({ storyId, status });
     const stories = groupByStory(threads, origin);
     const snapshotIds = await store.listSnapshotIds();
@@ -3752,6 +3824,13 @@ function createMiddleware(configDir) {
       return;
     }
     if (url.pathname === "/annotakit/" || url.pathname === "/annotakit") {
+      applyCors(req, res);
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      if (!enforceApiAccess(req, res)) return;
       res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
       res.end(`storybook-annotakit ${VERSION} \u2014 API at ${API_BASE}/* (health, threads, export, gh)`);
       return;

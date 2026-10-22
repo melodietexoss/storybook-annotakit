@@ -13,7 +13,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { getStore, migrateLegacyStore, nowIso, readConfig, TombstonedIdError, type Store } from './store';
+import { configWarnings, getStore, migrateLegacyStore, nowIso, readConfig, TombstonedIdError, type Store } from './store';
 import { renderDigest } from './digest';
 import { STATUS_RANK } from './merge';
 import { createGhSync, type GhSync } from './ghsync';
@@ -37,7 +37,7 @@ import { API_BASE, THREADS_CHANGED, type ThreadsChangedPayload } from '../shared
 import { MAX_BODY_CHARS } from '../shared/types';
 import type { AgentSurfaces, Comment, DomSnapshot, ExportBundle, ExportedStory, GhSyncStatus, GhSyncSummary, HealthInfo, Thread, ThreadInput } from '../shared/types';
 
-const VERSION = '0.6.15';
+const VERSION = '0.6.16';
 /** Boot timestamp — lets scripts/agents VERIFY a restart actually happened
  *  (a health-check loop can pass instantly against a stale process). */
 const BOOTED_AT = new Date().toISOString();
@@ -126,9 +126,13 @@ function bootstrap(configDir: string, port?: number): Runtime {
   // + a boot warning) — falling through to env/detection would silently
   // re-target the mirror at a different repo (wrong-repo data leak).
   const configRepoRaw = typeof config.ghRepo === 'string' ? config.ghRepo : null;
+  // v0.6.16 (56-a P3-3): PRESENCE, not string-ness, owns the decision — a
+  // present-but-non-string ghRepo (42, ["a/b"]) used to fall through to
+  // env/detection, the exact silent re-target Y3 kills for garbage strings.
+  const configRepoPresent = config.ghRepo !== undefined && config.ghRepo !== null;
   const configRepo = configRepoRaw !== null ? normalizeGhRepoInput(configRepoRaw) : null;
   const envRepo = ghRepoEnv();
-  const repo = configRepoRaw !== null ? configRepo : (envRepo ?? detected.repo);
+  const repo = configRepoPresent ? configRepo : (envRepo ?? detected.repo);
   const ghLabels = resolveGhLabels(config);
   // C14: the sync shutdown flush awaits these BEFORE its final git cycle —
   // ghsync.stop() settles any in-flight engine op so stamped rows reach the
@@ -151,13 +155,13 @@ function bootstrap(configDir: string, port?: number): Runtime {
   const configToken = typeof config.ghToken === 'string' ? config.ghToken : undefined;
 
   /* boot hygiene (dogfood #3/#9) — collected, logged once, surfaced in /health */
-  const bootWarnings: string[] = [];
+  const bootWarnings: string[] = [...configWarnings]; // 56-a P3-3: corrupt-config parse failures surface in /health
   // Y3: a refused config ghRepo must be LOUD — the user explicitly asked for
   // a mirror target and got none (unconfigured is honest, a silently-dead
   // or silently-retargeted engine is not)
-  if (configRepoRaw !== null && configRepo === null) {
+  if (configRepoPresent && configRepo === null) {
     bootWarnings.push(
-      `${CONFIG_FILE} "ghRepo" ${JSON.stringify(configRepoRaw)} is not a valid GitHub repo — expected "owner/name" (github.com URLs and the github: shorthand normalize). The GitHub mirror stays OFF instead of arming a dead target; fix the value to enable mirroring.`,
+      `${CONFIG_FILE} "ghRepo" ${JSON.stringify(config.ghRepo)} is not a valid GitHub repo — expected "owner/name" as a string (github.com URLs and the github: shorthand normalize). The GitHub mirror stays OFF instead of arming a dead target; fix the value to enable mirroring.`,
     );
   }
   // #3 cross-repo leak: mirroring into the kit's OWN repo is the demo/dogfood
@@ -358,7 +362,10 @@ function applyCors(req: IncomingMessage, res: ServerResponse, methods = 'GET,POS
     // advertises POST. Falls back to the passed list for unknown paths.
     let allow = methods;
     try {
-      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      // v0.6.16 (56-a P4): tolerate trailing slashes in the lookup — a
+      // /threads/ preflight used to miss the 405 table and get the global
+      // method superset.
+      const path = new URL(req.url ?? '/', 'http://localhost').pathname.replace(/\/+$/, '') || '/';
       const known = KNOWN_API_ROUTES.find(([re]) => re.test(path));
       if (known) allow = known[1];
     } catch { /* keep the default */ }
@@ -438,6 +445,9 @@ const ROUTE_404_HINT = 'unknown route — GET /annotakit/api/schema documents ev
 const warnedStories = new Set<string>();
 function warnUnknownStory(storyId: string, hasImportPath: boolean): void {
   if (hasImportPath || warnedStories.has(storyId)) return;
+  // v0.6.16 (56-a P4): cap the latch — unbounded growth in a long-lived dev
+  // server (one entry per unique storyId) for no recall benefit.
+  if (warnedStories.size > 500) warnedStories.clear();
   warnedStories.add(storyId);
   console.warn(
     `[storybook-annotakit] note: thread created for storyId ${JSON.stringify(storyId)} WITHOUT story metadata (importPath) — digests will show a bare story-id section with no story file. Pass story: {title, name, importPath} when you have it; a typo'd storyId is invisible to the server.`,
@@ -496,7 +506,10 @@ function stableCommentId(author: string, body: string, createdAt: string): strin
 }
 
 function normalizeComment(c: Comment): Comment {
-  if (!c.author?.trim()) c.author = 'anonymous';
+  // v0.6.16 (56-a P3-1): typeof-guard the coercions — a hostile non-string
+  // author (5) used to throw `c.author?.trim is not a function` past every
+  // caller that pre-validated nothing.
+  if (typeof c.author !== 'string' || !c.author.trim()) c.author = 'anonymous';
   if (!c.createdAt) c.createdAt = nowIso();
   c.id = stableCommentId(c.author, c.body, c.createdAt);
   return c;
@@ -543,12 +556,29 @@ function validateThreadInput(body: Record<string, unknown>): ThreadInput {
   const comments = Array.isArray(body.comments) ? (body.comments as Comment[]) : [];
   if (!storyId) throw Object.assign(new Error('storyId is required'), { status: 400 });
   validateTargetShape(target);
+  // v0.6.16 (56-a P2-2): a non-string id used to reach sqlite's binder —
+  // {} leaked bind internals as a 500, 123456 stored under '123456.0' (REAL
+  // bind) making the thread unreachable by its own returned id. The PATCH
+  // door has gated this since C11; the POST door now matches.
+  if (body.id !== undefined && typeof body.id !== 'string') {
+    throw Object.assign(new Error(`thread id must be a string (client-minted th_… for replay-safe retries; got ${typeof body.id})`), { status: 400 });
+  }
   if (comments.length === 0) {
     throw Object.assign(new Error('at least one comment is required'), { status: 400 });
   }
   for (const c of comments) {
-    if (!c.body?.trim()) throw Object.assign(new Error('comment body is required'), { status: 400 });
-    if (typeof c.body !== 'string') throw Object.assign(new Error('comment body must be a string'), { status: 400 });
+    // v0.6.16 (56-a P3-1): the C11 gates used to live at the PATCH door only
+    // — null entries / non-string body / non-string author crashed
+    // normalizeComment with a 500 here. Gate the shape BEFORE the ?. calls.
+    if (c === null || typeof c !== 'object' || Array.isArray(c)) {
+      throw Object.assign(new Error('each comment must be an object (author, body, createdAt?)'), { status: 400 });
+    }
+    if (typeof c.body !== 'string' || !c.body.trim()) {
+      throw Object.assign(new Error('comment body is required (a non-empty string)'), { status: 400 });
+    }
+    if (c.author !== undefined && c.author !== null && typeof c.author !== 'string') {
+      throw Object.assign(new Error(`comment author must be a string when present (got ${typeof c.author})`), { status: 400 });
+    }
     if (c.body.length > MAX_BODY_CHARS) {
       throw Object.assign(new Error(`comment body too large (max ${MAX_BODY_CHARS} chars — the full body stays in the store/json export; keep evidence links instead of pasting whole logs)`), { status: 413 });
     }
@@ -610,6 +640,22 @@ function buildPatchCandidate(prev: Thread, body: Record<string, unknown>): Threa
   return next as unknown as Thread;
 }
 
+/** v0.6.16 (56-a P3-2): ?status= used to accept ANY string — a typo
+ * ("banana") silently returned an EMPTY 200, reading as "no threads". The
+ * sort/format/mode params all 400 on unknown values (the house convention:
+ * never silently ignored); status now matches. '' = absent (the storyId
+ * param's convention). */
+const KNOWN_STATUSES = new Set(['open', 'fixed', 'rejected', 'resolved']);
+function parseStatusParam(url: URL): string | undefined {
+  const raw = url.searchParams.get('status');
+  if (raw === null || raw === '') return undefined;
+  const s = raw.toLowerCase();
+  if (!KNOWN_STATUSES.has(s)) {
+    throw Object.assign(new Error(`unknown status ${JSON.stringify(raw)} — use ?status=open|fixed|rejected|resolved (omit for all threads)`), { status: 400 });
+  }
+  return s;
+}
+
 /* ---------------------------------- routes ----------------------------------- */
 
 function groupByStory(threads: Thread[], origin: string): ExportedStory[] {
@@ -617,8 +663,13 @@ function groupByStory(threads: Thread[], origin: string): ExportedStory[] {
   for (const t of threads) {
     let entry = map.get(t.storyId);
     if (!entry) {
+      // v0.6.16 (56-a P2-1): the PATCH door explicitly admits `story: null`
+      // ("no story metadata" — frozen-view pins), but this reader spread
+      // `t.story.url` on null → every later /export + digest 500'd until
+      // someone re-PATCHed an object. Mirror the static twin's null-guard.
+      const storyUrl = `${origin}/?path=/story/${t.storyId}`;
       entry = {
-        story: { ...t.story, url: t.story.url ?? `${origin}/?path=/story/${t.storyId}` },
+        story: t.story ? { ...t.story, url: t.story.url ?? storyUrl } : { storyId: t.storyId, url: storyUrl },
         counts: { open: 0, fixed: 0, rejected: 0, resolved: 0 },
         threads: [],
       };
@@ -696,7 +747,7 @@ async function handleApi(
       COMMENT: {
         url: `${API_BASE}/threads/<id>/comments`,
         body: { author: 'agent', body: 'fixed in abc123' },
-        note: 'returns the FULL updated thread doc (201), not the comment; comment bodies capped at 64000 chars',
+        note: 'returns the FULL updated thread doc (201), not the comment; comment bodies capped at 64000 chars. v0.6.16: idempotent retries — an identical author|body|createdAt POST replays (200 + replayed:true, no duplicate); a stable client-minted createdAt is the idempotency key',
       },
       DELETE: { url: `${API_BASE}/threads/<id>` },
       SNAPSHOT: {
@@ -766,7 +817,7 @@ async function handleApi(
         storyId: url.searchParams.get('storyId') ?? undefined,
         // H-A-12: the filter is case-exact in sqlite — normalize so
         // ?status=Open (an easy agent typo) matches like the PATCH normalizer
-        status: url.searchParams.get('status')?.toLowerCase() || undefined,
+        status: parseStatusParam(url),
       });
       // v0.6.14 (sweep 53-d P3-8, the agent-surface recency parity): the
       // panel went latest-first — agents get the same view with ?sort=recent
@@ -829,9 +880,11 @@ async function handleApi(
       if (!id) throw Object.assign(new Error('?id= required'), { status: 400 });
       const prev = await store.getThread(id);
       const ok = await store.deleteThread(id);
-      if (!ok) return notFound(res), true;
-      // mirrored issue gets closed once (tombstone is durable in the db)
-      if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
+      if (!ok) return notFound(res, THREAD_404_HINT), true;
+      // mirrored issue gets closed once (tombstone is durable in the db).
+      // v0.6.16 (56-a P1): stamp the repo + thread id — after a repo re-point
+      // the tombstone must park, never close a same-numbered foreign issue.
+      if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue, prev.gh.repo, prev.id);
       // v0.6.13 (S9/U2, 33-f P3): the wire can now SAY delete — both DELETE
       // doors used to broadcast 'updated' (the taxonomy is the documented
       // contract; no listener branches on reason, both key on storyId —
@@ -861,7 +914,8 @@ async function handleApi(
       const prev = await store.getThread(id);
       const ok = await store.deleteThread(id);
       if (!ok) return notFound(res, THREAD_404_HINT), true;
-      if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue);
+      // v0.6.16 (56-a P1): repo + thread id stamped here too (the twin door)
+      if (prev?.gh?.issue) rt.ghsync.enqueueDelete(prev.gh.issue, prev.gh.repo, prev.id);
       // 33-f P3 twin of the ?id= door above: the path-form DELETE broadcasts
       // 'deleted' too (both doors are aliases — one contract).
       afterMutation(rt, { storyId: prev?.storyId, threadId: undefined, reason: 'deleted' });
@@ -1106,11 +1160,23 @@ async function handleApi(
         body: commentBody,
         createdAt: typeof body.createdAt === 'string' ? body.createdAt : nowIso(),
       } as Comment);
-      thread.comments.push(comment);
-      const updated = await store.updateThread(thread);
-      if (!updated) return notFound(res), true; // deleted concurrently
-      afterMutation(rt, { storyId: updated.storyId, threadId: updated.id, reason: 'commented' });
-      await sendMutationJson(rt, res, 201, updated);
+      // v0.6.16 (56-a P2-3): a lost-response retry of the SAME logical
+      // comment (same author|body|createdAt → same stable id) used to append
+      // a same-id duplicate that survived every union (the id-Set collapses
+      // but the array keeps both) and mirrored as TWO issue comments. The
+      // threads door has replayed-since-v0.4; the comment door now matches:
+      // an identical retry is a no-op that returns the doc (replayed flag).
+      const replay = thread.comments.some((c) => c.id === comment.id);
+      if (!replay) thread.comments.push(comment);
+      if (!replay) {
+        const updated = await store.updateThread(thread);
+        if (!updated) return notFound(res), true; // deleted concurrently
+        afterMutation(rt, { storyId: updated.storyId, threadId: updated.id, reason: 'commented' });
+        await sendMutationJson(rt, res, 201, updated);
+      } else {
+        res.setHeader('X-Annotakit-Replayed', '1');
+        await sendJson(res, 200, { ...thread, replayed: true });
+      }
       return true;
     }
   }
@@ -1152,8 +1218,11 @@ async function handleApi(
         html,
         clipped: body.clipped === true,
         capturedAt: typeof body.capturedAt === 'string' ? body.capturedAt : nowIso(),
-        width: Math.round(Number(body.width) || 800),
-        height: Math.round(Number(body.height) || 600),
+        // v0.6.16 (56-a P3-5): hostile dims (1e9 / negative) used to store
+        // verbatim — the evidence page and the recall mounted a billion-px
+        // layout. Clamp like the scroll fields below (scroll's ≥0 precedent).
+        width: Math.max(0, Math.min(20000, Math.round(Number(body.width)) || 800)),
+        height: Math.max(0, Math.min(20000, Math.round(Number(body.height)) || 600)),
         // v0.6.9 (S3): the frozen-container shape marker — additive; the
         // legacy story-root shape simply lacks it (old snapshots).
         surface: body.surface === 'frozen' ? 'frozen' : undefined,
@@ -1174,7 +1243,9 @@ async function handleApi(
 
     if (method === 'GET' || method === 'HEAD') {
       const snap = await store.getSnapshot(id);
-      if (!snap) return notFound(res, THREAD_404_HINT), true;
+      // v0.6.16 (56-a P4): the hint used to say "GET /threads lists thread
+      // ids" — but here the THREAD exists; it is the SNAPSHOT that is absent.
+      if (!snap) return notFound(res, 'this thread has no snapshot (plan-b evidence is optional — PUT one first, or check the thread doc)'), true;
       const fmt = url.searchParams.get('format');
       if (fmt !== null && fmt !== 'html' && fmt !== 'json') {
         throw Object.assign(new Error(`unknown format ${JSON.stringify(fmt)} — use ?format=html (human view) or omit for JSON`), { status: 400 });
@@ -1192,7 +1263,7 @@ async function handleApi(
         // renderers now agree; img-src stays open — images are passive
         // evidence, blocking them degrades the page's whole point).
         const esc = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-        const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'; frame-src 'none'"><title>annotakit snapshot ${esc(id)}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped (capture exceeded the client size cap)</div>' : ''}</body></html>`;
+        const page = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'unsafe-inline'; frame-src 'none'; object-src 'none'"><title>annotakit snapshot ${esc(id)}</title><style>html,body{margin:0}body{position:relative;width:${snap.width}px;min-height:${snap.height}px;background:#fff;overflow:hidden}[data-annota-snap]{outline:3px solid #d97706 !important;outline-offset:2px !important}</style></head><body>${snap.html}${snap.clipped ? '<div style="position:fixed;bottom:0;left:0;right:0;background:#451a03;color:#fdba74;font:600 12px sans-serif;padding:6px 10px">annotakit: snapshot clipped (capture exceeded the client size cap)</div>' : ''}</body></html>`;
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(method === 'HEAD' ? undefined : page);
         return true;
@@ -1210,7 +1281,7 @@ async function handleApi(
   /* export ------------------------------------------------------------------ */
   if (p === `${API_BASE}/export` && method === 'GET') {
     const storyId = url.searchParams.get('storyId') ?? undefined;
-    const status = url.searchParams.get('status')?.toLowerCase() || undefined;
+    const status = parseStatusParam(url);
     const threads = await store.listThreads({ storyId, status });
     const stories = groupByStory(threads, origin);
     const snapshotIds = await store.listSnapshotIds();
@@ -1383,7 +1454,17 @@ export function createMiddleware(configDir: string): (req: IncomingMessage, res:
       return;
     }
     if (url.pathname === '/annotakit/' || url.pathname === '/annotakit') {
-      // Landing note for humans who poke the URL.
+      // Landing note for humans who poke the URL. v0.6.16 (56-a P4): the
+      // note used to be served BEFORE the access gate — a non-loopback
+      // unkeyed peer learned the version + endpoint names while the API
+      // itself 403'd. The note now passes the same gate as everything else.
+      applyCors(req, res);
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      if (!enforceApiAccess(req, res)) return;
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(`storybook-annotakit ${VERSION} — API at ${API_BASE}/* (health, threads, export, gh)`);
       return;

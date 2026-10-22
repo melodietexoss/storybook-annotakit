@@ -275,6 +275,16 @@ export function createAutoSync(opts: {
   let legacyReadmeShas: Set<string> | null = null;
   /** Whether we have ever successfully pushed (durability reporting). */
   let everPushed = false;
+  // v0.6.16 (56-d P3-1/P3-2): no-credential LOCAL MODE — a repo configured
+  // (often autodetected from origin) with NO token used to fire an anonymous
+  // push on EVERY mutation (guaranteed failure: noise, wasted round-trips,
+  // consecutivePushFailures climbing) and then LIE in its state string
+  // ("committed locally; push failed") while writing NO local branch ref
+  // (the commits were unreachable objects). The latch engages after the
+  // first auth-shaped failure with no token configured; a token appearing
+  // (reload/restart) unlatches it. Credential-helper setups are preserved:
+  // the latch only engages after a push ACTUALLY failed without a token.
+  let noCredLocalMode = false;
   /** v0.6.1 (issue #16): machine-readable push health. */
   let consecutivePushFailures = 0;
   let lastPushError: string | null = null;
@@ -458,6 +468,9 @@ export function createAutoSync(opts: {
       return { ok: false, out: 'empty-sha guard' };
     }
     if (!repo) return { ok: false, out: 'no remote' };
+    // v0.6.16 (56-d): local mode — no doomed anonymous push attempts (the
+    // unlatch happens at cycle start when a token appears)
+    if (noCredLocalMode) return { ok: false, out: 'local mode (no push credential)' };
     maybeWarnArgvAuth();
     const token = ghToken();
     const url = `https://github.com/${repo}.git`;
@@ -774,6 +787,10 @@ export function createAutoSync(opts: {
         return false;
       }
 
+      // v0.6.16 (56-d): unlatch local mode when a token appeared (reload or
+      // restart) — checked HERE so the very next push attempt runs for real
+      // (unlatching inside the failure branch counted a phantom failure).
+      noCredLocalMode = noCredLocalMode && !ghToken();
       let push = await pushCommit(commit, timeoutMs);
       // Y1 (CAS): the sha actually pushed + the head it is parented on — the
       // A4.4 update-ref CAS below must use THESE, never the cycle's first
@@ -818,7 +835,17 @@ export function createAutoSync(opts: {
         }
       }
       if (!push.ok) {
-        if (repo) {
+        if (repo && !ghToken()) {
+          // the no-credential shape: the push cannot ever succeed anonymously
+          // — engage local mode, write the BRANCH ref (the commits stay
+          // reachable; the old path left them as unreachable objects while
+          // the state string claimed "committed locally"), honest state, no
+          // failure accounting (this is the configured reality, not a fault)
+          noCredLocalMode = true;
+          state = 'local mode — no push credential; branch updated locally (set ANNOTAKIT_GH_TOKEN in .env to push)';
+          lastSyncAttemptAt = new Date().toISOString();
+          await gitAsync(root, ['update-ref', `refs/heads/${branch}`, commit], timeoutMs);
+        } else if (repo) {
           // v0.6.1 (issue #16): machine-readable push health — the counter
           // feeds /health (git.consecutivePushFailures) and degrades
           // durability() while failing; the old string-only surface could

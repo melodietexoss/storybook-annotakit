@@ -412,7 +412,8 @@ function extractFingerprint(el) {
       sib = sib.nextElementSibling;
     }
   }
-  return { tag: el.tagName.toLowerCase(), attrs, neighborText };
+  const ownText = clip(normalizeText(el.textContent ?? ""), 60) || void 0;
+  return { tag: el.tagName.toLowerCase(), attrs, neighborText, ownText };
 }
 function nthOfTag(el) {
   const parent = el.parentElement;
@@ -510,6 +511,10 @@ function textQuoteGate(bboxNow, bboxThen, widthNow, widthThen) {
   if (Math.abs(widthNow - widthThen) > WIDTH_TOLERANCE) return true;
   return iou(bboxNow, bboxThen) >= IOU_THRESHOLD;
 }
+function fingerprintOwnTextOk(candidateText, recordedOwnText) {
+  if (recordedOwnText === void 0) return true;
+  return clip(normalizeText(candidateText ?? ""), 60) === recordedOwnText;
+}
 function findByTextQuote(ann, root) {
   const q = ann.selector.textQuote;
   if (!q?.exact) return null;
@@ -581,6 +586,7 @@ function findByFingerprint(ann, root) {
         if (!el || el === root || el.tagName.toLowerCase() !== fp.tag || withinOverlay(el)) continue;
         const idAttr = fp.attrs.find((a) => a.name === "id" || a.name === "data-testid");
         if (idAttr && el.getAttribute(idAttr.name) !== idAttr.value) continue;
+        if (fp.ownText !== void 0 && fingerprintOwnTextOk(el.textContent, fp.ownText) === false) continue;
         if (!ann.bbox || !textQuoteGate(bboxOf(el, root), ann.bbox, rootWidth(root), ann.captureViewportWidth)) continue;
         return el;
       }
@@ -617,5 +623,6 @@ export {
   cssPath,
   captureAnchor,
   textQuoteGate,
+  fingerprintOwnTextOk,
   resolveAnchor
 };

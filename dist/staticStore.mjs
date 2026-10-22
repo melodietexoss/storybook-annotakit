@@ -6,7 +6,7 @@ import {
   renderThreadBlock,
   resetStaticStoreForTests,
   staticScope
-} from "./chunk-DEMUCS72.mjs";
+} from "./chunk-56EMSXTR.mjs";
 export {
   getStaticStore,
   newThreadId,

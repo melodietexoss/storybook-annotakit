@@ -59,7 +59,12 @@ function componentName(fiber: FiberLike): string | null {
   const t = fiber.type;
   if (!t) return null;
   if (typeof t === 'string') return null; // host component
-  const name = t.displayName || t.name;
+  // v0.6.16 (56-b P3-6): a forwardRef fiber's type is the WRAPPER object —
+  // without a user-set displayName it is nameless, so the pin fell through
+  // to the PARENT (wrong name AND wrong props). forwardRef renders via the
+  // inner .render function; its name is the component's name.
+  const render = (t as { render?: unknown }).render;
+  const name = t.displayName || t.name || (typeof render === 'function' ? render.name : undefined);
   return typeof name === 'string' && name ? name : null;
 }
 
@@ -248,7 +253,7 @@ const smCache = new Map<string, Promise<SourceMapLines | null>>();
 function loadSourceMap(modulePath: string): Promise<SourceMapLines | null> {
   let p = smCache.get(modulePath);
   if (!p) {
-    p = (async () => {
+    const attempt = (async () => {
       try {
         const url = typeof location !== 'undefined' ? `${location.origin}/${modulePath}` : modulePath;
         const text = await (await fetch(url)).text();
@@ -260,6 +265,20 @@ function loadSourceMap(modulePath: string): Promise<SourceMapLines | null> {
         return null;
       }
     })();
+    // v0.6.16 (56-b P3-5): cache SUCCESSES only — a transient 404/500 used
+    // to permanently disable sourcemap correction for that module for the
+    // whole session (silent fallback to raw transformed lines). A failed
+    // load retries on the next pin (pins are user-triggered, bounded).
+    p = attempt.then(
+      (v) => {
+        if (v === null) smCache.delete(modulePath);
+        return v;
+      },
+      () => {
+        smCache.delete(modulePath);
+        return null;
+      },
+    );
     smCache.set(modulePath, p);
   }
   return p;
@@ -282,7 +301,9 @@ export async function correctSource(source: ComponentSource): Promise<ComponentS
   try {
     const lines = await loadSourceMap(source.file);
     if (!lines) return source;
-    const orig = mapPosition(lines, source.line - 1, source.column);
+    // 56-b P3-1: V8 columns are 1-based; sourcemap gen columns are 0-based —
+    // the raw column looked one segment right (a line flip at boundaries).
+    const orig = mapPosition(lines, source.line - 1, source.column - 1);
     return orig ? { ...source, line: orig.line, column: orig.column } : source;
   } catch {
     return source;
@@ -293,9 +314,14 @@ function summarizeProps(props: Record<string, unknown> | undefined): Record<stri
   if (!props) return undefined;
   const out: Record<string, string> = {};
   let count = 0;
+  let visited = 0;
   for (const [key, value] of Object.entries(props)) {
     if (key.startsWith('_')) continue; // react internals
     if (count >= 8) break;
+    // 56-b P3-2: Object.entries materializes EVERY key upfront — a 200k-key
+    // hostile props object iterated fully (~112ms/pin measured). Cap total
+    // VISITED keys, not just collected ones.
+    if (++visited > 200) break;
     const s = propValueToString(value);
     if (s === null) continue;
     out[key] = s;
@@ -322,6 +348,19 @@ function propValueToString(value: unknown): string | null {
  * Returns null when React metadata is unavailable (prod build, non-React tree).
  */
 export function inspectComponent(el: HTMLElement): ComponentRef | null {
+  // v0.6.16 (56-b P2-1): the file header promises "Everything is guarded" —
+  // it was not: a hostile displayName/props getter (foreign-renderer fibers
+  // in dev; ANY story in prod, where React does not freeze props) threw past
+  // the composerMeta effect and unmounted the whole decorated story. A
+  // metadata failure degrades to a metadata-less pin, never a canvas crash.
+  try {
+    return inspectComponentRaw(el);
+  } catch {
+    return null;
+  }
+}
+
+function inspectComponentRaw(el: HTMLElement): ComponentRef | null {
   // v0.6.9 (S3): frozen-clone elements carry no fiber of their own, and the
   // closestFiber ancestor walk would report the overlay/portal-host fiber —
   // a lie. Pins captured inside a frozen view honestly carry no component

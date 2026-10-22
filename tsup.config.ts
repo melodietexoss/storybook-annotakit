@@ -30,6 +30,10 @@ export default [
       // elementsFromPoint/rect getters — jsdom-free).
       hotkeys: 'src/shared/hotkeys.ts',
       hittest: 'src/preview/hittest.ts',
+      // v0.6.16 (wave-6, 57-a P3): the pin cascade — pure math, standalone
+      // export (the s6 suite pins the corner/edge/ladder shapes; three
+      // browser rounds found the corner regressions, a unit pin ends that).
+      cascade: 'src/shared/cascade.ts',
       // v0.6.12 (S7-AUDIT-C7): the panel-toggle helper — same pattern (the
       // manager bundle is not node-importable; the truth table is unit-pinned).
       panelToggle: 'src/shared/panelToggle.ts',

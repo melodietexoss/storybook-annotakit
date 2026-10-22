@@ -13,7 +13,7 @@
  * with [scope, storyId, refresh] deps re-subscribes correctly.
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { addons, types, useStorybookApi, useStorybookState } from 'storybook/manager-api';
 import { useTheme } from 'storybook/theming';
 import { BoxIcon, CameraIcon, CheckIcon, CommentIcon, CommentsIcon, EyeIcon, EyeCloseIcon, LinkIcon, PinIcon, SyncIcon } from '@storybook/icons';
@@ -310,20 +310,30 @@ function ReviewPanel(): React.ReactElement {
     };
   }, [staticMode]);
 
+  // v0.6.16 (56-b P2-2 twin): last-started-wins — the manager's refresh
+  // shares the layer's stale-response erase class (an in-flight list landing
+  // after a newer refresh overwrote the fresher panel state).
+  const fetchSeqRef = useRef(0);
   const refresh = useCallback(async () => {
+    const seq = ++fetchSeqRef.current;
     try {
       if (staticMode) {
         const store = await getGhLinkedStaticStore();
+        if (seq !== fetchSeqRef.current) return;
         setThreads(store.list(scope === 'story' ? storyId : undefined));
         setSnapshotIds(new Set());
         setError(null);
       } else {
         const { threads: list, snapshots } = await getThreadsAndSnapshots(scope === 'story' ? storyId : undefined);
+        if (seq !== fetchSeqRef.current) return;
         setThreads(list);
         setSnapshotIds(snapshots);
         setError(null);
       }
     } catch (e) {
+      // v0.6.16 (57-a P4): a superseded refresh that rejects must not flash
+      // an error over healthy state — a newer refresh owns the slot.
+      if (seq !== fetchSeqRef.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
     if (staticMode) return; // no server to piggyback
@@ -842,35 +852,35 @@ function ReviewPanel(): React.ReactElement {
       {/* header row */}
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', paddingBottom: 6, borderBottom: `1px solid ${theme.appBorderColor}` }}>
         <div style={{ display: 'flex', gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: 'hidden' }}>
-          <button style={miniBtn(theme.colorSecondary, scope === 'story')} onClick={() => setScope('story')}>
+          <button style={miniBtn(theme.colorSecondary, scope === 'story')} aria-pressed={scope === 'story'} onClick={() => setScope('story')}>
             This story
           </button>
-          <button style={miniBtn(theme.colorSecondary, scope === 'all')} onClick={() => setScope('all')}>
+          <button style={miniBtn(theme.colorSecondary, scope === 'all')} aria-pressed={scope === 'all'} onClick={() => setScope('all')}>
             All stories
           </button>
         </div>
         <div style={{ display: 'flex', gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: 'hidden' }}>
-          <button style={miniBtn(theme.colorSecondary, filter === 'all')} onClick={() => setFilter('all')} title="Show everything">
+          <button style={miniBtn(theme.colorSecondary, filter === 'all')} aria-pressed={filter === 'all'} onClick={() => setFilter('all')} title="Show everything">
             all
           </button>
-          <button style={miniBtn(theme.colorSecondary, filter === 'open')} onClick={() => setFilter('open')} title="Show only open (agent work queue)">
+          <button style={miniBtn(theme.colorSecondary, filter === 'open')} aria-pressed={filter === 'open'} onClick={() => setFilter('open')} title="Show only open (agent work queue)">
             open
           </button>
-          <button style={miniBtn(theme.colorSecondary, filter === 'active')} onClick={() => setFilter('active')} title="Everything unresolved — open + to review + rejected (resolved excluded): the full outstanding-work view">
+          <button style={miniBtn(theme.colorSecondary, filter === 'active')} aria-pressed={filter === 'active'} onClick={() => setFilter('active')} title="Everything unresolved — open + to review + rejected (resolved excluded): the full outstanding-work view">
             active
           </button>
-          <button style={miniBtn(theme.colorSecondary, filter === 'review')} onClick={() => setFilter('review')} title="Threads the agent marked fixed — awaiting your verification (the check-latest-batch view)">
+          <button style={miniBtn(theme.colorSecondary, filter === 'review')} aria-pressed={filter === 'review'} onClick={() => setFilter('review')} title="Threads the agent marked fixed — awaiting your verification (the check-latest-batch view)">
             to review
           </button>
-          <button style={miniBtn(theme.colorSecondary, filter === 'rejected')} onClick={() => setFilter('rejected')} title="Fixes you rejected — awaiting the agent's re-work (the verdict is durable)">
+          <button style={miniBtn(theme.colorSecondary, filter === 'rejected')} aria-pressed={filter === 'rejected'} onClick={() => setFilter('rejected')} title="Fixes you rejected — awaiting the agent's re-work (the verdict is durable)">
             rejected
           </button>
         </div>
         <div style={{ display: 'flex', gap: 0, border: `1px solid ${theme.appBorderColor}`, borderRadius: 7, overflow: 'hidden' }}>
-          <button style={miniBtn(theme.colorSecondary, sortMode === 'story')} onClick={() => changeSort('story')} title="Stable order: story title, then thread number — resolving never reorders the list">
+          <button style={miniBtn(theme.colorSecondary, sortMode === 'story')} aria-pressed={sortMode === 'story'} onClick={() => changeSort('story')} title="Stable order: story title, then thread number — resolving never reorders the list">
             by story
           </button>
-          <button style={miniBtn(theme.colorSecondary, sortMode === 'recent')} onClick={() => changeSort('recent')} title="Latest first: most recently touched (replies, status flips, new pins) on top — the default (persisted; the 'by story' switch is remembered too)">
+          <button style={miniBtn(theme.colorSecondary, sortMode === 'recent')} aria-pressed={sortMode === 'recent'} onClick={() => changeSort('recent')} title="Latest first: most recently touched (replies, status flips, new pins) on top — the default (persisted; the 'by story' switch is remembered too)">
             latest
           </button>
         </div>
@@ -948,7 +958,7 @@ function ReviewPanel(): React.ReactElement {
                   {sync.mode === 'auto' ? 'auto-sync' : sync.mode === 'unconfigured' ? 'local mode' : 'mirror off'}
                 </span>
                 <span style={{ color: theme.textMutedColor }}>
-                  {sync.mode === 'auto' && <>{sync.mapped}/{sync.threads} threads mirrored{sync.pending > 0 ? ` · ${sync.pending} queued` : ''}{sync.stalled > 0 ? ` · ${sync.stalled} stalled` : ''}{sync.lastPushAt ? ` · pushed ${ago(sync.lastPushAt)}` : ''}{sync.lastPullAt ? ` · pulled ${ago(sync.lastPullAt)}` : ''}{sync.pollSec > 0 ? ` · polls every ${sync.pollSec}s` : ''}{sync.labels && sync.labels.length ? ` · labels: ${sync.labels.join(', ')}` : ''}</>}
+                  {sync.mode === 'auto' && <>{sync.mapped}/{sync.threads} threads mirrored{sync.detached > 0 ? ` · ${sync.detached} detached` : ''}{sync.pending > 0 ? ` · ${sync.pending} queued` : ''}{sync.stalled > 0 ? ` · ${sync.stalled} stalled` : ''}{sync.lastPushAt ? ` · pushed ${ago(sync.lastPushAt)}` : ''}{sync.lastPullAt ? ` · pulled ${ago(sync.lastPullAt)}` : ''}{sync.pollSec > 0 ? ` · polls every ${sync.pollSec}s` : ''}{sync.labels && sync.labels.length ? ` · labels: ${sync.labels.join(', ')}` : ''}</>}
                   {sync.backoffUntil && <>{sync.lastError ? ' · ' : ''}backoff until {new Date(sync.backoffUntil).toLocaleTimeString()}</>}
                 </span>
               </>
@@ -1200,16 +1210,23 @@ function ReviewPanel(): React.ReactElement {
               )}
               {/* DD-21 (v0.6.15): a mapping whose repo differs from the active
                   config — frozen (never synced); the chip says WHY the issue
-                  link points at the OLD repo and nothing moves. */}
-              {t.gh && ghStat?.configured && ghStat.repo && ghMappingRepo(t.gh) !== null && ghMappingRepo(t.gh) !== ghStat.repo && (
-                <span
-                  title={`mirror DETACHED — issue #${t.gh.issue} lives on ${ghMappingRepo(t.gh)}, the active repo is ${ghStat.repo}. This thread is frozen (no push, no pull, no close). Restore the repo setting or unlink the thread to re-mirror.`}
-                  style={chip('#7c2d1233', '#fb7185')}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  detached
-                </span>
-              )}
+                  link points at the OLD repo and nothing moves.
+                  v0.6.16 (56-e P4-1): the active repo now resolves in DEV
+                  mode too (via /health's gh.repo) — the chip used to render
+                  in static builds only, leaving dev-mode repo re-points
+                  invisible in the panel. */}
+              {(() => {
+                const activeRepo = ghStat?.repo ?? health?.gh?.repo;
+                return t.gh && activeRepo && ghMappingRepo(t.gh) !== null && ghMappingRepo(t.gh) !== activeRepo ? (
+                  <span
+                    title={`mirror DETACHED — issue #${t.gh.issue} lives on ${ghMappingRepo(t.gh)}, the active repo is ${activeRepo}. This thread is frozen (no push, no pull, no close). Restore the repo setting or unlink the thread to re-mirror.`}
+                    style={chip('#7c2d1233', '#fb7185')}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    detached
+                  </span>
+                ) : null;
+              })()}
               {t.component?.name && <span style={chip(`${theme.colorSecondary}18`, theme.colorSecondary)}>{t.component.name}</span>}
               {t.transient && (
                 <span

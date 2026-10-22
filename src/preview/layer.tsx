@@ -19,6 +19,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { addons } from 'storybook/preview-api';
 import { captureAnchor, resolveAnchor, type AnchorResolution } from './anchor';
 import { inspectComponent, correctSource } from './fiber';
+import { cascadeSlots } from '../shared/cascade';
 import { buildStoryRef } from './story-meta';
 import { addComment, createThread, getSnapshot, getThreads, patchThread, postSnapshot } from './api';
 import { captureFrozenSnapshot, captureFrozenView, captureSnapshot, mountRecalledView, type FrozenMount } from './snapshot';
@@ -186,6 +187,15 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
    *  start; after the await only the current-token holder may touch state
    *  (see shared/recall.ts for the full contract, unit-pinned there). */
   const recallSeqRef = useRef(0);
+  // v0.6.16 (56-b P2-2): last-started-wins for THREAD LIST refreshes — an
+  // in-flight GET /threads landing after a NEWER refresh (broadcast echo,
+  // optimistic pin) used to overwrite the fresher state and silently ERASE
+  // just-created pins from the canvas (live-proven: 12→11 with REST truth 13).
+  const fetchSeqRef = useRef(0);
+  /** v0.6.16 (56-b P3-7): the current composer's stable client thread id —
+   *  keyed by composer object identity (stable across failed submit attempts
+   *  of one composer, fresh for a new one). */
+  const draftIdRef = useRef<{ composer: unknown; id: string } | null>(null);
   /** v0.6.13 (S9/DD-17a): the recalled view's scroll was restored from the
    *  snapshot's `scroll` field — the flash effect then skips its
    *  scrollIntoView centering (the as-captured position IS the pin's
@@ -445,14 +455,22 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
 
   /* ---- fetch threads (mount, story change, broadcast) — never apiOk-gated ---- */
   const refresh = useCallback(async (): Promise<void> => {
+    const seq = ++fetchSeqRef.current;
     try {
       const list = await dataRef.current.list(storyIdRef.current);
       if (!mountedRef.current) return;
+      // a newer refresh superseded this one — its response must never
+      // overwrite the fresher state (the stale-response erase bug)
+      if (seq !== fetchSeqRef.current) return;
       retryCount.current = 0;
       setThreads(list);
       setError(null);
     } catch (e) {
       if (!mountedRef.current) return;
+      // v0.6.16 (57-a P4): a SUPERSEDED refresh that rejects must not arm the
+      // retry ladder or flash an error over healthy state — a newer refresh
+      // already owns the slot.
+      if (seq !== fetchSeqRef.current) return;
       // transient? retry with backoff (max 5); a cold dev server must not lose pins
       if (retryCount.current < 5) {
         const delay = 400 * 2 ** retryCount.current;
@@ -1393,7 +1411,16 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
         const component = raw?.source ? await correctComponent(raw) : raw;
         const story = await buildStoryRef(storyId, { title, name });
         const comment: Comment = { id: uid('c'), author: getAuthor(), body, createdAt: new Date().toISOString() };
+        // v0.6.16 (56-b P3-7): a stable CLIENT id per composer instance —
+        // the server's replay contract (identical POST → same id → no dup)
+        // was unreachable from the UI: a lost-response retry re-minted and
+        // created a duplicate thread. The id is stable across failed
+        // attempts of ONE composer; a fresh composer (new pin) mints anew.
+        if (!draftIdRef.current || draftIdRef.current.composer !== composer) {
+          draftIdRef.current = { composer, id: uid('th') };
+        }
         const created = await dataRef.current.create({
+          id: draftIdRef.current.id,
           storyId,
           story,
           component,
@@ -1475,6 +1502,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
     const out: Array<{
       thread: Thread;
       fixed: { x: number; y: number; w: number; h: number };
+      render: { x: number; y: number };
       status: ResolvedPin['status'];
     }> = [];
     for (const t of threads) {
@@ -1486,13 +1514,14 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
         out.push({
           thread: t,
           fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h },
+          render: { x: 0, y: 0 }, // filled by the cascade pass below
           status: 'resolved',
         });
         continue;
       }
       if (pin.el) {
         const r = pin.el.getBoundingClientRect();
-        out.push({ thread: t, fixed: { x: r.left, y: r.top, w: r.width, h: r.height }, status: pin.status });
+        out.push({ thread: t, fixed: { x: r.left, y: r.top, w: r.width, h: r.height }, render: { x: 0, y: 0 }, status: pin.status });
       } else {
         // orphan: fall back to stored fragment (root-relative — the frozen
         // clone while frozen; the live root after thaw. Portal pins are
@@ -1500,32 +1529,22 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
         // layouts — documented; recall is their real review surface.)
         const rootRect = activeRoot().getBoundingClientRect();
         const f = t.target.selector.fragment ?? t.target.bbox;
-        out.push({ thread: t, fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h }, status: 'orphan' });
+        out.push({ thread: t, fixed: { x: rootRect.left + f.x, y: rootRect.top + f.y, w: f.w, h: f.h }, render: { x: 0, y: 0 }, status: 'orphan' });
       }
     }
-    // v0.6.14 (sweep 53-d P2-3): PIN CASCADE — two pins on the same element
-    // (or clamped to the same edge) stacked EXACTLY, and only the topmost
-    // was clickable: the threads existed but were unreachable from the
-    // canvas. Stack-index pins that share a rounded anchor slot and offset
-    // each subsequent one down-right by 10px — every pin stays clickable.
-    // Regions are exempt (their rects differ; the cascade is for POINT
-    // pins). Deterministic order = the render order below.
-    const slotCount = new Map<string, number>();
-    for (const v of out) {
-      if (v.thread.target.kind === 'region') continue;
-      // v0.6.15 (55-d P3-4): key on the CLAMPED render position — the render
-      // clamps pins into the viewport, so two pins near the right/bottom edge
-      // clamped onto the SAME pixel while their unclamped keys differed (no
-      // cascade): at the corner, two pins rendered at exactly one point and
-      // only the topmost was clickable (the original "8 pins as 2 dots" bug
-      // alive at the corner). Same clamp constants as the pin render below.
-      const cx = Math.min(Math.max(v.fixed.x - 4, 2), Math.max(vw - 26, 2));
-      const cy = Math.min(Math.max(v.fixed.y - 26, 2), Math.max(vh - 26, 2));
-      const key = `${Math.round(cx / 12)}:${Math.round(cy / 12)}`;
-      const n = slotCount.get(key) ?? 0;
-      slotCount.set(key, n + 1);
-      if (n > 0) v.fixed = { ...v.fixed, x: v.fixed.x + n * 10, y: v.fixed.y + n * 10 };
-    }
+    // v0.6.14 (sweep 53-d P2-3) → v0.6.16 (wave-6, 57-a P3): PIN CASCADE —
+    // two pins on the same element (or clamped to the same edge) stacked
+    // EXACTLY, and only the topmost was clickable. The shared pure function
+    // computes the FINAL render position (clamp → offset toward the interior
+    // → re-clamp the interior bound only): two browser rounds proved the
+    // fixed-space offsets got re-eaten at the corner for deep-past fragments.
+    // Unit-pinned in the s6 suite (the corner/edge/ladder shapes).
+    const slots = cascadeSlots(
+      out.map((v) => ({ x: v.fixed.x, y: v.fixed.y, region: v.thread.target.kind === 'region' })),
+      vw,
+      vh,
+    );
+    for (let i = 0; i < out.length; i++) out[i].render = slots[i] ?? { x: 2, y: 2 };
     void vw;
     void vh;
     return out;
@@ -1564,7 +1583,7 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
 
       {/* pins + regions */}
       {visible &&
-        pinViews.map(({ thread, fixed, status }) =>
+        pinViews.map(({ thread, fixed, render, status }) =>
           thread.target.kind === 'region' ? (
             <div
               key={thread.id}
@@ -1601,8 +1620,11 @@ export function AnnotaLayer({ storyId, title, name, hotkeys, frozenView = true }
                 .filter(Boolean)
                 .join(' ')}
               style={{
-                left: clamp(fixed.x - 4, 2, Math.max(window.innerWidth - 26, 2)),
-                top: clamp(fixed.y - 26, 2, Math.max(window.innerHeight - 26, 2)),
+                // v0.6.16 (57-a P3): the cascade's final position — clamped +
+                // cascade-offset in one place (the old double clamp re-ate
+                // the fixed-space offset at the corner)
+                left: render.x,
+                top: render.y,
               }}
               onClick={() => setActiveThread(thread.id)}
               onKeyDown={(e) => {
@@ -1872,7 +1894,7 @@ function ComposerCard(props: {
 
 function ThreadCard(props: {
   thread: Thread;
-  pin: { fixed: { x: number; y: number } } | null;
+  pin: { fixed: { x: number; y: number }; render: { x: number; y: number } } | null;
   busy: boolean;
   error: string | null;
   onReply: (t: Thread, body: string) => Promise<boolean>;
@@ -1904,7 +1926,9 @@ function ThreadCard(props: {
     });
   };
   const t = props.thread;
-  const near = props.pin?.fixed;
+  // v0.6.16 (57-a P3): follow the VISIBLE pin — the render position is
+  // post-clamp + post-cascade (the pre-clamp anchor can sit far off-canvas)
+  const near = props.pin?.render ?? props.pin?.fixed;
   const { ref, style } = useClampedPosition(near ? near.x + (near.x > window.innerWidth / 2 ? -120 : 120) : 40, near ? near.y : 60);
   const comp = t.component;
   // v0.6.14 (audit 53-c P3): in newest-first order a submitted reply lands at

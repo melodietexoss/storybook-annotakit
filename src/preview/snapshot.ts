@@ -521,14 +521,21 @@ function captureFrozenSnapshotInner(mount: FrozenMount, pinned: HTMLElement | nu
     // flagship evidence while clipped stayed false (an honest-looking
     // snapshot missing its subject).
     while (byteLen(html) > FROZEN_BUDGET && temp.children.length > 1) {
-      const last = temp.lastElementChild;
       // v0.6.15 (55-d P2): the guard checked DESCENDANTS only — pinning the
       // portal ROOT (the whole context-menu container, a primary portal-pin
       // shape) fell through and dropped exactly the flagship evidence with
       // clipped:false (empirically proven end-to-end). The marker on the
       // ROOT itself protects the portal too.
-      if (last && (last.matches(`[${MARK}]`) || last.querySelector(`[${MARK}]`))) break; // the pinned surface stays, whatever the cost — the next rung clips honestly
-      last?.remove();
+      // v0.6.16 (55-d P4-1): scan BACK past pinned children instead of
+      // breaking — the old break at a pinned LAST portal left an unpinned
+      // HUGE portal EARLIER in the order undropped, and the ladder jumped
+      // to the terminal trim (worse evidence where dropping it would fit).
+      let drop = temp.lastElementChild;
+      while (drop && (drop.matches(`[${MARK}]`) || drop.querySelector(`[${MARK}]`))) drop = drop.previousElementSibling;
+      // nothing droppable before the pinned surface, or only the story clone
+      // remains (never dropped — it IS the evidence) → clip honestly instead
+      if (!drop || drop === temp.firstElementChild) break;
+      drop.remove();
       html = temp.outerHTML;
     }
   }

@@ -237,7 +237,11 @@ export function getStaticStore(): Promise<StaticStore> {
       tombstones = merged.deletedIds;
       localEdits = true;
     } else if (persisted) {
-      threads = persisted.threads;
+      // v0.6.16 (56-e P4-2, the THIRD no-merge path): a persisted doc written
+      // pre-DD-20 (or by an old tab) loaded VERBATIM here — the seed-only and
+      // reload paths heal, this boot path never ran one, so a polluted doc
+      // rendered doubled replies until the first local mutation.
+      threads = persisted.threads.map(healThreadTwins);
       tombstones = persisted.deletedIds;
       localEdits = true;
     } else {

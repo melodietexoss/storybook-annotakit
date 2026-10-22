@@ -98,9 +98,11 @@ export interface Store extends StoreKind {
   /** Fold the WAL into the main db file (sqlite); no-op for json. */
   checkpoint(): void;
   /** Remember a deleted thread's GitHub issue so the mirror engine can close
-   *  it exactly once (durable — same db file as the threads). */
-  tombstone(issue: number): Promise<void>;
-  listOpenTombstones(): Promise<number[]>;
+   *  it exactly once (durable — same db file as the threads). v0.6.16: carries
+   *  the repo the issue lived on + the deleted thread's id (DD-21 — a repo
+   *  re-point must never close a same-numbered foreign issue on the new repo). */
+  tombstone(issue: number, repo?: string, threadId?: string): Promise<void>;
+  listOpenTombstones(): Promise<{ issue: number; repo?: string; threadId?: string }[]>;
   tombstoneDone(issue: number): Promise<void>;
   /* plan-b DOM snapshots: stored OUTSIDE thread payloads so listings stay
    * lean; deleted with their thread. */
@@ -146,7 +148,9 @@ CREATE TABLE IF NOT EXISTS counters (
 );
 CREATE TABLE IF NOT EXISTS tombstones (
   issue INTEGER PRIMARY KEY,
-  done INTEGER NOT NULL DEFAULT 0
+  done INTEGER NOT NULL DEFAULT 0,
+  repo TEXT,
+  thread_id TEXT
 );
 CREATE TABLE IF NOT EXISTS snapshots (
   thread_id TEXT PRIMARY KEY,
@@ -173,6 +177,16 @@ function sqliteStore(db: SqliteDb, storePath: string): Store {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA busy_timeout = 3000;');
   db.exec(SCHEMA);
+  // v0.6.16 (wave-5 56-a P1): tombstones carry the repo the issue lived on
+  // (DD-21 amendment 2's server twin — the issue-keyed table alone cannot
+  // tell a same-numbered foreign issue after a repo re-point). Existing dbs
+  // predate the columns: idempotent ALTER (sqlite has no ADD COLUMN IF NOT
+  // EXISTS).
+  {
+    const cols = new Set(db.prepare('PRAGMA table_info(tombstones)').all().map((r) => String(r.name)));
+    if (!cols.has('repo')) db.exec('ALTER TABLE tombstones ADD COLUMN repo TEXT');
+    if (!cols.has('thread_id')) db.exec('ALTER TABLE tombstones ADD COLUMN thread_id TEXT');
+  }
 
   const rowToThread = (row: Record<string, unknown>): Thread =>
     JSON.parse(row.payload as string) as Thread;
@@ -313,12 +327,18 @@ function sqliteStore(db: SqliteDb, storePath: string): Store {
     }
   };
 
-  const tombstone = async (issue: number): Promise<void> => {
+  const tombstone = async (issue: number, repo?: string, threadId?: string): Promise<void> => {
     if (!Number.isFinite(issue) || issue <= 0) return;
-    db.prepare('INSERT OR IGNORE INTO tombstones (issue, done) VALUES (?, 0)').run(issue);
+    // v0.6.16: stamp the repo/thread identity (DD-21). ON CONFLICT updates
+    // the identity — a re-delete of a same-numbered mapping keeps the
+    // freshest intent (done rows are pruned immediately, so every existing
+    // row is live).
+    db.prepare(
+      'INSERT INTO tombstones (issue, done, repo, thread_id) VALUES (?, 0, ?, ?) ON CONFLICT(issue) DO UPDATE SET repo = excluded.repo, thread_id = excluded.thread_id',
+    ).run(issue, repo ?? null, threadId ?? null);
   };
-  const listOpenTombstones = async (): Promise<number[]> =>
-    db.prepare('SELECT issue FROM tombstones WHERE done = 0 ORDER BY issue ASC').all().map((r) => Number(r.issue));
+  const listOpenTombstones = async (): Promise<{ issue: number; repo?: string; threadId?: string }[]> =>
+    db.prepare('SELECT issue, repo, thread_id FROM tombstones WHERE done = 0 ORDER BY issue ASC').all().map((r) => ({ issue: Number(r.issue), repo: r.repo == null ? undefined : String(r.repo), threadId: r.thread_id == null ? undefined : String(r.thread_id) }));
   const tombstoneDone = async (issue: number): Promise<void> => {
     // done rows are pruned immediately: the "already closed?" check in the
     // pull loop keeps the close idempotent without needing history, and the
@@ -427,7 +447,7 @@ function jsonStore(storePath: string): Store {
   type Doc = {
     threads: Thread[];
     counters: Record<string, number>;
-    tombstones: { issue: number; done: boolean }[];
+    tombstones: { issue: number; done: boolean; repo?: string; threadId?: string }[];
     snapshots: Record<string, DomSnapshot>;
     deleted: string[];
   };
@@ -597,15 +617,20 @@ function jsonStore(storePath: string): Store {
       return doc.threads.length;
     },
     checkpoint: () => undefined,
-    tombstone: (issue) =>
+    tombstone: (issue, repo, threadId) =>
       mutate(async () => {
-        if (Number.isFinite(issue) && issue > 0 && !doc.tombstones.some((t) => t.issue === issue)) {
-          doc.tombstones.push({ issue, done: false });
+        if (Number.isFinite(issue) && issue > 0) {
+          const existing = doc.tombstones.find((t) => t.issue === issue);
+          if (!existing) doc.tombstones.push({ issue, done: false, repo, threadId });
+          else {
+            existing.repo = repo; // DD-21: freshest intent wins on a re-delete
+            existing.threadId = threadId;
+          }
         }
       }),
     listOpenTombstones: async () => {
       await loadRead();
-      return doc.tombstones.filter((t) => !t.done).map((t) => t.issue);
+      return doc.tombstones.filter((t) => !t.done).map((t) => ({ issue: t.issue, repo: t.repo, threadId: t.threadId }));
     },
     tombstoneDone: (issue) =>
       mutate(async () => {
@@ -745,15 +770,31 @@ export async function migrateLegacyStore(configDir: string, store: Store, curren
   return 0;
 }
 
+/** v0.6.16 (56-a P3-3): boot-hygiene collector — a corrupt config file
+ *  surfaces in /health warnings (console-only was invisible to agents). */
+export const configWarnings: string[] = [];
+
 /** Read <configDir>/annotakit.config.json (optional). */
 export function readConfig(configDir: string): Record<string, unknown> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fsSync = require('node:fs') as typeof import('node:fs');
+  const file = path.resolve(configDir, 'annotakit.config.json');
+  let raw: string;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fsSync = require('node:fs') as typeof import('node:fs');
-    return JSON.parse(
-      fsSync.readFileSync(path.resolve(configDir, 'annotakit.config.json'), 'utf8'),
-    ) as Record<string, unknown>;
+    raw = fsSync.readFileSync(file, 'utf8');
   } catch {
+    return {};
+  }
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch (err) {
+    // v0.6.16 (56-a P3-3): a corrupt config (trailing comma etc.) used to
+    // parse to {} SILENTLY — ghRepo/labels/ghAuto/autoSync all reverted to
+    // defaults with no signal, including the store-location flip
+    // (autoSync:false → git-dir vs classic). Loud, once, at boot + /health.
+    const msg = `annotakit.config.json is not valid JSON (${err instanceof Error ? err.message : String(err)}) — IGNORED, defaults apply. Fix the file to restore its settings.`;
+    console.warn(`[storybook-annotakit] ${msg}`);
+    configWarnings.push(msg);
     return {};
   }
 }

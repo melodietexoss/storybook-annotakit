@@ -181,8 +181,19 @@ function distSetProblems() {
  * CLEAN. Extracted into a function so the selftest can plant a whitelist
  * regression and prove THIS gate bites. */
 function packLeakProblems() {
-  const out = run('npm', ['pack', '--dry-run', '--json']);
-  if (out === null) {
+  // v0.6.16 (56-c P3-7): a NON-ZERO npm pack (broken package.json, npm error)
+  // used to be indistinguishable from "npm not installed" — the leak guard
+  // SILENTLY SKIPPED instead of failing (stage-release's twin already parsed
+  // err.stdout). Only ENOENT (tool missing) may skip.
+  let out = null;
+  let npmMissing = false;
+  try {
+    out = execFileSync('npm', ['pack', '--dry-run', '--json'], { cwd: root, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (err) {
+    if (err?.code === 'ENOENT') npmMissing = true;
+    out = String(err?.stdout ?? ''); // npm prints the listing even on non-zero exits
+  }
+  if (out === null && npmMissing) {
     notes.push('npm pack unavailable (skipped leak guard — run it where npm exists)');
     return [];
   }

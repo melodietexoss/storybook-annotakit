@@ -6,11 +6,14 @@ guide is the verified path for THIS environment class: a platform-scaffolded
 **Next.js App Router app that owns the only exposed port (3000)**, ephemeral
 disk, and a public preview URL proxied to localhost:3000.
 
-Everything below was E2E-verified on v0.6.12 in exactly this environment
+Everything below was E2E-verified in exactly this environment
 (static bake served by `next dev` on :3000, browser-mirrored GitHub issues,
-full reviewer loop; the consumer surface is unchanged since the v0.6.11
-verification — v0.6.12 changed store-merge machinery only). Follow it in
-order and you will have a working review surface in ~10 minutes.
+full reviewer loop) — the flows most recently re-verified end-to-end by a
+fresh cold-install walk on the public v0.6.15 (v0.6.16 audit round); the
+consumer-visible surface has evolved since the original v0.6.12 verification
+(latest-first panel default, aria-pressed toggles, sticky reply rows, the
+DETACHED chip), but every documented flow below works as written. Follow it
+in order and you will have a working review surface in ~10 minutes.
 
 ## 0. What you are setting up (60 seconds)
 
